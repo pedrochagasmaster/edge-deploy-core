@@ -1,0 +1,5 @@
+# The on-node tooling and committed Tool Profiles must keep LF endings: CRLF in a
+# *.sh breaks the shebang on the Edge Node, and the engine reads *.yaml verbatim.
+*.sh text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
