@@ -90,6 +90,7 @@ class FakeTmuxDriver:
         head_commits: list[str] | None = None,
         changed_paths: list[str] | None = None,
         update_code: int = 0,
+        install_preflight_code: int = 0,
         install_code: int = 0,
         permissions: dict[str, Any] | None = None,
         remote_runtime: dict[str, str] | None = None,
@@ -102,6 +103,7 @@ class FakeTmuxDriver:
         self._head_commits = list(head_commits) if head_commits else []
         self._changed_paths = list(changed_paths) if changed_paths else []
         self.update_code = update_code
+        self.install_preflight_code = install_preflight_code
         self.install_code = install_code
         self._permissions = permissions if permissions is not None else dict(OK_PERMISSIONS)
         self._remote_runtime = dict(remote_runtime) if remote_runtime else {}
@@ -209,12 +211,14 @@ class FakeTmuxDriver:
             return self._sentinel("", 0)
         if "git rev-parse --verify HEAD" in command:
             return self._sentinel(self._next_head(), 0)
-        if "git diff --name-only" in command:
+        if "diff --name-only" in command:
             return self._sentinel("\n".join(self._changed_paths), 0)
         if "git rev-parse --verify" in command:
             return self._sentinel(self._head_commits[-1] if self._head_commits else "f" * 40, 0)
         if "./update.sh" in command:
             return self._sentinel(f"update.sh exit {self.update_code}", self.update_code)
+        if "pip" in command and "--dry-run" in command:
+            return self._sentinel(f"install preflight exit {self.install_preflight_code}", self.install_preflight_code)
         if "./install.sh" in command:
             return self._sentinel(f"install.sh exit {self.install_code}", self.install_code)
         return self._sentinel("", 0)

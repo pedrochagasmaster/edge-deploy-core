@@ -115,6 +115,7 @@ def test_parser_help_lists_all_subcommands(capsys) -> None:
 def test_parser_parses_release_args() -> None:
     args = cli.build_parser().parse_args(
         ["release", "--tool", "both", "--nodes", "03,04", "--snapshot", "abc123",
+         "--tool-snapshot", "autobench=aaa", "--auth-mode", "prompt",
          "--smoke", "deep", "--fail-fast", "--report-dir", "out", "--max-auth-attempts", "5"]
     )
 
@@ -122,6 +123,8 @@ def test_parser_parses_release_args() -> None:
     assert args.tool == "both"
     assert args.nodes == "03,04"
     assert args.snapshot == "abc123"
+    assert args.tool_snapshot == ["autobench=aaa"]
+    assert args.auth_mode == "prompt"
     assert args.smoke == "deep"
     assert args.fail_fast is True
     assert args.report_dir == "out"
@@ -133,6 +136,8 @@ def test_parser_release_defaults() -> None:
 
     assert args.nodes is None
     assert args.snapshot is None
+    assert args.tool_snapshot is None
+    assert args.auth_mode == "pane"
     assert args.smoke == "standard"
     assert args.fail_fast is False
     assert args.max_auth_attempts == 3
@@ -277,6 +282,8 @@ def test_release_command_dispatches_and_writes_consolidated_report(tmp_path, mon
         captured["selection"] = selection
         captured["report_dir"] = report_dir
         captured["max_auth_attempts"] = max_auth_attempts
+        captured["auth_mode"] = kwargs["auth_mode"]
+        captured["progress_fn"] = kwargs["progress_fn"]
         return ReleaseReport(
             selection={"tools": selection.tools},
             publishes=[{"tool": "autobench", "status": "published", "snapshot": "abc"}],
@@ -296,6 +303,9 @@ def test_release_command_dispatches_and_writes_consolidated_report(tmp_path, mon
     assert selection.tools == ["autobench", "robocop"]
     assert selection.nodes == ["node03", "node04"]
     assert selection.smoke == "deep"
+    assert selection.snapshot_by_tool == {}
+    assert captured["auth_mode"] == "pane"
+    assert callable(captured["progress_fn"])
     assert captured["max_auth_attempts"] == 5
     assert (report_dir / "release.json").exists()
     assert "Release: passed" in capsys.readouterr().out
@@ -317,6 +327,34 @@ def test_release_command_nonzero_exit_on_failure(tmp_path, monkeypatch) -> None:
     )
 
     assert rc == 1
+
+
+def test_release_command_resume_loads_publish_snapshots(tmp_path, monkeypatch) -> None:
+    config_path = _write_operator_config_both(tmp_path)
+    resume_dir = tmp_path / "resume"
+    resume_dir.mkdir()
+    (resume_dir / "publish-autobench.json").write_text(
+        json.dumps({"tool": "autobench", "status": "published", "deployment_commit": "a" * 40}) + "\n",
+        encoding="utf-8",
+    )
+    (resume_dir / "publish-robocop.json").write_text(
+        json.dumps({"tool": "robocop", "status": "published", "deployment_commit": "b" * 40}) + "\n",
+        encoding="utf-8",
+    )
+    captured: dict = {}
+
+    def fake_run_release(operator, selection, *, report_dir, max_auth_attempts, **kwargs) -> ReleaseReport:
+        captured["selection"] = selection
+        captured["report_dir"] = report_dir
+        return ReleaseReport(selection={}, rollouts=[])
+
+    monkeypatch.setattr(cli, "run_release", fake_run_release)
+
+    rc = cli.main(["--config", str(config_path), "release", "--tool", "both", "--resume", str(resume_dir)])
+
+    assert rc == 0
+    assert captured["report_dir"] == resume_dir
+    assert captured["selection"].snapshot_by_tool == {"autobench": "a" * 40, "robocop": "b" * 40}
 
 
 # ---------------------------------------------------------------------------

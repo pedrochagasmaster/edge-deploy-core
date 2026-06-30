@@ -11,7 +11,7 @@ from typing import Iterator
 
 import pytest
 
-from edge_deploy.auth import authenticate_node, ensure_kerberos
+from edge_deploy.auth import authenticate_node, authenticate_node_via_pane, ensure_kerberos
 from edge_deploy.tmux_driver import AuthenticationError
 
 
@@ -66,6 +66,26 @@ def test_authenticate_noop_when_preauthed(fake_tmux) -> None:
 
     assert prompts == []
     assert driver.sent_secrets == []
+
+
+def test_pane_auth_waits_for_operator_typed_passcode_without_getpass(fake_tmux) -> None:
+    driver = fake_tmux(auth_script=["accept"])
+    messages: list[str] = []
+
+    authenticate_node_via_pane(driver, "node03", notify_fn=messages.append)
+
+    assert driver.sent_secrets == []
+    assert any("edge-node" in message or "tmux" in message for message in messages)
+
+
+def test_pane_auth_reuses_existing_authenticated_session(fake_tmux) -> None:
+    driver = fake_tmux(auth_script=["preauthed"])
+    messages: list[str] = []
+
+    authenticate_node_via_pane(driver, "node03", notify_fn=messages.append)
+
+    assert driver.sent_secrets == []
+    assert messages == []
 
 
 # ---------------------------------------------------------------------------

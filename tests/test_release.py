@@ -273,6 +273,62 @@ def test_release_snapshot_skips_publish_and_reuses_sha(fake_tmux, tmp_path, monk
     assert drivers["node03"].ran(f"./update.sh {SNAP}")
 
 
+def test_release_tool_snapshots_resume_both_tools_without_publish(
+    fake_tmux, tmp_path, monkeypatch, patched_drift
+) -> None:
+    operator = _operator()
+    monkeypatch.setattr(release, "ensure_snapshot_available", lambda root, sha, **kw: True)
+    events: list = []
+    drivers: dict = {}
+    autobench_snapshot = "a" * 40
+    robocop_snapshot = "b" * 40
+
+    def configure(name, kw):
+        kw["head_commits"] = [PREV, autobench_snapshot, PREV, robocop_snapshot]
+
+    report = run_release(
+        operator,
+        ReleaseSelection(
+            tools=["autobench", "robocop"],
+            nodes=["node03"],
+            snapshot_by_tool={"autobench": autobench_snapshot, "robocop": robocop_snapshot},
+        ),
+        report_dir=tmp_path,
+        getpass_fn=_getpass(events),
+        publish_fn=_publishing(events),
+        driver_factory=_make_factory(fake_tmux, drivers, configure=configure),
+    )
+
+    assert not any(e[0] == "publish" for e in events)
+    assert report.selection["snapshot_by_tool"] == {"autobench": autobench_snapshot, "robocop": robocop_snapshot}
+    assert drivers["node03"].ran(f"./update.sh {autobench_snapshot}")
+    assert drivers["node03"].ran(f"./update.sh {robocop_snapshot}")
+    assert report.exit_code() == 0
+
+
+def test_release_pane_auth_mode_does_not_prompt_for_passcode(fake_tmux, tmp_path, patched_drift) -> None:
+    operator = _operator()
+    events: list = []
+    drivers: dict = {}
+    progress: list[str] = []
+
+    report = run_release(
+        operator,
+        ReleaseSelection(tools=["autobench"], nodes=["node03"]),
+        report_dir=tmp_path,
+        getpass_fn=_getpass(events),
+        publish_fn=_publishing(events),
+        driver_factory=_make_factory(fake_tmux, drivers),
+        auth_mode="pane",
+        progress_fn=progress.append,
+    )
+
+    assert report.exit_code() == 0
+    assert not any(e[0] == "auth" for e in events)
+    assert any("waiting for node03 RSA" in message for message in progress)
+    assert any("published autobench" in message for message in progress)
+
+
 def test_release_snapshot_unavailable_surfaces_handoff(fake_tmux, tmp_path, monkeypatch) -> None:
     operator = _operator()
     monkeypatch.setattr(release, "ensure_snapshot_available", lambda root, sha, **kw: False)

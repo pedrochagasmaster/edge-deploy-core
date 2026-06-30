@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from edge_deploy.auth import authenticate_node, ensure_kerberos
+from edge_deploy.auth import authenticate_node, authenticate_node_via_pane, ensure_kerberos
 from edge_deploy.config import OperatorConfig, load_tool_profile
 from edge_deploy.publish import PublishError, PublishResult, publish_snapshot
 from edge_deploy.reporting import (
@@ -47,6 +47,7 @@ class ReleaseSelection:
     tools: list[str]  # resolved from --tool {autobench|robocop|both}
     nodes: list[str]  # resolved node names (default: all configured)
     snapshot: str | None = None  # --snapshot <sha> -> skip Publish, roll out an existing Snapshot
+    snapshot_by_tool: dict[str, str] | None = None  # per-tool resume map, e.g. {"autobench": "..."}
     smoke: str = "standard"  # "standard" | "deep"
     fail_fast: bool = False
 
@@ -238,6 +239,9 @@ def run_release(
     clock: Callable[[], datetime] = _utc_now,
     remote: str = "bitbucket",
     max_auth_attempts: int = 3,
+    auth_mode: str = "prompt",
+    auth_wait_seconds: float = 300.0,
+    progress_fn: Callable[[str], None] | None = None,
 ) -> ReleaseReport:
     """Run one Release and return the consolidated :class:`ReleaseReport`.
 
@@ -257,9 +261,52 @@ def run_release(
     recorded: dict[tuple[str, str], dict[str, Any]] = {}
     stop = False  # set by --fail-fast on the first non-success
 
+    def progress(message: str) -> None:
+        if progress_fn is not None:
+            progress_fn(message)
+
     # ---- PUBLISH (skipped entirely when --snapshot reuses an existing Snapshot) ----
-    if selection.snapshot:
+    if selection.snapshot_by_tool:
         for tool in tools:
+            snapshot = selection.snapshot_by_tool.get(tool)
+            if not snapshot:
+                for node_name in node_names:
+                    recorded[(node_name, tool)] = _compact_rollout(
+                        tool=tool,
+                        node=node_name,
+                        status="skipped",
+                        state_left="no snapshot supplied for this tool",
+                    )
+                continue
+            progress(f"checking local availability of {tool} snapshot {snapshot}")
+            if ensure_snapshot_available(local_roots[tool], snapshot, remote=remote):
+                snapshots[tool] = snapshot
+            else:
+                state_left = (
+                    f"snapshot {snapshot} not available locally for drift; "
+                    f"run: git fetch {remote} (in {local_roots[tool]}) then re-run"
+                )
+                for node_name in node_names:
+                    node = operator.node(node_name)
+                    synthetic = _synthetic_report(
+                        "failed",
+                        node,
+                        profiles[tool].repo_path,
+                        deployment_commit=snapshot,
+                        check=ReportCheck("snapshot_unavailable", False, state_left),
+                    )
+                    path = write_report(report_dir / f"rollout-{tool}-{node_name}.json", synthetic)
+                    recorded[(node_name, tool)] = _compact_rollout(
+                        tool=tool,
+                        node=node_name,
+                        status="failed",
+                        state_left=state_left,
+                        deployment_commit=snapshot,
+                        report_path=path,
+                    )
+    elif selection.snapshot:
+        for tool in tools:
+            progress(f"checking local availability of {tool} snapshot {selection.snapshot}")
             if ensure_snapshot_available(local_roots[tool], selection.snapshot, remote=remote):
                 snapshots[tool] = selection.snapshot
             else:
@@ -293,8 +340,10 @@ def run_release(
             if stop:
                 break
             try:
+                progress(f"publishing {tool}")
                 result = publish_fn(profiles[tool], repo_root=local_roots[tool], remote=remote, clock=clock)
             except PublishError as exc:
+                progress(f"publish failed for {tool}: {exc}")
                 publishes.append({"tool": tool, "status": "failed", "snapshot": None, "error": str(exc)})
                 for node_name in node_names:
                     recorded[(node_name, tool)] = _compact_rollout(
@@ -309,6 +358,7 @@ def run_release(
             snapshots[tool] = result.snapshot
             publish_path = _write_publish_report(report_dir, tool, result, local_roots[tool])
             publishes.append({**result.to_payload(), "report_path": str(publish_path)})
+            progress(f"published {tool}: {result.snapshot}")
 
     # ---- ROLLOUT fan-out: nodes outer, tools inner (one reused pane per node) ----
     if snapshots and not stop:
@@ -319,7 +369,16 @@ def run_release(
             driver = driver_factory(node, profiles[tools[0]])  # chrome/tui_exit from the first tool (Risk #7)
 
             try:
-                authenticate_node(driver, node_name, getpass_fn=getpass_fn, max_attempts=max_auth_attempts)
+                if auth_mode == "pane":
+                    authenticate_node_via_pane(
+                        driver,
+                        node_name,
+                        notify_fn=progress,
+                        wait_timeout=auth_wait_seconds,
+                    )
+                else:
+                    progress(f"waiting for {node_name} RSA prompt")
+                    authenticate_node(driver, node_name, getpass_fn=getpass_fn, max_attempts=max_auth_attempts)
             except (AuthenticationError, SessionGoneError, TimeoutError) as exc:
                 # Never block other nodes (ADR-0003): record every still-open pair as failed.
                 for tool in tools:
@@ -357,6 +416,7 @@ def run_release(
                 snapshot = snapshots[tool]
                 profile = profiles[tool]
                 try:
+                    progress(f"rolling out {tool}/{node_name} -> {snapshot}")
                     report = run_rollout(
                         driver,
                         profile,
@@ -395,6 +455,7 @@ def run_release(
                     state_left = _engine_state_left(report)
 
                 path = write_report(report_dir / f"rollout-{tool}-{node_name}.json", report)
+                progress(f"{tool}/{node_name}: {report.status}")
                 recorded[(node_name, tool)] = _compact_rollout(
                     tool=tool,
                     node=node_name,
@@ -437,6 +498,7 @@ def run_release(
             "smoke": selection.smoke,
             "fail_fast": selection.fail_fast,
             "snapshot_override": selection.snapshot,
+            "snapshot_by_tool": dict(selection.snapshot_by_tool or {}),
         },
         publishes=publishes,
         rollouts=rollouts,

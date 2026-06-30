@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import re
 from dataclasses import dataclass
 
 from edge_deploy.config import ToolProfile
@@ -87,14 +88,51 @@ def build_update_command(profile: ToolProfile, target_commit: str, *, remote: st
     )
 
 
+def _install_python_expr() -> str:
+    """Shell expression resolving the preferred Edge Python for install.sh."""
+    return (
+        "$(dsw=$(command -v dswpython310 2>/dev/null); "
+        "case \"$dsw\" in \"alias dswpython310='\"*) "
+        "printf %s \"$dsw\" | sed \"s/^alias dswpython310='//;s/'$//\";; "
+        "?*) printf %s \"$dsw\";; "
+        "*) command -v python3.10 || "
+        "if [ -x /sys_apps_01/python/python310/bin/python3.10 ]; then "
+        "printf %s /sys_apps_01/python/python310/bin/python3.10; "
+        "else command -v python3.11; fi;; "
+        "esac)"
+    )
+
+
 def build_install_command(profile: ToolProfile, *, operator_email: str = "") -> str:
     """``install.sh`` with the standardized python-bin/email env (ADR-0004)."""
-    py = "$(command -v python3.11 || command -v python3.10)"
+    py = _install_python_expr()
     parts: list[str] = []
     if operator_email:
         parts.append(f"EDGE_DEPLOY_EMAIL={operator_email}")
     parts.append(f"EDGE_DEPLOY_PYTHON_BIN={py}")
     parts.append("./install.sh")
+    return " ".join(parts)
+
+
+def build_install_preflight_command(profile: ToolProfile, *, operator_email: str = "") -> str:
+    """Dry-run offline wheel resolution before running install.sh."""
+    py = _install_python_expr()
+    parts: list[str] = []
+    if operator_email:
+        parts.append(f"EDGE_DEPLOY_EMAIL={operator_email}")
+    parts.append(f"EDGE_DEPLOY_PYTHON_BIN={py}")
+    parts.append(
+        "sh -u -c '"
+        "if [ -d offline_packages ] || [ -d vendor ]; then "
+        "tmp=$(mktemp -d) || exit 1; "
+        "\"$EDGE_DEPLOY_PYTHON_BIN\" -m venv \"$tmp/venv\" && "
+        "\"$tmp/venv/bin/pip\" install --dry-run --no-index "
+        "--find-links=\"$PWD/offline_packages\" --find-links=\"$PWD/vendor\" "
+        "-r \"$PWD/requirements.txt\"; "
+        "rc=$?; rm -rf \"$tmp\"; exit \"$rc\"; "
+        "fi"
+        "'"
+    )
     return " ".join(parts)
 
 
@@ -105,9 +143,34 @@ def _remote_git_output(driver: TmuxDriver, repo_path: str, command: str, *, time
     return screen
 
 
+def _remote_payload_lines(screen: str) -> list[str]:
+    """Return command payload lines, excluding echoed prompts and run_remote sentinels."""
+    lines: list[str] = []
+    for raw in screen.splitlines():
+        line = raw.strip()
+        if not line or "__RC_" in line or "__START_" in line:
+            continue
+        if re.search(r"[\$#]\s*$", line):
+            continue
+        if re.search(r"[\$#]\s*cd\s+", line):
+            continue
+        if "git fetch --prune" in line or "git diff --name-only" in line or "printf " in line:
+            continue
+        lines.append(line)
+    return lines
+
+
+def _output_tail(screen: str, *, limit: int = 20) -> str:
+    lines = _remote_payload_lines(screen)
+    return "\n".join(lines[-limit:])
+
+
 def _remote_rev_parse(driver: TmuxDriver, repo_path: str, ref: str) -> str:
     screen = _remote_git_output(driver, repo_path, f"git rev-parse --verify {ref}", timeout=30)
-    return screen.strip().splitlines()[-2 if "__RC_" in screen else -1].strip()
+    for line in reversed(_remote_payload_lines(screen)):
+        if re.fullmatch(r"[0-9a-f]{40}", line):
+            return line
+    raise RuntimeError(f"Could not parse git rev-parse output for {ref!r}")
 
 
 def remote_changed_paths(
@@ -125,12 +188,11 @@ def remote_changed_paths(
         repo_path,
         (
             f"git fetch --prune {remote} {branch}:refs/remotes/{remote}/{branch} >/dev/null 2>&1 && "
-            f"git diff --name-only {previous} {target}"
+            f"git --no-pager diff --name-only {previous} {target}"
         ),
         timeout=90,
     )
-    lines = [line.strip() for line in screen.splitlines() if line.strip()]
-    return [line for line in lines if not line.startswith("git ") and "__RC_" not in line]
+    return _remote_payload_lines(screen)
 
 
 def _permission_evidence(driver: TmuxDriver, profile: ToolProfile) -> dict[str, object]:
@@ -168,7 +230,9 @@ print("PERMISSION_PAYLOAD_END")
     screen, code = _remote_python(driver, script, timeout=120)
     if code != 0:
         raise RuntimeError(f"Permission verification failed with exit code {code}")
-    payload = _extract_payload(screen, "PERMISSION_PAYLOAD_START", "PERMISSION_PAYLOAD_END")
+    payload = "".join(
+        _extract_payload(screen, "PERMISSION_PAYLOAD_START", "PERMISSION_PAYLOAD_END").splitlines()
+    )
     return json.loads(payload)
 
 
@@ -243,11 +307,31 @@ def run_rollout(
     )
 
     if install.action == "run":
-        _install_screen, install_code = driver.run_remote(
-            f"cd {repo_path} && {build_install_command(profile, operator_email=operator_email)}",
+        preflight_screen, preflight_code = driver.run_remote(
+            f"cd {repo_path} && {build_install_preflight_command(profile, operator_email=operator_email)}",
             timeout=240,
         )
-        checks.append(ReportCheck("install", install_code == 0, install.reason, {"exit_code": install_code}))
+        checks.append(
+            ReportCheck(
+                "install_preflight",
+                preflight_code == 0,
+                f"offline install dry-run exit {preflight_code}",
+                {"exit_code": preflight_code, "output_tail": _output_tail(preflight_screen)},
+            )
+        )
+        if preflight_code == 0:
+            install_screen, install_code = driver.run_remote(
+                f"cd {repo_path} && {build_install_command(profile, operator_email=operator_email)}",
+                timeout=240,
+            )
+            checks.append(
+                ReportCheck(
+                    "install",
+                    install_code == 0,
+                    install.reason,
+                    {"exit_code": install_code, "output_tail": _output_tail(install_screen)},
+                )
+            )
     else:
         checks.append(ReportCheck("install", True, install.reason))
 

@@ -486,14 +486,23 @@ class TmuxDriver:
         self.send_key("C-u")
 
         nonce = uuid.uuid4().hex[:12]
-        # The ``'`` split keeps the literal marker out of the echoed command line: bash
-        # concatenates ``'\n__RC'`` + ``'_<nonce>_%s__\n'`` so only the printed output
-        # contains ``__RC_<nonce>_<code>__``.
-        marker_cmd = f"{command}; printf '\\n__RC''_{nonce}_%s__\\n' \"$?\""
+        # The ``'`` split keeps literal markers out of the echoed command line: bash
+        # concatenates them so only printed output contains the start/end sentinels.
+        start_marker = f"__START_{nonce}__"
+        marker_cmd = (
+            f"printf '\\n__START''_{nonce}__\\n'; "
+            f"{command}; printf '\\n__RC''_{nonce}_%s__\\n' \"$?\""
+        )
         self.send_keys(marker_cmd)
 
         pattern = rf"__RC_{nonce}_(\d+)__"
-        screen = self.wait_for(pattern, timeout=timeout, poll_interval=0.5)
+        self.wait_for(pattern, timeout=timeout, poll_interval=0.5)
+        screen = self.capture_screen(history_lines=2000)
+        start_index = screen.rfind(start_marker)
+        if start_index != -1:
+            match_after_start = re.search(pattern, screen[start_index:])
+            if match_after_start:
+                screen = screen[start_index:start_index + match_after_start.end()]
         match = re.search(pattern, screen)
         exit_code = int(match.group(1)) if match else -1
         return screen, exit_code

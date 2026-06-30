@@ -122,6 +122,15 @@ def test_build_install_command_includes_email_only_when_present(real_profile) ->
     assert "EDGE_DEPLOY_EMAIL=" not in without_email
 
 
+def test_build_install_command_prefers_dswpython310_alias_then_python310(real_profile) -> None:
+    command = build_install_command(real_profile, operator_email="op@example.com")
+
+    assert "command -v dswpython310" in command
+    assert "alias dswpython310=" in command
+    assert "/sys_apps_01/python/python310/bin/python3.10" in command
+    assert "command -v python3.11" in command
+
+
 # ---------------------------------------------------------------------------
 # run_rollout — success
 # ---------------------------------------------------------------------------
@@ -154,7 +163,10 @@ def test_run_rollout_success_contract(
     assert payload["previous_remote_commit"] == PREVIOUS
     assert payload["changed_paths"] == changed
     assert "refused_paths" not in payload
-    assert {check["name"] for check in payload["checks"]} == {"update", "final_commit", "install", "permissions"}
+    expected_checks = {"update", "final_commit", "install", "permissions"}
+    if expect_install == "run":
+        expected_checks.add("install_preflight")
+    assert {check["name"] for check in payload["checks"]} == expected_checks
 
 
 @pytest.mark.parametrize("tool, changed", SAFE_CHANGE)
@@ -166,7 +178,7 @@ def test_run_rollout_records_authenticated_pane_calls(load_profile, sample_node,
 
     # HEAD is read before and after update; the diff is taken once.
     assert sum("git rev-parse --verify HEAD" in c for c in driver.commands) == 2
-    assert sum("git diff --name-only" in c for c in driver.commands) == 1
+    assert sum("diff --name-only" in c for c in driver.commands) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +223,40 @@ def test_run_rollout_failed_when_update_errors(load_profile, sample_node, fake_t
     assert report.status == "failed"
     update_check = next(check for check in report.checks if check.name == "update")
     assert update_check.passed is False
+
+
+@pytest.mark.parametrize("tool, changed", SAFE_CHANGE)
+def test_run_rollout_records_install_output_tail_on_failure(
+    load_profile, sample_node, fake_tmux, tool, changed
+) -> None:
+    profile = load_profile(tool)
+    driver = fake_tmux(head_commits=[PREVIOUS, TARGET], changed_paths=changed, install_code=1)
+
+    report = run_rollout(driver, profile, sample_node, target_commit=TARGET, install_mode="always")
+
+    install_check = next(check for check in report.checks if check.name == "install")
+    assert install_check.passed is False
+    assert install_check.evidence is not None
+    assert install_check.evidence["exit_code"] == 1
+    assert "install.sh exit 1" in install_check.evidence["output_tail"]
+
+
+@pytest.mark.parametrize("tool, changed", SAFE_CHANGE)
+def test_run_rollout_preflights_offline_install_before_running_install(
+    load_profile, sample_node, fake_tmux, tool, changed
+) -> None:
+    profile = load_profile(tool)
+    driver = fake_tmux(head_commits=[PREVIOUS, TARGET], changed_paths=changed, install_preflight_code=1)
+
+    report = run_rollout(driver, profile, sample_node, target_commit=TARGET, install_mode="always")
+
+    assert report.status == "failed"
+    preflight_check = next(check for check in report.checks if check.name == "install_preflight")
+    assert preflight_check.passed is False
+    assert preflight_check.evidence is not None
+    assert preflight_check.evidence["exit_code"] == 1
+    assert "install preflight exit 1" in preflight_check.evidence["output_tail"]
+    assert not driver.ran("./install.sh")
 
 
 @pytest.mark.parametrize("tool, changed", SAFE_CHANGE)

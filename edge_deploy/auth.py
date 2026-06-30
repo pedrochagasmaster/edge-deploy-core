@@ -47,6 +47,53 @@ def authenticate_node(
                 raise
 
 
+def authenticate_node_via_pane(
+    driver: TmuxDriver,
+    label: str,
+    *,
+    notify_fn: Callable[[str], None] | None = None,
+    connect_timeout: float | None = None,
+    wait_timeout: float = 300.0,
+) -> None:
+    """Authenticate by letting the Operator type RSA directly into the tmux pane.
+
+    Cursor-owned terminals can be read-only to the user, so a hidden ``getpass`` prompt can
+    trap the release. Pane auth makes the interactive boundary explicit: start the SSH pane,
+    tell the Operator which tmux session is waiting, then poll until it reaches a shell.
+    """
+    try:
+        session_exists = driver.session_exists()
+    except Exception:
+        session_exists = False
+
+    if session_exists:
+        try:
+            if driver.at_shell_prompt():
+                return
+        except AttributeError:
+            pass
+        except Exception:
+            session_exists = False
+        else:
+            if notify_fn is not None:
+                notify_fn(
+                    f"waiting for {label} RSA in existing tmux session {driver.session!r}; "
+                    f"enter the current PASSCODE in that pane"
+                )
+            driver.await_authenticated(timeout=wait_timeout)
+            return
+
+    if driver.start_session(connect_timeout=connect_timeout):
+        return
+
+    if notify_fn is not None:
+        notify_fn(
+            f"waiting for {label} RSA in tmux session {driver.session!r}; "
+            f"attach or open that pane and enter the current PASSCODE"
+        )
+    driver.await_authenticated(timeout=wait_timeout)
+
+
 def ensure_kerberos(
     driver: TmuxDriver,
     label: str,

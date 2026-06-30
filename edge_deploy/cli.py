@@ -9,6 +9,7 @@ tool's ToolProfile), establishes an Authenticated Pane, and calls the engine. Th
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,10 +42,24 @@ def build_parser() -> argparse.ArgumentParser:
     release_parser.add_argument("--tool", required=True, choices=("autobench", "robocop", "both"))
     release_parser.add_argument("--nodes", default=None, help="Comma list (e.g. 03,04); default: all configured nodes")
     release_parser.add_argument("--snapshot", default=None, help="Skip Publish; roll out this existing Snapshot SHA")
+    release_parser.add_argument(
+        "--tool-snapshot",
+        action="append",
+        default=None,
+        metavar="TOOL=SHA",
+        help="Skip Publish for this tool and roll out its existing Snapshot SHA; repeat per tool",
+    )
+    release_parser.add_argument(
+        "--resume",
+        default=None,
+        help="Resume from an existing release report dir by loading publish-<tool>.json snapshots",
+    )
     release_parser.add_argument("--smoke", choices=("standard", "deep"), default="standard")
     release_parser.add_argument("--fail-fast", action="store_true", help="Stop on the first non-success (ADR-0003)")
     release_parser.add_argument("--report-dir", default=None, help="Default: ./edge-deploy/reports/release-<UTC>/")
     release_parser.add_argument("--max-auth-attempts", type=int, default=3)
+    release_parser.add_argument("--auth-mode", choices=("pane", "prompt"), default="pane")
+    release_parser.add_argument("--auth-wait-seconds", type=float, default=300.0)
 
     publish_parser = subparsers.add_parser("publish", help="Publish one Tool's Snapshot to its Bitbucket remote")
     publish_parser.add_argument("--tool", required=True, choices=TOOL_CHOICES, help="Per-tool; no 'both'")
@@ -108,6 +123,49 @@ def _default_report_dir() -> Path:
     return Path("edge-deploy") / "reports" / f"release-{stamp}"
 
 
+def _parse_tool_snapshots(values: list[str] | None) -> dict[str, str]:
+    snapshots: dict[str, str] = {}
+    for value in values or []:
+        tool, sep, snapshot = value.partition("=")
+        if not sep or not tool or not snapshot:
+            raise ValueError("--tool-snapshot must be TOOL=SHA")
+        snapshots[tool] = snapshot
+    return snapshots
+
+
+def _load_resume_snapshots(report_dir: Path, tools: list[str]) -> dict[str, str]:
+    snapshots: dict[str, str] = {}
+    for tool in tools:
+        path = report_dir / f"publish-{tool}.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        snapshot = payload.get("deployment_commit") or payload.get("snapshot")
+        if payload.get("status") != "published" or not snapshot:
+            raise ValueError(f"Cannot resume {tool}: {path} is not a successful publish report")
+        snapshots[tool] = str(snapshot)
+    return snapshots
+
+
+def _load_resume_publishes(report_dir: Path, tools: list[str]) -> list[dict]:
+    publishes: list[dict] = []
+    for tool in tools:
+        path = report_dir / f"publish-{tool}.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        snapshot = payload.get("deployment_commit") or payload.get("snapshot")
+        publishes.append(
+            {
+                "tool": payload.get("tool", tool),
+                "status": payload.get("status", "failed"),
+                "snapshot": snapshot,
+                "source_short": payload.get("source_short"),
+                "branch": payload.get("branch"),
+                "previous_remote_commit": payload.get("previous_remote_commit"),
+                "message": payload.get("message", ""),
+                "report_path": str(path),
+            }
+        )
+    return publishes
+
+
 def _print_release_summary(report, consolidated_path: Path) -> None:
     summary = report.summary()
     counts = summary["counts"]
@@ -126,15 +184,34 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
     tools = resolve_tools(args.tool)
     for tool in tools:
         operator.tool_path(tool)  # validate each selected tool is configured (raises KeyError)
+    if args.resume:
+        report_dir = Path(args.resume)
+    elif args.report_dir:
+        report_dir = Path(args.report_dir)
+    else:
+        report_dir = _default_report_dir()
+    snapshot_by_tool = _parse_tool_snapshots(args.tool_snapshot)
+    if args.resume:
+        snapshot_by_tool.update(_load_resume_snapshots(report_dir, tools))
     selection = ReleaseSelection(
         tools=tools,
         nodes=resolve_nodes(operator, args.nodes),
         snapshot=args.snapshot,
+        snapshot_by_tool=snapshot_by_tool,
         smoke=args.smoke,
         fail_fast=args.fail_fast,
     )
-    report_dir = Path(args.report_dir) if args.report_dir else _default_report_dir()
-    report = run_release(operator, selection, report_dir=report_dir, max_auth_attempts=args.max_auth_attempts)
+    report = run_release(
+        operator,
+        selection,
+        report_dir=report_dir,
+        max_auth_attempts=args.max_auth_attempts,
+        auth_mode=args.auth_mode,
+        auth_wait_seconds=args.auth_wait_seconds,
+        progress_fn=lambda message: print(redact(f"[release] {message}")),
+    )
+    if args.resume:
+        report.publishes = _load_resume_publishes(report_dir, tools)
     consolidated_path = write_release_report(report_dir / "release.json", report)
     _print_release_summary(report, consolidated_path)
     return report.exit_code()
@@ -226,7 +303,7 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_drift(args, operator)
         if args.command == "preflight":
             return _cmd_preflight(args, operator)
-    except (RuntimeError, PublishError, AuthenticationError, SessionGoneError, KeyError) as exc:
+    except (RuntimeError, PublishError, AuthenticationError, SessionGoneError, KeyError, ValueError) as exc:
         print(f"{args.command} failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
     return 2

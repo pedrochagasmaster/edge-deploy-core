@@ -69,8 +69,8 @@ def local_runtime_map(profile: ToolProfile, root: str | Path, commit: str) -> di
 
 
 def _extract_payload(screen: str, start: str, end: str) -> str:
-    start_index = screen.find(start)
-    end_index = screen.find(end)
+    start_index = screen.rfind(start)
+    end_index = screen.find(end, start_index + len(start)) if start_index != -1 else -1
     if start_index == -1 or end_index == -1 or end_index <= start_index:
         raise RuntimeError(f"Could not find payload markers {start!r} / {end!r}")
     return screen[start_index + len(start):end_index].strip()
@@ -105,7 +105,7 @@ print("DRIFT_PAYLOAD_END")
     screen, code = _remote_python(driver, script, timeout=120)
     if code != 0:
         raise RuntimeError(f"Remote runtime scan failed with exit code {code}")
-    payload = _extract_payload(screen, "DRIFT_PAYLOAD_START", "DRIFT_PAYLOAD_END")
+    payload = "".join(_extract_payload(screen, "DRIFT_PAYLOAD_START", "DRIFT_PAYLOAD_END").splitlines())
     return json.loads(payload)
 
 

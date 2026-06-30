@@ -103,13 +103,16 @@ def test_run_remote_returns_output_and_exit_code() -> None:
         patch.object(driver, "send_keys", side_effect=fake_send_keys),
         patch.object(driver, "send_key"),
         patch.object(driver, "wait_for") as wait_for,
+        patch.object(driver, "capture_screen") as capture_screen,
     ):
 
         def fake_wait(pattern: str, **kwargs: object) -> str:
             nonce = pattern.split("__RC_")[1].split("_(")[0]
+            captured["nonce"] = nonce
             return f"some output\n__RC_{nonce}_0__\n"
 
         wait_for.side_effect = fake_wait
+        capture_screen.side_effect = lambda history_lines=0: f"some output\n__RC_{captured['nonce']}_0__\n"
         screen, code = driver.run_remote("which dispatch")
 
     assert code == 0
@@ -121,19 +124,62 @@ def test_run_remote_returns_output_and_exit_code() -> None:
 
 def test_run_remote_parses_nonzero_exit_code() -> None:
     driver = TmuxDriver("user@edge", "session", "/repo")
+    captured: dict[str, str] = {}
 
     with (
         patch.object(driver, "return_to_shell", return_value=True),
         patch.object(driver, "send_keys"),
         patch.object(driver, "send_key"),
         patch.object(driver, "wait_for") as wait_for,
+        patch.object(driver, "capture_screen") as capture_screen,
     ):
 
         def fake_wait(pattern: str, **kwargs: object) -> str:
             nonce = pattern.split("__RC_")[1].split("_(")[0]
+            captured["nonce"] = nonce
             return f"boom\n__RC_{nonce}_7__\n"
 
         wait_for.side_effect = fake_wait
+        capture_screen.side_effect = lambda history_lines=0: f"boom\n__RC_{captured['nonce']}_7__\n"
         _, code = driver.run_remote("false", ensure_shell=False)
 
     assert code == 7
+
+
+def test_run_remote_returns_only_latest_command_block_from_history() -> None:
+    driver = TmuxDriver("user@edge", "session", "/repo")
+    captured: dict[str, str] = {}
+
+    def fake_send_keys(keys: str, *, literal: bool = False) -> None:
+        captured["cmd"] = keys
+
+    with (
+        patch.object(driver, "return_to_shell", return_value=True),
+        patch.object(driver, "send_keys", side_effect=fake_send_keys),
+        patch.object(driver, "send_key"),
+        patch.object(driver, "wait_for") as wait_for,
+        patch.object(driver, "capture_screen") as capture_screen,
+    ):
+
+        def fake_wait(pattern: str, **kwargs: object) -> str:
+            nonce = pattern.split("__RC_")[1].split("_(")[0]
+            captured["nonce"] = nonce
+            return f"new output\n__RC_{nonce}_0__\n"
+
+        wait_for.side_effect = fake_wait
+
+        def fake_capture(history_lines: int = 0) -> str:
+            nonce = captured["nonce"]
+            return (
+                "old command\n__START_old__\nold output\n__RC_old_0__\n"
+                f"echoed command\n__START_{nonce}__\nnew output\n__RC_{nonce}_0__\n"
+                "prompt$ "
+            )
+
+        capture_screen.side_effect = fake_capture
+        screen, code = driver.run_remote("echo new")
+
+    assert code == 0
+    assert "new output" in screen
+    assert "old output" not in screen
+    assert "__START''_" in captured["cmd"]
