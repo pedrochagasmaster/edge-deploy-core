@@ -8,6 +8,7 @@ result) and a real temporary git repo + local bare remote for the happy path.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -239,6 +240,35 @@ def test_run_local_check_no_powershell_raises(tmp_path, monkeypatch) -> None:
 
     with pytest.raises(PublishError, match="neither 'pwsh' nor 'powershell'"):
         publish.run_local_check_ps1(tmp_path)
+
+
+def test_run_local_check_prepends_repo_venv_py_shim(tmp_path, monkeypatch) -> None:
+    script = tmp_path / "tools" / "dev" / "local_check.ps1"
+    script.parent.mkdir(parents=True)
+    script.write_text("py -m pytest\n", encoding="utf-8")
+    venv_python = tmp_path / ".venv" / "Scripts" / "python.exe"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.write_text("", encoding="utf-8")
+    monkeypatch.setattr(publish, "_resolve_powershell", lambda: "pwsh")
+    seen: dict[str, object] = {}
+
+    def fake_run(argv, *, cwd, capture_output, text, env):
+        shim_dir = Path(str(env["PATH"]).split(os.pathsep)[0])
+        shim = shim_dir / "py.cmd"
+        seen["argv"] = argv
+        seen["cwd"] = cwd
+        seen["shim_text"] = shim.read_text(encoding="utf-8")
+        seen["path_head"] = shim_dir
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(publish.subprocess, "run", fake_run)
+
+    assert publish.run_local_check_ps1(tmp_path) == 0
+
+    assert seen["argv"] == ["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)]
+    assert seen["cwd"] == str(tmp_path)
+    assert str(venv_python) in str(seen["shim_text"])
+    assert Path(seen["path_head"]).parent == tmp_path
 
 
 # ---------------------------------------------------------------------------

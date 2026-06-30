@@ -58,8 +58,10 @@ def build_parser() -> argparse.ArgumentParser:
     release_parser.add_argument("--fail-fast", action="store_true", help="Stop on the first non-success (ADR-0003)")
     release_parser.add_argument("--report-dir", default=None, help="Default: ./edge-deploy/reports/release-<UTC>/")
     release_parser.add_argument("--max-auth-attempts", type=int, default=3)
-    release_parser.add_argument("--auth-mode", choices=("pane", "prompt"), default="pane")
+    release_parser.add_argument("--auth-mode", choices=("auto", "prompt", "pane"), default="auto")
     release_parser.add_argument("--auth-wait-seconds", type=float, default=300.0)
+    release_parser.add_argument("--heartbeat-interval", type=float, default=30.0)
+    release_parser.add_argument("--stall-threshold", type=float, default=300.0)
 
     publish_parser = subparsers.add_parser("publish", help="Publish one Tool's Snapshot to its Bitbucket remote")
     publish_parser.add_argument("--tool", required=True, choices=TOOL_CHOICES, help="Per-tool; no 'both'")
@@ -145,27 +147,6 @@ def _load_resume_snapshots(report_dir: Path, tools: list[str]) -> dict[str, str]
     return snapshots
 
 
-def _load_resume_publishes(report_dir: Path, tools: list[str]) -> list[dict]:
-    publishes: list[dict] = []
-    for tool in tools:
-        path = report_dir / f"publish-{tool}.json"
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        snapshot = payload.get("deployment_commit") or payload.get("snapshot")
-        publishes.append(
-            {
-                "tool": payload.get("tool", tool),
-                "status": payload.get("status", "failed"),
-                "snapshot": snapshot,
-                "source_short": payload.get("source_short"),
-                "branch": payload.get("branch"),
-                "previous_remote_commit": payload.get("previous_remote_commit"),
-                "message": payload.get("message", ""),
-                "report_path": str(path),
-            }
-        )
-    return publishes
-
-
 def _print_release_summary(report, consolidated_path: Path) -> None:
     summary = report.summary()
     counts = summary["counts"]
@@ -208,10 +189,10 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
         max_auth_attempts=args.max_auth_attempts,
         auth_mode=args.auth_mode,
         auth_wait_seconds=args.auth_wait_seconds,
+        heartbeat_interval_s=args.heartbeat_interval,
+        stall_threshold_s=args.stall_threshold,
         progress_fn=lambda message: print(redact(f"[release] {message}")),
     )
-    if args.resume:
-        report.publishes = _load_resume_publishes(report_dir, tools)
     consolidated_path = write_release_report(report_dir / "release.json", report)
     _print_release_summary(report, consolidated_path)
     return report.exit_code()

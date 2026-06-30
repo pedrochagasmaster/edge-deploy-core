@@ -97,6 +97,7 @@ class FakeTmuxDriver:
         auth_script: list[str] | None = None,
         klist_code: int | list[int] = 0,
         command_codes: dict[str, int] | None = None,
+        fetch_script: list[tuple[int, str]] | None = None,
     ) -> None:
         self.commands: list[str] = []
         self.call_log: list[dict[str, Any]] = []
@@ -111,8 +112,11 @@ class FakeTmuxDriver:
         self._auth_script = list(auth_script) if auth_script else ["accept"]
         self._klist_codes = [klist_code] if isinstance(klist_code, int) else list(klist_code) or [0]
         self._command_codes = dict(command_codes) if command_codes else {}
+        self._fetch_script = list(fetch_script) if fetch_script else [(0, "")]
         self.sent_secrets: list[str] = []
         self.sent_keys: list[str] = []
+        self.start_session_calls: list[dict[str, Any]] = []
+        self.await_timeouts: list[float | None] = []
         # Attributes the CLI/engine read directly off a driver.
         self.session = "fake-session"
         self.host = "user@edge.example"
@@ -124,6 +128,7 @@ class FakeTmuxDriver:
         return True
 
     def start_session(self, *args: Any, **kwargs: Any) -> bool:
+        self.start_session_calls.append(dict(kwargs))
         # Phase 1 callers never reached this (session_exists() short-circuits); Phase 2's
         # auth seam relies on it reporting the auth prompt (``False``) unless preauthed.
         return self._auth_script[0] == "preauthed" if self._auth_script else False
@@ -141,6 +146,7 @@ class FakeTmuxDriver:
         self.sent_secrets.append(secret)
 
     def await_authenticated(self, *, timeout: float | None = None, poll_interval: float = 1.0) -> None:
+        self.await_timeouts.append(timeout)
         outcome = self._auth_script.pop(0) if self._auth_script else "accept"
         if outcome == "reject":
             raise AuthenticationError("Edge Node re-prompted for a PASSCODE — the code was stale or wrong.")
@@ -209,9 +215,14 @@ class FakeTmuxDriver:
                 )
                 return self._sentinel(body, 0)
             return self._sentinel("", 0)
+        if "rev-parse --is-inside-work-tree" in command:
+            return self._sentinel("true", 0)
+        if "git fetch --prune" in command:
+            code, body = self._fetch_script.pop(0) if len(self._fetch_script) > 1 else self._fetch_script[0]
+            return self._sentinel(body, code)
         if "git rev-parse --verify HEAD" in command:
             return self._sentinel(self._next_head(), 0)
-        if "diff --name-only" in command:
+        if "git --no-pager diff --name-only" in command or "diff --name-only" in command:
             return self._sentinel("\n".join(self._changed_paths), 0)
         if "git rev-parse --verify" in command:
             return self._sentinel(self._head_commits[-1] if self._head_commits else "f" * 40, 0)

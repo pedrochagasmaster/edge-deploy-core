@@ -30,6 +30,42 @@ from edge_deploy.tmux_driver import TmuxDriver
 # The status values a single Rollout can report.
 ROLLOUT_STATUSES = ("rolled_out", "failed", "skipped", "refused")
 
+_TRANSIENT_GIT_MARKERS = (
+    "unable to access",
+    "could not resolve host",
+    "timed out",
+    "rpc failed",
+    "remote end hung up",
+    "connection reset",
+)
+_PERMANENT_GIT_MARKERS = (
+    "not a git repository",
+    "bad object",
+    "unknown revision",
+    "invalid ref",
+)
+
+
+@dataclass(frozen=True)
+class RemoteGitPreflightFailure:
+    """Structured evidence when remote verify/fetch/diff preflight fails."""
+
+    step: str
+    command: str
+    exit_code: int
+    output_tail: str
+    transient: bool
+    attempts: int
+    suggested_action: str
+
+
+class RemoteGitPreflightError(RuntimeError):
+    """Raised when remote git preflight fails; carries structured evidence."""
+
+    def __init__(self, failure: RemoteGitPreflightFailure) -> None:
+        self.failure = failure
+        super().__init__(failure.suggested_action)
+
 
 @dataclass(frozen=True)
 class InstallDecision:
@@ -136,11 +172,134 @@ def build_install_preflight_command(profile: ToolProfile, *, operator_email: str
     return " ".join(parts)
 
 
-def _remote_git_output(driver: TmuxDriver, repo_path: str, command: str, *, timeout: float = 60.0) -> str:
-    screen, code = driver.run_remote(f"cd {repo_path} && {command}", timeout=timeout)
+def _remote_git_output(driver: TmuxDriver, repo_path: str, command: str, *, timeout: float = 60.0) -> tuple[str, int]:
+    return driver.run_remote(f"cd {repo_path} && {command}", timeout=timeout)
+
+
+def _is_transient_git_error(output: str) -> bool:
+    lowered = output.lower()
+    if any(marker in lowered for marker in _PERMANENT_GIT_MARKERS):
+        return False
+    return any(marker in lowered for marker in _TRANSIENT_GIT_MARKERS)
+
+
+def _suggested_action_for_step(step: str, *, transient: bool) -> str:
+    if step == "verify":
+        return "confirm the tool repo path exists on the node and is a git checkout"
+    if step == "fetch":
+        if transient:
+            return "retry the release; if fetch keeps failing, check network and remote access from the node"
+        return "inspect fetch stderr on the node and confirm the remote branch/ref exists"
+    if step == "diff":
+        return "confirm previous and target SHAs exist on the node after fetch"
+    return "inspect remote git preflight evidence and retry when resolved"
+
+
+def _remote_git_preflight(
+    driver: TmuxDriver,
+    repo_path: str,
+    previous: str,
+    target: str,
+    *,
+    remote: str = "bitbucket",
+    branch: str = "main",
+) -> list[str]:
+    """Verify repo, fetch target branch, and diff SHAs as separate remote steps."""
+    verify_command = "git rev-parse --is-inside-work-tree"
+    screen, code = _remote_git_output(driver, repo_path, verify_command, timeout=30)
+    if code != 0 or "true" not in _remote_payload_lines(screen):
+        output_tail = _output_tail(screen)
+        raise RemoteGitPreflightError(
+            RemoteGitPreflightFailure(
+                step="verify",
+                command=verify_command,
+                exit_code=code,
+                output_tail=output_tail,
+                transient=False,
+                attempts=1,
+                suggested_action=_suggested_action_for_step("verify", transient=False),
+            )
+        )
+
+    fetch_command = f"git fetch --prune {remote} {branch}:refs/remotes/{remote}/{branch}"
+    attempts = 0
+    last_screen = ""
+    last_code = 0
+    while attempts < 2:
+        attempts += 1
+        last_screen, last_code = _remote_git_output(driver, repo_path, fetch_command, timeout=90)
+        if last_code == 0:
+            break
+        if attempts == 1 and _is_transient_git_error(last_screen):
+            continue
+        break
+    if last_code != 0:
+        transient = _is_transient_git_error(last_screen)
+        raise RemoteGitPreflightError(
+            RemoteGitPreflightFailure(
+                step="fetch",
+                command=fetch_command,
+                exit_code=last_code,
+                output_tail=_output_tail(last_screen),
+                transient=transient,
+                attempts=attempts,
+                suggested_action=_suggested_action_for_step("fetch", transient=transient),
+            )
+        )
+
+    diff_command = f"git --no-pager diff --name-only {previous} {target}"
+    screen, code = _remote_git_output(driver, repo_path, diff_command, timeout=60)
     if code != 0:
-        raise RuntimeError(f"Remote command failed ({code}): {command}")
-    return screen
+        transient = _is_transient_git_error(screen)
+        raise RemoteGitPreflightError(
+            RemoteGitPreflightFailure(
+                step="diff",
+                command=diff_command,
+                exit_code=code,
+                output_tail=_output_tail(screen),
+                transient=transient,
+                attempts=1,
+                suggested_action=_suggested_action_for_step("diff", transient=transient),
+            )
+        )
+    return _remote_payload_lines(screen)
+
+
+def _preflight_failure_report(
+    *,
+    node_name: str,
+    host: str,
+    repo_path: str,
+    target_commit: str,
+    previous_commit: str,
+    failure: RemoteGitPreflightFailure,
+) -> OperationReport:
+    evidence = {
+        "step": failure.step,
+        "command": failure.command,
+        "exit_code": failure.exit_code,
+        "output_tail": failure.output_tail,
+        "transient": failure.transient,
+        "attempts": failure.attempts,
+        "suggested_action": failure.suggested_action,
+    }
+    check = ReportCheck(
+        name="remote_git_preflight",
+        passed=False,
+        message=f"Remote git preflight failed at {failure.step}: {failure.suggested_action}",
+        evidence=evidence,
+    )
+    return OperationReport(
+        operation="rollout",
+        status="failed",
+        node=node_name,
+        host=host,
+        repo_path=repo_path,
+        deployment_commit=target_commit,
+        previous_remote_commit=previous_commit,
+        install_decision="not_applicable",
+        checks=[check],
+    )
 
 
 def _remote_payload_lines(screen: str) -> list[str]:
@@ -166,7 +325,9 @@ def _output_tail(screen: str, *, limit: int = 20) -> str:
 
 
 def _remote_rev_parse(driver: TmuxDriver, repo_path: str, ref: str) -> str:
-    screen = _remote_git_output(driver, repo_path, f"git rev-parse --verify {ref}", timeout=30)
+    screen, code = _remote_git_output(driver, repo_path, f"git rev-parse --verify {ref}", timeout=30)
+    if code != 0:
+        raise RuntimeError(f"Remote git rev-parse failed ({code}) for {ref!r}")
     for line in reversed(_remote_payload_lines(screen)):
         if re.fullmatch(r"[0-9a-f]{40}", line):
             return line
@@ -183,16 +344,9 @@ def remote_changed_paths(
     branch: str = "main",
 ) -> list[str]:
     """Changed paths between the node's current HEAD and the target Snapshot."""
-    screen = _remote_git_output(
-        driver,
-        repo_path,
-        (
-            f"git fetch --prune {remote} {branch}:refs/remotes/{remote}/{branch} >/dev/null 2>&1 && "
-            f"git --no-pager diff --name-only {previous} {target}"
-        ),
-        timeout=90,
+    return _remote_git_preflight(
+        driver, repo_path, previous, target, remote=remote, branch=branch
     )
-    return _remote_payload_lines(screen)
 
 
 def _permission_evidence(driver: TmuxDriver, profile: ToolProfile) -> dict[str, object]:
@@ -256,9 +410,19 @@ def run_rollout(
     host = getattr(node, "host", "")
 
     previous_commit = _remote_rev_parse(driver, repo_path, "HEAD")
-    changed_paths = remote_changed_paths(
-        driver, repo_path, previous_commit, target_commit, remote=remote, branch=branch
-    )
+    try:
+        changed_paths = remote_changed_paths(
+            driver, repo_path, previous_commit, target_commit, remote=remote, branch=branch
+        )
+    except RemoteGitPreflightError as exc:
+        return _preflight_failure_report(
+            node_name=node_name,
+            host=host,
+            repo_path=repo_path,
+            target_commit=target_commit,
+            previous_commit=previous_commit,
+            failure=exc.failure,
+        )
     sensitive_changed = matching_paths(changed_paths, profile.sensitive_paths)
     refused = matching_paths(changed_paths, profile.dependency_paths)
 

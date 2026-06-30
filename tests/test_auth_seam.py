@@ -68,6 +68,24 @@ def test_authenticate_noop_when_preauthed(fake_tmux) -> None:
     assert driver.sent_secrets == []
 
 
+def test_authenticate_reuses_existing_authenticated_pane_without_restart(fake_tmux) -> None:
+    driver = fake_tmux(auth_script=["accept"])
+    driver.at_shell_prompt = lambda: True
+
+    authenticate_node(driver, "node03", getpass_fn=lambda prompt: "should-not-prompt")
+
+    assert driver.start_session_calls == []
+    assert driver.sent_secrets == []
+
+
+def test_authenticate_uses_auth_wait_seconds_after_submitting_code(fake_tmux) -> None:
+    driver = fake_tmux(auth_script=["accept"])
+
+    authenticate_node(driver, "node03", getpass_fn=lambda prompt: "11112222", wait_timeout=123.0)
+
+    assert driver.await_timeouts == [123.0]
+
+
 def test_pane_auth_waits_for_operator_typed_passcode_without_getpass(fake_tmux) -> None:
     driver = fake_tmux(auth_script=["accept"])
     messages: list[str] = []

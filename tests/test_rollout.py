@@ -16,6 +16,7 @@ from edge_deploy.rollout import (
     build_update_command,
     decide_install_action,
     matching_paths,
+    remote_changed_paths,
     run_rollout,
 )
 
@@ -270,3 +271,61 @@ def test_run_rollout_failed_on_commit_mismatch(load_profile, sample_node, fake_t
     final_check = next(check for check in report.checks if check.name == "final_commit")
     assert final_check.passed is False
     assert final_check.evidence == {"expected_commit": TARGET}
+
+
+# ---------------------------------------------------------------------------
+# Remote git preflight (verify / fetch / diff)
+# ---------------------------------------------------------------------------
+
+
+def test_remote_changed_paths_runs_verify_fetch_diff_separately(load_profile, sample_node, fake_tmux) -> None:
+    profile = load_profile("autobench")
+    driver = fake_tmux(changed_paths=["benchmark.py"])
+
+    paths = remote_changed_paths(driver, profile.repo_path, PREVIOUS, TARGET)
+
+    assert paths == ["benchmark.py"]
+    assert driver.ran("git rev-parse --is-inside-work-tree")
+    assert driver.ran("git fetch --prune bitbucket main:refs/remotes/bitbucket/main")
+    assert driver.ran(f"git --no-pager diff --name-only {PREVIOUS} {TARGET}")
+    assert not any(">/dev/null" in command for command in driver.commands)
+
+
+def test_remote_fetch_retries_once_on_transient_failure(load_profile, sample_node, fake_tmux) -> None:
+    profile = load_profile("autobench")
+    driver = fake_tmux(
+        changed_paths=["benchmark.py"],
+        fetch_script=[
+            (128, "fatal: unable to access 'https://example/repo/': connection reset"),
+            (0, ""),
+        ],
+    )
+
+    paths = remote_changed_paths(driver, profile.repo_path, PREVIOUS, TARGET)
+
+    assert paths == ["benchmark.py"]
+    fetch_commands = [command for command in driver.commands if "git fetch --prune" in command]
+    assert len(fetch_commands) == 2
+
+
+def test_run_rollout_preflight_failure_preserves_evidence(load_profile, sample_node, fake_tmux) -> None:
+    profile = load_profile("autobench")
+    driver = fake_tmux(
+        head_commits=[PREVIOUS],
+        changed_paths=["benchmark.py"],
+        fetch_script=[(128, "fatal: not a git repository: '/bad/path'")],
+    )
+
+    report = run_rollout(driver, profile, sample_node, target_commit=TARGET)
+
+    assert report.status == "failed"
+    assert not driver.ran("./update.sh")
+    check = next(check for check in report.checks if check.name == "remote_git_preflight")
+    evidence = check.evidence or {}
+    assert evidence["step"] == "fetch"
+    assert "git fetch --prune" in evidence["command"]
+    assert evidence["exit_code"] == 128
+    assert evidence["output_tail"]
+    assert evidence["transient"] is False
+    assert evidence["attempts"] == 1
+    assert evidence["suggested_action"]

@@ -24,21 +24,31 @@ def authenticate_node(
     getpass_fn: Callable[[str], str] = getpass.getpass,
     max_attempts: int = 3,
     connect_timeout: float | None = None,
+    wait_timeout: float = 300.0,
 ) -> None:
     """Bring ``driver``'s pane to an authenticated shell, prompting for the RSA passcode.
 
-    No-op if the session is already authenticated (``start_session`` returns ``True``).
-    Re-prompts for a fresh single-use code on a rejected/stale passcode, up to
-    ``max_attempts``; re-raises :class:`AuthenticationError` once attempts are exhausted.
+    Reuses an existing authenticated pane when ``at_shell_prompt()`` is true. Otherwise
+    starts a session when needed, then re-prompts for a fresh single-use code on a
+    rejected/stale passcode, up to ``max_attempts``; re-raises :class:`AuthenticationError`
+    once attempts are exhausted.
     """
+    try:
+        if driver.session_exists() and driver.at_shell_prompt():
+            return
+    except AttributeError:
+        pass
+    except Exception:
+        pass
+
     if driver.start_session(connect_timeout=connect_timeout):
-        return  # already at a shell prompt (rare)
+        return
 
     for attempt in range(1, max_attempts + 1):
         code = getpass_fn(f"[{label}] Enter RSA PASSCODE: ")  # transient; never stored
         driver.submit_secret(code)
         try:
-            driver.await_authenticated(timeout=connect_timeout)
+            driver.await_authenticated(timeout=wait_timeout)
             return
         except AuthenticationError:
             # sshd re-displayed PASSCODE: the code was stale/wrong — loop to re-prompt for a

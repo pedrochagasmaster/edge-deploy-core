@@ -7,7 +7,9 @@ real ``run_rollout`` / ``verify`` / auth-seam paths run end to end against the e
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -53,7 +55,7 @@ def _make_factory(fake_tmux, drivers: dict, *, configure=None):
     return factory
 
 
-def _publishing(events: list, *, fail: tuple[str, ...] = ()):
+def _publishing(events: list, *, fail: tuple[str, ...] = (), local_check_tail: str = ""):
     def publish_fn(profile, **kwargs):
         events.append(("publish", profile.tool))
         if profile.tool in fail:
@@ -68,6 +70,7 @@ def _publishing(events: list, *, fail: tuple[str, ...] = ()):
             previous_remote_commit="prev1234",
             message=f"Deploy snapshot: {profile.tool} src1234 on main (2026-06-29 23:00) [edge-deploy]",
             gate={"clean_tree": True, "on_release_branch": True, "local_check": True},
+            local_check_output_tail=local_check_tail or f"{profile.tool} local_check ok",
         )
 
     return publish_fn
@@ -103,6 +106,9 @@ def test_release_full_matrix_succeeds(fake_tmux, tmp_path, patched_drift) -> Non
         getpass_fn=_getpass(events),
         publish_fn=_publishing(events),
         driver_factory=_make_factory(fake_tmux, drivers),
+        auth_mode="prompt",
+        heartbeat_interval_s=3600.0,
+        stall_threshold_s=7200.0,
     )
 
     assert report.exit_code() == 0
@@ -130,6 +136,8 @@ def test_release_full_matrix_succeeds(fake_tmux, tmp_path, patched_drift) -> Non
     assert (tmp_path / "rollout-autobench-node03.json").exists()
     assert (tmp_path / "rollout-robocop-node04.json").exists()
     assert (tmp_path / "publish-robocop.json").exists()
+    assert (tmp_path / "release.json").exists()
+    assert (tmp_path / "release.log").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +157,7 @@ def test_release_publish_failure_skips_only_that_tool(fake_tmux, tmp_path, patch
         getpass_fn=_getpass(events),
         publish_fn=_publishing(events, fail=("robocop",)),
         driver_factory=_make_factory(fake_tmux, drivers),
+        auth_mode="prompt",
     )
 
     counts = report.summary()["counts"]
@@ -179,6 +188,7 @@ def test_release_auth_failure_isolated_to_node(fake_tmux, tmp_path, patched_drif
         getpass_fn=_getpass([]),
         publish_fn=_publishing([]),
         driver_factory=_make_factory(fake_tmux, drivers, configure=configure),
+        auth_mode="prompt",
         max_auth_attempts=3,
     )
 
@@ -204,6 +214,7 @@ def test_release_refused_dependency_change(fake_tmux, tmp_path, patched_drift) -
         getpass_fn=_getpass([]),
         publish_fn=_publishing([]),
         driver_factory=_make_factory(fake_tmux, drivers, configure=configure),
+        auth_mode="prompt",
     )
 
     assert report.rollouts[0]["status"] == "refused"
@@ -233,6 +244,7 @@ def test_release_fail_fast_halts_after_first_failure(fake_tmux, tmp_path, patche
         getpass_fn=_getpass([]),
         publish_fn=_publishing([]),
         driver_factory=_make_factory(fake_tmux, drivers, configure=configure),
+        auth_mode="prompt",
     )
 
     counts = report.summary()["counts"]
@@ -262,6 +274,7 @@ def test_release_snapshot_skips_publish_and_reuses_sha(fake_tmux, tmp_path, monk
         getpass_fn=_getpass(events),
         publish_fn=_publishing(events),
         driver_factory=_make_factory(fake_tmux, drivers),
+        auth_mode="prompt",
     )
 
     assert not any(e[0] == "publish" for e in events)  # Publish skipped entirely
@@ -297,6 +310,7 @@ def test_release_tool_snapshots_resume_both_tools_without_publish(
         getpass_fn=_getpass(events),
         publish_fn=_publishing(events),
         driver_factory=_make_factory(fake_tmux, drivers, configure=configure),
+        auth_mode="prompt",
     )
 
     assert not any(e[0] == "publish" for e in events)
@@ -329,6 +343,57 @@ def test_release_pane_auth_mode_does_not_prompt_for_passcode(fake_tmux, tmp_path
     assert any("published autobench" in message for message in progress)
 
 
+def test_release_auto_auth_prompts_when_stdin_is_interactive(
+    fake_tmux, tmp_path, patched_drift, monkeypatch
+) -> None:
+    operator = _operator()
+    events: list = []
+    drivers: dict = {}
+    monkeypatch.setattr(release.sys, "stdin", SimpleNamespace(isatty=lambda: True))
+
+    report = run_release(
+        operator,
+        ReleaseSelection(tools=["autobench"], nodes=["node03"]),
+        report_dir=tmp_path,
+        getpass_fn=_getpass(events),
+        publish_fn=_publishing(events),
+        driver_factory=_make_factory(fake_tmux, drivers),
+        auth_mode="auto",
+        auth_wait_seconds=77.0,
+    )
+
+    assert report.exit_code() == 0
+    assert any(e[0] == "auth" for e in events)
+    assert drivers["node03"].await_timeouts == [77.0]
+
+
+def test_release_auto_auth_falls_back_to_pane_when_stdin_is_not_interactive(
+    fake_tmux, tmp_path, patched_drift, monkeypatch
+) -> None:
+    operator = _operator()
+    events: list = []
+    drivers: dict = {}
+    progress: list[str] = []
+    monkeypatch.setattr(release.sys, "stdin", SimpleNamespace(isatty=lambda: False))
+
+    report = run_release(
+        operator,
+        ReleaseSelection(tools=["autobench"], nodes=["node03"]),
+        report_dir=tmp_path,
+        getpass_fn=_getpass(events),
+        publish_fn=_publishing(events),
+        driver_factory=_make_factory(fake_tmux, drivers),
+        auth_mode="auto",
+        auth_wait_seconds=88.0,
+        progress_fn=progress.append,
+    )
+
+    assert report.exit_code() == 0
+    assert not any(e[0] == "auth" for e in events)
+    assert drivers["node03"].await_timeouts == [88.0]
+    assert any("non-interactive" in message and "tmux pane" in message for message in progress)
+
+
 def test_release_snapshot_unavailable_surfaces_handoff(fake_tmux, tmp_path, monkeypatch) -> None:
     operator = _operator()
     monkeypatch.setattr(release, "ensure_snapshot_available", lambda root, sha, **kw: False)
@@ -341,6 +406,7 @@ def test_release_snapshot_unavailable_surfaces_handoff(fake_tmux, tmp_path, monk
         getpass_fn=_getpass([]),
         publish_fn=_publishing([]),
         driver_factory=_make_factory(fake_tmux, drivers),
+        auth_mode="prompt",
     )
 
     assert report.rollouts[0]["status"] == "failed"
@@ -370,9 +436,187 @@ def test_release_deep_smoke_runs_kerberos_once_per_node(fake_tmux, tmp_path, pat
         getpass_fn=_getpass([]),
         publish_fn=_publishing([]),
         driver_factory=_make_factory(fake_tmux, drivers, configure=configure),
+        auth_mode="prompt",
     )
 
     assert report.summary()["counts"]["rolled_out"] == 2
     # Kerberos was checked on the node, and robocop's deep command ran; autobench deep is [].
     assert drivers["node03"].ran("klist -s")
     assert drivers["node03"].ran("<controlled Impala job>")
+
+
+def test_release_retries_transient_git_preflight_once(fake_tmux, tmp_path, patched_drift) -> None:
+    operator = _operator()
+    drivers: dict = {}
+    rollout_calls: list[str] = []
+
+    def configure(name, kw):
+        kw["fetch_script"] = [
+            (128, "fatal: unable to access 'https://example/repo/': connection reset"),
+            (128, "fatal: unable to access 'https://example/repo/': connection reset"),
+            (0, ""),
+        ]
+
+    original_run_rollout = release.run_rollout
+
+    def counting_run_rollout(*args, **kwargs):
+        profile = args[1]
+        rollout_calls.append(profile.tool)
+        return original_run_rollout(*args, **kwargs)
+
+    import edge_deploy.release as release_module
+
+    release_module.run_rollout = counting_run_rollout
+    try:
+        report = run_release(
+            operator,
+            ReleaseSelection(tools=["autobench"], nodes=["node03"]),
+            report_dir=tmp_path,
+            getpass_fn=_getpass([]),
+            publish_fn=_publishing([]),
+            driver_factory=_make_factory(fake_tmux, drivers, configure=configure),
+            auth_mode="prompt",
+            heartbeat_interval_s=3600.0,
+            stall_threshold_s=7200.0,
+        )
+    finally:
+        release_module.run_rollout = original_run_rollout
+
+    assert report.exit_code() == 0
+    assert rollout_calls == ["autobench", "autobench"]
+    fetch_commands = [command for command in drivers["node03"].commands if "git fetch --prune" in command]
+    assert len(fetch_commands) == 3
+
+
+def test_release_does_not_retry_permanent_git_preflight(fake_tmux, tmp_path, patched_drift) -> None:
+    operator = _operator()
+    drivers: dict = {}
+    rollout_calls: list[str] = []
+
+    def configure(name, kw):
+        kw["fetch_script"] = [(128, "fatal: not a git repository: '/bad/path'")]
+
+    original_run_rollout = release.run_rollout
+
+    def counting_run_rollout(*args, **kwargs):
+        profile = args[1]
+        rollout_calls.append(profile.tool)
+        return original_run_rollout(*args, **kwargs)
+
+    import edge_deploy.release as release_module
+
+    release_module.run_rollout = counting_run_rollout
+    try:
+        report = run_release(
+            operator,
+            ReleaseSelection(tools=["autobench"], nodes=["node03"]),
+            report_dir=tmp_path,
+            getpass_fn=_getpass([]),
+            publish_fn=_publishing([]),
+            driver_factory=_make_factory(fake_tmux, drivers, configure=configure),
+            auth_mode="prompt",
+            heartbeat_interval_s=3600.0,
+            stall_threshold_s=7200.0,
+        )
+    finally:
+        release_module.run_rollout = original_run_rollout
+
+    assert report.exit_code() == 1
+    assert rollout_calls == ["autobench"]
+    rollout = report.rollouts[0]
+    assert rollout["status"] == "failed"
+    assert "remote git preflight" in rollout["state_left"]
+    assert (tmp_path / "release.log").exists()
+    assert (tmp_path / "release-progress.json").exists()
+    log_text = (tmp_path / "release.log").read_text(encoding="utf-8")
+    assert "remote preflight autobench/node03" in log_text
+    assert "output tail:" in log_text
+    assert "not a git repository" in log_text
+
+
+def test_resume_loads_publishes_into_release_json(fake_tmux, tmp_path, monkeypatch, patched_drift) -> None:
+    operator = _operator()
+    monkeypatch.setattr(release, "ensure_snapshot_available", lambda root, sha, **kw: True)
+    autobench_snapshot = "a" * 40
+    robocop_snapshot = "b" * 40
+    (tmp_path / "publish-autobench.json").write_text(
+        json.dumps(
+            {
+                "tool": "autobench",
+                "status": "published",
+                "deployment_commit": autobench_snapshot,
+                "source_short": "src1111",
+                "branch": "main",
+                "previous_remote_commit": "prev1111",
+                "message": "Deploy snapshot: autobench",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "publish-robocop.json").write_text(
+        json.dumps(
+            {
+                "tool": "robocop",
+                "status": "published",
+                "deployment_commit": robocop_snapshot,
+                "source_short": "src2222",
+                "branch": "main",
+                "previous_remote_commit": "prev2222",
+                "message": "Deploy snapshot: robocop",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "release.log").write_text("2026-06-30T12:00:00Z [release] prior run started\n", encoding="utf-8")
+    drivers: dict = {}
+
+    def configure(name, kw):
+        kw["head_commits"] = [PREV, autobench_snapshot, PREV, robocop_snapshot]
+
+    report = run_release(
+        operator,
+        ReleaseSelection(
+            tools=["autobench", "robocop"],
+            nodes=["node03"],
+            snapshot_by_tool={"autobench": autobench_snapshot, "robocop": robocop_snapshot},
+        ),
+        report_dir=tmp_path,
+        getpass_fn=_getpass([]),
+        publish_fn=_publishing([]),
+        driver_factory=_make_factory(fake_tmux, drivers, configure=configure),
+        auth_mode="prompt",
+    )
+
+    assert len(report.publishes) == 2
+    release_json = json.loads((tmp_path / "release.json").read_text(encoding="utf-8"))
+    assert len(release_json["publishes"]) == 2
+    assert {entry["tool"] for entry in release_json["publishes"]} == {"autobench", "robocop"}
+    assert release_json["summary"]["counts"]["published"] == 2
+    log_text = (tmp_path / "release.log").read_text(encoding="utf-8")
+    assert "prior run started" in log_text
+    assert "rolling out autobench/node03" in log_text
+
+
+def test_release_log_includes_local_check_output_tail_redacted(fake_tmux, tmp_path, patched_drift) -> None:
+    operator = _operator()
+    drivers: dict = {}
+    secret = "token=super-secret-value"
+
+    report = run_release(
+        operator,
+        ReleaseSelection(tools=["autobench"], nodes=["node03"]),
+        report_dir=tmp_path,
+        getpass_fn=_getpass([]),
+        publish_fn=_publishing([], local_check_tail=f"local_check passed with {secret}"),
+        driver_factory=_make_factory(fake_tmux, drivers),
+        auth_mode="prompt",
+    )
+
+    assert report.exit_code() == 0
+    log_text = (tmp_path / "release.log").read_text(encoding="utf-8")
+    assert "local_check autobench output tail:" in log_text
+    assert "local_check passed with" in log_text
+    assert secret not in log_text
+    assert "token=***REDACTED***" in log_text

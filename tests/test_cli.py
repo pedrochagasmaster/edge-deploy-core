@@ -137,10 +137,27 @@ def test_parser_release_defaults() -> None:
     assert args.nodes is None
     assert args.snapshot is None
     assert args.tool_snapshot is None
-    assert args.auth_mode == "pane"
+    assert args.auth_mode == "auto"
     assert args.smoke == "standard"
     assert args.fail_fast is False
     assert args.max_auth_attempts == 3
+    assert args.heartbeat_interval == 30.0
+    assert args.stall_threshold == 300.0
+
+
+def test_parser_parses_heartbeat_and_stall_threshold() -> None:
+    args = cli.build_parser().parse_args(
+        ["release", "--tool", "autobench", "--heartbeat-interval", "15", "--stall-threshold", "120"]
+    )
+
+    assert args.heartbeat_interval == 15.0
+    assert args.stall_threshold == 120.0
+
+
+def test_parser_accepts_auto_prompt_and_pane_auth_modes() -> None:
+    for mode in ("auto", "prompt", "pane"):
+        args = cli.build_parser().parse_args(["release", "--tool", "autobench", "--auth-mode", mode])
+        assert args.auth_mode == mode
 
 
 def test_parser_parses_publish_args() -> None:
@@ -304,7 +321,7 @@ def test_release_command_dispatches_and_writes_consolidated_report(tmp_path, mon
     assert selection.nodes == ["node03", "node04"]
     assert selection.smoke == "deep"
     assert selection.snapshot_by_tool == {}
-    assert captured["auth_mode"] == "pane"
+    assert captured["auth_mode"] == "auto"
     assert callable(captured["progress_fn"])
     assert captured["max_auth_attempts"] == 5
     assert (report_dir / "release.json").exists()
@@ -346,7 +363,11 @@ def test_release_command_resume_loads_publish_snapshots(tmp_path, monkeypatch) -
     def fake_run_release(operator, selection, *, report_dir, max_auth_attempts, **kwargs) -> ReleaseReport:
         captured["selection"] = selection
         captured["report_dir"] = report_dir
-        return ReleaseReport(selection={}, rollouts=[])
+        return ReleaseReport(
+            selection={"tools": selection.tools},
+            publishes=[],
+            rollouts=[{"tool": "autobench", "node": "node03", "status": "rolled_out", "state_left": ""}],
+        )
 
     monkeypatch.setattr(cli, "run_release", fake_run_release)
 
@@ -355,6 +376,7 @@ def test_release_command_resume_loads_publish_snapshots(tmp_path, monkeypatch) -
     assert rc == 0
     assert captured["report_dir"] == resume_dir
     assert captured["selection"].snapshot_by_tool == {"autobench": "a" * 40, "robocop": "b" * 40}
+    assert (resume_dir / "release.json").exists()
 
 
 # ---------------------------------------------------------------------------

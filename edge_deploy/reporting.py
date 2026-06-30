@@ -17,12 +17,14 @@ from typing import Any
 # Secrets are forwarded transiently (RSA passcode, Kerberos password, BB token); they
 # must never reach a report or log. Match ``key=value`` up to the next whitespace/quote.
 _SECRET_RE = re.compile(r"(?i)\b(passcode|password|token)=([^\s'\"]+)")
+_BEARER_RE = re.compile(r"(?i)Authorization:\s*Bearer\s+\S+")
 _REDACTED = "***REDACTED***"
 
 
 def redact(text: str) -> str:
-    """Mask ``passcode=`` / ``password=`` / ``token=`` values in a string."""
-    return _SECRET_RE.sub(rf"\1={_REDACTED}", text)
+    """Mask secret assignments and Bearer auth headers in a string."""
+    masked = _SECRET_RE.sub(rf"\1={_REDACTED}", text)
+    return _BEARER_RE.sub(f"Authorization: Bearer {_REDACTED}", masked)
 
 
 def _redact_obj(obj: Any) -> Any:

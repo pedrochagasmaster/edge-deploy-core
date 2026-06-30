@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -38,6 +39,7 @@ from edge_deploy.config import ToolProfile
 GitRunner = Callable[[Sequence[str]], str]
 
 LOCAL_CHECK_RELATIVE = Path("tools") / "dev" / "local_check.ps1"
+LOCAL_CHECK_OUTPUT_TAIL_LINES = 20
 
 
 class PublishError(RuntimeError):
@@ -57,6 +59,7 @@ class PublishResult:
     previous_remote_commit: str
     message: str
     gate: dict[str, bool] = field(default_factory=dict)
+    local_check_output_tail: str = ""
 
     def to_payload(self) -> dict[str, Any]:
         """A compact, secret-free dict for the consolidated release report."""
@@ -89,6 +92,11 @@ def _resolve_powershell() -> str | None:
     return None
 
 
+def _output_tail_text(text: str, *, limit: int = LOCAL_CHECK_OUTPUT_TAIL_LINES) -> str:
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    return "\n".join(lines[-limit:])
+
+
 def run_local_check_ps1(repo_root: Path) -> int:
     """Invoke the repo's committed ``tools/dev/local_check.ps1`` and return its exit code.
 
@@ -97,6 +105,10 @@ def run_local_check_ps1(repo_root: Path) -> int:
     and **fails loudly** (rather than silently skipping the gate) when neither shell or the
     script is present — a silent skip would let an unverified build publish (Risk #6).
     """
+    return _run_local_check_ps1(repo_root)[0]
+
+
+def _run_local_check_ps1(repo_root: Path) -> tuple[int, str]:
     repo_root = Path(repo_root)
     script = repo_root / LOCAL_CHECK_RELATIVE
     if not script.is_file():
@@ -110,13 +122,27 @@ def run_local_check_ps1(repo_root: Path) -> int:
             "Cannot run the local_check gate: neither 'pwsh' nor 'powershell' is on PATH. "
             "Install PowerShell or pass --no-local-check to bypass the gate."
         )
-    completed = subprocess.run(
-        [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-    )
-    return completed.returncode
+    venv_python = repo_root / ".venv" / "Scripts" / "python.exe"
+    shim_dir: Path | None = None
+    env = os.environ.copy()
+    if venv_python.is_file():
+        shim_dir = Path(tempfile.mkdtemp(prefix="edge-deploy-pyshim-", dir=repo_root))
+        shim = shim_dir / "py.cmd"
+        shim.write_text(f'@"{venv_python}" %*\n', encoding="utf-8")
+        env["PATH"] = str(shim_dir) + os.pathsep + env.get("PATH", "")
+    try:
+        completed = subprocess.run(
+            [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        output_tail = _output_tail_text(completed.stdout + completed.stderr)
+        return completed.returncode, output_tail
+    finally:
+        if shim_dir is not None:
+            shutil.rmtree(shim_dir, ignore_errors=True)
 
 
 def _default_git_runner(repo_root: str | Path) -> GitRunner:
@@ -211,8 +237,12 @@ def publish_snapshot(
         source = commit
 
     local_check_passed = True
+    local_check_output_tail = ""
     if run_local_check:
-        code = local_check_runner(repo_root)
+        if local_check_runner is run_local_check_ps1:
+            code, local_check_output_tail = _run_local_check_ps1(repo_root)
+        else:
+            code = local_check_runner(repo_root)
         local_check_passed = code == 0
         if not local_check_passed:
             raise PublishError(f"local_check.ps1 failed with exit code {code}")
@@ -247,4 +277,5 @@ def publish_snapshot(
         previous_remote_commit=previous_remote_commit,
         message=message,
         gate=gate,
+        local_check_output_tail=local_check_output_tail,
     )

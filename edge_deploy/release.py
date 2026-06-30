@@ -16,7 +16,9 @@ publish-failed tools, snapshot-unavailable resumes (Risk #1), and pairs left unt
 from __future__ import annotations
 
 import getpass
+import json
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,12 +26,14 @@ from typing import Any, Callable
 
 from edge_deploy.auth import authenticate_node, authenticate_node_via_pane, ensure_kerberos
 from edge_deploy.config import OperatorConfig, load_tool_profile
+from edge_deploy.progress import ReleaseProgressTracker
 from edge_deploy.publish import PublishError, PublishResult, publish_snapshot
 from edge_deploy.reporting import (
     OperationReport,
     ReleaseReport,
     ReportCheck,
     report_node_name,
+    write_release_report,
     write_report,
 )
 from edge_deploy.rollout import run_rollout
@@ -137,6 +141,33 @@ def _smoke_result(checks: list[ReportCheck]) -> str:
     return "passed" if all(check.passed for check in smoke) else "failed"
 
 
+def _resolve_auth_mode(auth_mode: str) -> str:
+    """Resolve ``auto`` to prompt (interactive stdin) or pane (non-interactive)."""
+    if auth_mode != "auto":
+        return auth_mode
+    if sys.stdin.isatty():
+        return "prompt"
+    return "pane"
+
+
+def _is_transient_preflight_failure(report: OperationReport) -> bool:
+    for check in report.checks:
+        if check.name != "remote_git_preflight" or check.evidence is None:
+            continue
+        return bool(check.evidence.get("transient"))
+    return False
+
+
+def _preflight_state_left(report: OperationReport) -> str:
+    for check in report.checks:
+        if check.name == "remote_git_preflight":
+            evidence = check.evidence or {}
+            action = evidence.get("suggested_action", check.message)
+            step = evidence.get("step", "preflight")
+            return f"remote git preflight ({step}): {action}"
+    return _engine_state_left(report)
+
+
 def _engine_state_left(report: OperationReport) -> str:
     if report.status == "refused":
         return "not started; dependency change refused"
@@ -216,6 +247,61 @@ def _write_publish_report(report_dir: Path, tool: str, result: PublishResult, re
     return write_report(report_dir / f"publish-{tool}.json", report)
 
 
+def _load_publishes_from_disk(report_dir: Path, tools: list[str]) -> list[dict[str, Any]]:
+    """Load prior publish summaries from ``publish-<tool>.json`` for resume continuity."""
+    publishes: list[dict[str, Any]] = []
+    for tool in tools:
+        path = report_dir / f"publish-{tool}.json"
+        if not path.is_file():
+            continue
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        snapshot = payload.get("deployment_commit") or payload.get("snapshot")
+        publishes.append(
+            {
+                "tool": payload.get("tool", tool),
+                "status": payload.get("status", "failed"),
+                "snapshot": snapshot,
+                "source_short": payload.get("source_short") or payload.get("extra", {}).get("source_short"),
+                "branch": payload.get("branch") or payload.get("extra", {}).get("branch"),
+                "previous_remote_commit": payload.get("previous_remote_commit"),
+                "message": payload.get("message") or payload.get("extra", {}).get("message", ""),
+                "report_path": str(path),
+            }
+        )
+    return publishes
+
+
+def _log_local_check_output(tracker: ReleaseProgressTracker, tool: str, output_tail: str) -> None:
+    if not output_tail:
+        return
+    tracker.log("publish", f"local_check {tool} output tail:\n{output_tail}")
+
+
+def _log_preflight_evidence(
+    tracker: ReleaseProgressTracker,
+    *,
+    tool: str,
+    node: str,
+    report: OperationReport,
+    retry: bool = False,
+) -> None:
+    for check in report.checks:
+        if check.name != "remote_git_preflight" or check.evidence is None:
+            continue
+        evidence = check.evidence
+        prefix = "remote preflight retry decision" if retry else "remote preflight"
+        tracker.log(
+            "rollout",
+            (
+                f"{prefix} {tool}/{node} step={evidence.get('step')} "
+                f"exit={evidence.get('exit_code')} attempts={evidence.get('attempts')} "
+                f"transient={evidence.get('transient')}: {evidence.get('suggested_action')}\n"
+                f"output tail:\n{evidence.get('output_tail', '')}"
+            ),
+        )
+        return
+
+
 def _safe_stop(driver: TmuxDriver) -> None:
     try:
         driver.stop_session()
@@ -239,9 +325,12 @@ def run_release(
     clock: Callable[[], datetime] = _utc_now,
     remote: str = "bitbucket",
     max_auth_attempts: int = 3,
-    auth_mode: str = "prompt",
+    auth_mode: str = "auto",
     auth_wait_seconds: float = 300.0,
+    heartbeat_interval_s: float = 30.0,
+    stall_threshold_s: float = 300.0,
     progress_fn: Callable[[str], None] | None = None,
+    progress_tracker: ReleaseProgressTracker | None = None,
 ) -> ReleaseReport:
     """Run one Release and return the consolidated :class:`ReleaseReport`.
 
@@ -254,6 +343,14 @@ def run_release(
     node_names = selection.nodes
     profiles = {tool: load_tool_profile(operator.tool_path(tool)) for tool in tools}
     local_roots = {tool: operator.tool_path(tool) for tool in tools}
+    effective_auth_mode = _resolve_auth_mode(auth_mode)
+
+    tracker = progress_tracker or ReleaseProgressTracker(
+        report_dir,
+        heartbeat_interval_s=heartbeat_interval_s,
+        stall_threshold_s=stall_threshold_s,
+        notify_fn=progress_fn,
+    )
 
     publishes: list[dict[str, Any]] = []
     snapshots: dict[str, str] = {}
@@ -262,8 +359,7 @@ def run_release(
     stop = False  # set by --fail-fast on the first non-success
 
     def progress(message: str) -> None:
-        if progress_fn is not None:
-            progress_fn(message)
+        tracker.emit(message)
 
     # ---- PUBLISH (skipped entirely when --snapshot reuses an existing Snapshot) ----
     if selection.snapshot_by_tool:
@@ -341,7 +437,8 @@ def run_release(
                 break
             try:
                 progress(f"publishing {tool}")
-                result = publish_fn(profiles[tool], repo_root=local_roots[tool], remote=remote, clock=clock)
+                with tracker.tracked(f"publish {tool}", phase="publish", tool=tool):
+                    result = publish_fn(profiles[tool], repo_root=local_roots[tool], remote=remote, clock=clock)
             except PublishError as exc:
                 progress(f"publish failed for {tool}: {exc}")
                 publishes.append({"tool": tool, "status": "failed", "snapshot": None, "error": str(exc)})
@@ -358,6 +455,7 @@ def run_release(
             snapshots[tool] = result.snapshot
             publish_path = _write_publish_report(report_dir, tool, result, local_roots[tool])
             publishes.append({**result.to_payload(), "report_path": str(publish_path)})
+            _log_local_check_output(tracker, tool, result.local_check_output_tail)
             progress(f"published {tool}: {result.snapshot}")
 
     # ---- ROLLOUT fan-out: nodes outer, tools inner (one reused pane per node) ----
@@ -369,16 +467,39 @@ def run_release(
             driver = driver_factory(node, profiles[tools[0]])  # chrome/tui_exit from the first tool (Risk #7)
 
             try:
-                if auth_mode == "pane":
-                    authenticate_node_via_pane(
-                        driver,
-                        node_name,
-                        notify_fn=progress,
-                        wait_timeout=auth_wait_seconds,
-                    )
+                if effective_auth_mode == "pane":
+                    if auth_mode == "auto" and not sys.stdin.isatty():
+                        progress(
+                            "non-interactive terminal detected; using tmux pane auth — "
+                            "attach to the node session and enter the current PASSCODE"
+                        )
+                    with tracker.tracked(
+                        f"auth {node_name}",
+                        phase="auth",
+                        node=node_name,
+                        tmux_session=getattr(driver, "session", None),
+                    ):
+                        authenticate_node_via_pane(
+                            driver,
+                            node_name,
+                            notify_fn=progress,
+                            wait_timeout=auth_wait_seconds,
+                        )
                 else:
                     progress(f"waiting for {node_name} RSA prompt")
-                    authenticate_node(driver, node_name, getpass_fn=getpass_fn, max_attempts=max_auth_attempts)
+                    with tracker.tracked(
+                        f"auth {node_name}",
+                        phase="auth",
+                        node=node_name,
+                        tmux_session=getattr(driver, "session", None),
+                    ):
+                        authenticate_node(
+                            driver,
+                            node_name,
+                            getpass_fn=getpass_fn,
+                            max_attempts=max_auth_attempts,
+                            wait_timeout=auth_wait_seconds,
+                        )
             except (AuthenticationError, SessionGoneError, TimeoutError) as exc:
                 # Never block other nodes (ADR-0003): record every still-open pair as failed.
                 for tool in tools:
@@ -417,14 +538,43 @@ def run_release(
                 profile = profiles[tool]
                 try:
                     progress(f"rolling out {tool}/{node_name} -> {snapshot}")
-                    report = run_rollout(
-                        driver,
-                        profile,
-                        node,
-                        target_commit=snapshot,
-                        operator_email=operator.operator_email,
-                        remote=remote,
-                    )
+                    with tracker.tracked(
+                        f"rollout {tool}/{node_name}",
+                        phase="rollout",
+                        tool=tool,
+                        node=node_name,
+                        tmux_session=getattr(driver, "session", None),
+                    ):
+                        report = run_rollout(
+                            driver,
+                            profile,
+                            node,
+                            target_commit=snapshot,
+                            operator_email=operator.operator_email,
+                            remote=remote,
+                        )
+                    if report.status == "failed" and _is_transient_preflight_failure(report):
+                        _log_preflight_evidence(
+                            tracker, tool=tool, node=node_name, report=report, retry=True
+                        )
+                        tracker.retry(
+                            f"transient remote git preflight for {tool}/{node_name}; retrying rollout once"
+                        )
+                        with tracker.tracked(
+                            f"rollout retry {tool}/{node_name}",
+                            phase="rollout",
+                            tool=tool,
+                            node=node_name,
+                            tmux_session=getattr(driver, "session", None),
+                        ):
+                            report = run_rollout(
+                                driver,
+                                profile,
+                                node,
+                                target_commit=snapshot,
+                                operator_email=operator.operator_email,
+                                remote=remote,
+                            )
                 except (RuntimeError, SessionGoneError, AuthenticationError) as exc:
                     report = _synthetic_report(
                         "failed",
@@ -436,23 +586,33 @@ def run_release(
 
                 state_left = ""
                 if report.status == "rolled_out":
-                    report.checks.extend(
-                        verify_after_rollout(
-                            driver,
-                            profile,
-                            node,
-                            commit=snapshot,
-                            local_root=local_roots[tool],
-                            smoke_level=selection.smoke,
+                    with tracker.tracked(
+                        f"verify {tool}/{node_name}",
+                        phase="verify",
+                        tool=tool,
+                        node=node_name,
+                        tmux_session=getattr(driver, "session", None),
+                    ):
+                        report.checks.extend(
+                            verify_after_rollout(
+                                driver,
+                                profile,
+                                node,
+                                commit=snapshot,
+                                local_root=local_roots[tool],
+                                smoke_level=selection.smoke,
+                            )
                         )
-                    )
                     if selection.smoke == "deep" and profile.smoke.deep and kerb_check is not None:
                         report.checks.append(kerb_check)
                     if not all(check.passed for check in report.checks):
                         report.status = "failed"
                         state_left = _verify_state_left(report)
                 else:
-                    state_left = _engine_state_left(report)
+                    state_left = _preflight_state_left(report) if any(
+                        check.name == "remote_git_preflight" for check in report.checks
+                    ) else _engine_state_left(report)
+                    _log_preflight_evidence(tracker, tool=tool, node=node_name, report=report)
 
                 path = write_report(report_dir / f"rollout-{tool}-{node_name}.json", report)
                 progress(f"{tool}/{node_name}: {report.status}")
@@ -491,7 +651,10 @@ def run_release(
             )
         )
 
-    return ReleaseReport(
+    if selection.snapshot_by_tool and not publishes:
+        publishes = _load_publishes_from_disk(report_dir, tools)
+
+    consolidated = ReleaseReport(
         selection={
             "tools": tools,
             "nodes": node_names,
@@ -504,3 +667,6 @@ def run_release(
         rollouts=rollouts,
         operator_email=operator.operator_email,
     )
+    release_json = write_release_report(report_dir / "release.json", consolidated)
+    tracker.final_reports(release_json)
+    return consolidated
