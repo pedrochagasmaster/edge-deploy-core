@@ -16,6 +16,8 @@ from types import SimpleNamespace
 import pytest
 
 from edge_deploy import cli
+from edge_deploy.publish import PublishError, PublishResult
+from edge_deploy.reporting import ReleaseReport
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROJECTS_ROOT = Path(__file__).resolve().parents[2]
@@ -29,6 +31,32 @@ nodes:
 tools:
   autobench: {autobench_path}
 """
+
+OPERATOR_CONFIG_BOTH = """\
+operator_email: operator@example.com
+nodes:
+  node03:
+    host: "user@edge3.example"
+    ssh_options: "-p 2222"
+  node04:
+    host: "user@edge4.example"
+    ssh_options: "-p 2222"
+tools:
+  autobench: {autobench_path}
+  robocop: {robocop_path}
+"""
+
+
+def _write_operator_config_both(tmp_path: Path) -> Path:
+    config_path = tmp_path / "config-both.yaml"
+    config_path.write_text(
+        OPERATOR_CONFIG_BOTH.format(
+            autobench_path=(PROJECTS_ROOT / "autobench").as_posix(),
+            robocop_path=(PROJECTS_ROOT / "robocop").as_posix(),
+        ),
+        encoding="utf-8",
+    )
+    return config_path
 
 
 def _ok_addrinfo(host: str, port: int, *, type: int):  # noqa: A002 - mirrors socket.getaddrinfo
@@ -77,9 +105,54 @@ def test_parser_help_lists_all_subcommands(capsys) -> None:
 
     assert exc.value.code == 0
     help_text = capsys.readouterr().out
+    assert "release" in help_text
+    assert "publish" in help_text
     assert "rollout" in help_text
     assert "drift" in help_text
     assert "preflight" in help_text
+
+
+def test_parser_parses_release_args() -> None:
+    args = cli.build_parser().parse_args(
+        ["release", "--tool", "both", "--nodes", "03,04", "--snapshot", "abc123",
+         "--smoke", "deep", "--fail-fast", "--report-dir", "out", "--max-auth-attempts", "5"]
+    )
+
+    assert args.command == "release"
+    assert args.tool == "both"
+    assert args.nodes == "03,04"
+    assert args.snapshot == "abc123"
+    assert args.smoke == "deep"
+    assert args.fail_fast is True
+    assert args.report_dir == "out"
+    assert args.max_auth_attempts == 5
+
+
+def test_parser_release_defaults() -> None:
+    args = cli.build_parser().parse_args(["release", "--tool", "autobench"])
+
+    assert args.nodes is None
+    assert args.snapshot is None
+    assert args.smoke == "standard"
+    assert args.fail_fast is False
+    assert args.max_auth_attempts == 3
+
+
+def test_parser_parses_publish_args() -> None:
+    args = cli.build_parser().parse_args(
+        ["publish", "--tool", "robocop", "--commit", "deadbeef", "--no-local-check", "--remote", "origin"]
+    )
+
+    assert args.command == "publish"
+    assert args.tool == "robocop"
+    assert args.commit == "deadbeef"
+    assert args.no_local_check is True
+    assert args.remote == "origin"
+
+
+def test_parser_publish_rejects_both() -> None:
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["publish", "--tool", "both"])
 
 
 def test_parser_requires_a_subcommand() -> None:
@@ -192,6 +265,100 @@ def test_rollout_command_refused_returns_1(tmp_path, fake_tmux, monkeypatch) -> 
 
 
 # ---------------------------------------------------------------------------
+# release command dispatch (run_release monkeypatched)
+# ---------------------------------------------------------------------------
+
+
+def test_release_command_dispatches_and_writes_consolidated_report(tmp_path, monkeypatch, capsys) -> None:
+    config_path = _write_operator_config_both(tmp_path)
+    captured: dict = {}
+
+    def fake_run_release(operator, selection, *, report_dir, max_auth_attempts, **kwargs) -> ReleaseReport:
+        captured["selection"] = selection
+        captured["report_dir"] = report_dir
+        captured["max_auth_attempts"] = max_auth_attempts
+        return ReleaseReport(
+            selection={"tools": selection.tools},
+            publishes=[{"tool": "autobench", "status": "published", "snapshot": "abc"}],
+            rollouts=[{"tool": "autobench", "node": "node03", "status": "rolled_out", "state_left": ""}],
+        )
+
+    monkeypatch.setattr(cli, "run_release", fake_run_release)
+    report_dir = tmp_path / "rep"
+
+    rc = cli.main(
+        ["--config", str(config_path), "release", "--tool", "both", "--nodes", "03,04",
+         "--smoke", "deep", "--report-dir", str(report_dir), "--max-auth-attempts", "5"]
+    )
+
+    assert rc == 0
+    selection = captured["selection"]
+    assert selection.tools == ["autobench", "robocop"]
+    assert selection.nodes == ["node03", "node04"]
+    assert selection.smoke == "deep"
+    assert captured["max_auth_attempts"] == 5
+    assert (report_dir / "release.json").exists()
+    assert "Release: passed" in capsys.readouterr().out
+
+
+def test_release_command_nonzero_exit_on_failure(tmp_path, monkeypatch) -> None:
+    config_path = _write_operator_config_both(tmp_path)
+
+    def fake_run_release(operator, selection, *, report_dir, max_auth_attempts, **kwargs) -> ReleaseReport:
+        return ReleaseReport(
+            selection={},
+            rollouts=[{"tool": "autobench", "node": "node03", "status": "failed", "state_left": "boom"}],
+        )
+
+    monkeypatch.setattr(cli, "run_release", fake_run_release)
+
+    rc = cli.main(
+        ["--config", str(config_path), "release", "--tool", "autobench", "--report-dir", str(tmp_path / "rep")]
+    )
+
+    assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# publish command dispatch (publish_snapshot monkeypatched)
+# ---------------------------------------------------------------------------
+
+
+def test_publish_command_prints_snapshot(tmp_path, monkeypatch, capsys) -> None:
+    config_path = _write_operator_config_both(tmp_path)
+
+    def fake_publish(profile, **kwargs) -> PublishResult:
+        return PublishResult(
+            tool=profile.tool, status="published", snapshot="snap123", source_commit="srccommit",
+            source_short="srcshrt", branch="main", previous_remote_commit="prev999",
+            message="Deploy snapshot: autobench srcshrt on main (2026-06-29 23:00) [edge-deploy]",
+        )
+
+    monkeypatch.setattr(cli, "publish_snapshot", fake_publish)
+
+    rc = cli.main(["--config", str(config_path), "publish", "--tool", "autobench", "--no-local-check"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Published Snapshot: snap123" in out
+    assert "srcshrt" in out
+
+
+def test_publish_command_publish_error_returns_2(tmp_path, monkeypatch, capsys) -> None:
+    config_path = _write_operator_config_both(tmp_path)
+
+    def fake_publish(profile, **kwargs) -> PublishResult:
+        raise PublishError("local_check.ps1 failed with exit code 1")
+
+    monkeypatch.setattr(cli, "publish_snapshot", fake_publish)
+
+    rc = cli.main(["--config", str(config_path), "publish", "--tool", "robocop"])
+
+    assert rc == 2
+    assert "publish failed" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
 # python -m edge_deploy entry point
 # ---------------------------------------------------------------------------
 
@@ -206,6 +373,7 @@ def test_dunder_main_help_smoke() -> None:
 
     assert result.returncode == 0
     assert "rollout" in result.stdout
+    assert "release" in result.stdout
 
 
 def test_dunder_main_requires_subcommand() -> None:

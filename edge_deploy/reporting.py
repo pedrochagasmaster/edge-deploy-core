@@ -116,3 +116,137 @@ def write_report(path: str | Path, report: OperationReport) -> Path:
     payload = _redact_obj(report.to_payload())
     report_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return report_path
+
+
+# ---------------------------------------------------------------------------
+# Consolidated release report (edge-deploy/release/1)
+# ---------------------------------------------------------------------------
+
+# The schema identifier embedded in every consolidated release report.
+RELEASE_SCHEMA = "edge-deploy/release/1"
+
+# Rollout pair statuses that count as actionable failures for the exit code (ADR-0003).
+_FAILED_ROLLOUT_STATUSES = ("failed", "refused")
+
+
+def _node_suffix(node: Any) -> str:
+    """``"node04"`` -> ``"04"`` for a copy-pasteable ``--nodes`` argument in handoffs."""
+    name = str(node or "")
+    return name[len("node"):] if name.startswith("node") else name
+
+
+def _resume_action(rollout: dict[str, Any]) -> str:
+    """A ready-to-paste resume command for a mid-state/refused/unavailable pair."""
+    tool = rollout.get("tool", "")
+    nodes = _node_suffix(rollout.get("node"))
+    command = f"py -m edge_deploy release --tool {tool} --nodes {nodes}"
+    snapshot = rollout.get("deployment_commit")
+    if snapshot:
+        command += f" --snapshot {snapshot}"
+    return f"investigate {rollout.get('node')}; re-run: {command}"
+
+
+@dataclass
+class ReleaseReport:
+    """The consolidated ``edge-deploy/release/1`` report for one Release run.
+
+    Embeds compact per-Publish and per-Rollout summaries (the detailed per-(tool×node)
+    :class:`OperationReport` files are referenced via each rollout's ``report_path``).
+    ``summary`` carries counts + ``handoffs[]`` + ``overall``; ``exit_code`` is non-zero
+    when any Rollout failed/refused or any Publish failed (ADR-0003).
+    """
+
+    selection: dict[str, Any]
+    publishes: list[dict[str, Any]] = field(default_factory=list)
+    rollouts: list[dict[str, Any]] = field(default_factory=list)
+    operator_email: str = ""
+    timestamp: str = field(default_factory=utc_iso_timestamp)
+
+    def exit_code(self) -> int:
+        if any(rollout.get("status") in _FAILED_ROLLOUT_STATUSES for rollout in self.rollouts):
+            return 1
+        if any(publish.get("status") != "published" for publish in self.publishes):
+            return 1
+        return 0
+
+    def _counts(self) -> dict[str, int]:
+        counts = {"rolled_out": 0, "failed": 0, "skipped": 0, "refused": 0, "published": 0, "publish_failed": 0}
+        for rollout in self.rollouts:
+            status = rollout.get("status", "")
+            if status in counts:
+                counts[status] += 1
+        for publish in self.publishes:
+            counts["published" if publish.get("status") == "published" else "publish_failed"] += 1
+        return counts
+
+    def _handoffs(self) -> list[dict[str, Any]]:
+        handoffs: list[dict[str, Any]] = []
+        for publish in self.publishes:
+            if publish.get("status") != "published":
+                tool = publish.get("tool", "")
+                handoffs.append({
+                    "kind": "publish",
+                    "tool": tool,
+                    "node": None,
+                    "message": publish.get("error", "publish failed"),
+                    "action": f"fix the publish gate, then re-run: py -m edge_deploy publish --tool {tool}",
+                })
+        for rollout in self.rollouts:
+            status = rollout.get("status")
+            state_left = rollout.get("state_left", "")
+            if status == "failed":
+                # A failed --snapshot resume (tree not local) is a snapshot handoff (Risk #1);
+                # any other failure is a node left mid-state.
+                kind = "snapshot" if state_left.startswith("snapshot ") else "mid_state"
+                handoffs.append({
+                    "kind": kind,
+                    "tool": rollout.get("tool", ""),
+                    "node": rollout.get("node"),
+                    "message": state_left,
+                    "action": _resume_action(rollout),
+                })
+            elif status == "refused":
+                handoffs.append({
+                    "kind": "refused",
+                    "tool": rollout.get("tool", ""),
+                    "node": rollout.get("node"),
+                    "message": rollout.get("state_left", ""),
+                    "action": "run the offline bundle refresh first, then re-run the Release",
+                })
+            elif status == "skipped" and "snapshot" in state_left:
+                handoffs.append({
+                    "kind": "snapshot",
+                    "tool": rollout.get("tool", ""),
+                    "node": rollout.get("node"),
+                    "message": state_left,
+                    "action": _resume_action(rollout),
+                })
+        return handoffs
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "counts": self._counts(),
+            "handoffs": self._handoffs(),
+            "overall": "failed" if self.exit_code() else "passed",
+        }
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "schema": RELEASE_SCHEMA,
+            "timestamp": self.timestamp,
+            "operator_email": self.operator_email,
+            "selection": self.selection,
+            "publishes": self.publishes,
+            "rollouts": self.rollouts,
+            "summary": self.summary(),
+            "exit_code": self.exit_code(),
+        }
+
+
+def write_release_report(path: str | Path, report: ReleaseReport) -> Path:
+    """Write the consolidated release report as redacted JSON (same path as ``write_report``)."""
+    report_path = Path(path)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = _redact_obj(report.to_payload())
+    report_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return report_path

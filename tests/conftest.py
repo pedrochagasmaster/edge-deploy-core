@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 
 from edge_deploy.config import NodeConfig, ToolProfile
+from edge_deploy.tmux_driver import AuthenticationError
 
 # Sibling Tool repos live next to edge-deploy-core (…/Projects/{autobench,robocop}).
 PROJECTS_ROOT = Path(__file__).resolve().parents[2]
@@ -61,6 +62,26 @@ class FakeTmuxDriver:
     * ``update_code`` / ``install_code`` — exit codes for ``update.sh`` / ``install.sh``.
     * ``permissions`` — the rollout permission-probe payload.
     * ``remote_runtime`` — the drift remote runtime map.
+
+    Phase 2 adds an **auth-seam** surface (ADR-0002) so the getpass auth flow and the
+    Kerberos-only-for-deep path can be exercised with no real tmux/SSH and no real
+    secrets. These knobs are all additive and default to the Phase-1 behaviour:
+
+    * ``auth_script`` — a list scripting the RSA seam outcome, e.g. ``["accept"]``,
+      ``["reject", "accept"]`` (re-prompt), ``["preauthed"]`` (session already at a
+      shell). ``start_session`` returns ``True`` only for ``"preauthed"``; otherwise it
+      reports the auth prompt (``False``) so the seam engages. Each
+      ``await_authenticated`` consumes one entry: ``"reject"`` raises
+      :class:`AuthenticationError` (forcing a re-prompt), anything else succeeds.
+    * ``klist_code`` — exit code(s) returned for ``klist -s`` (a valid ticket is ``0``).
+      Accepts an int (repeats) or a list (consumed left to right, last value repeats) so
+      a test can model "no ticket, then acquired".
+    * ``command_codes`` — optional ``{substring: exit_code}`` overrides so smoke commands
+      can be made to fail by content.
+
+    Captured secret/key traffic is exposed via ``sent_secrets`` (``submit_secret``) and
+    ``sent_keys`` (``send_keys`` / ``send_key`` / ``send_text``); the RSA passcode and the
+    Kerberos password must only ever appear in ``sent_secrets``, never in ``commands``.
     """
 
     def __init__(
@@ -72,6 +93,9 @@ class FakeTmuxDriver:
         install_code: int = 0,
         permissions: dict[str, Any] | None = None,
         remote_runtime: dict[str, str] | None = None,
+        auth_script: list[str] | None = None,
+        klist_code: int | list[int] = 0,
+        command_codes: dict[str, int] | None = None,
     ) -> None:
         self.commands: list[str] = []
         self.call_log: list[dict[str, Any]] = []
@@ -81,17 +105,26 @@ class FakeTmuxDriver:
         self.install_code = install_code
         self._permissions = permissions if permissions is not None else dict(OK_PERMISSIONS)
         self._remote_runtime = dict(remote_runtime) if remote_runtime else {}
+        # Auth-seam scripting (Phase 2, ADR-0002).
+        self._auth_script = list(auth_script) if auth_script else ["accept"]
+        self._klist_codes = [klist_code] if isinstance(klist_code, int) else list(klist_code) or [0]
+        self._command_codes = dict(command_codes) if command_codes else {}
+        self.sent_secrets: list[str] = []
+        self.sent_keys: list[str] = []
         # Attributes the CLI/engine read directly off a driver.
         self.session = "fake-session"
         self.host = "user@edge.example"
         self.repo_path = ""
+        self.ssh_connect_timeout = 15
 
     # -- TmuxDriver surface the engine and CLI touch -----------------------------------
     def session_exists(self) -> bool:
         return True
 
     def start_session(self, *args: Any, **kwargs: Any) -> bool:
-        return True
+        # Phase 1 callers never reached this (session_exists() short-circuits); Phase 2's
+        # auth seam relies on it reporting the auth prompt (``False``) unless preauthed.
+        return self._auth_script[0] == "preauthed" if self._auth_script else False
 
     def stop_session(self) -> None:
         return None
@@ -100,6 +133,28 @@ class FakeTmuxDriver:
         self.commands.append(command)
         self.call_log.append({"command": command, "timeout": timeout, "ensure_shell": ensure_shell})
         return self._respond(command)
+
+    # -- auth seam (ADR-0002) ----------------------------------------------------------
+    def submit_secret(self, secret: str) -> None:
+        self.sent_secrets.append(secret)
+
+    def await_authenticated(self, *, timeout: float | None = None, poll_interval: float = 1.0) -> None:
+        outcome = self._auth_script.pop(0) if self._auth_script else "accept"
+        if outcome == "reject":
+            raise AuthenticationError("Edge Node re-prompted for a PASSCODE — the code was stale or wrong.")
+
+    def send_keys(self, keys: str, *, literal: bool = False) -> None:
+        self.sent_keys.append(keys)
+
+    def send_key(self, key: str) -> None:
+        self.sent_keys.append(key)
+
+    def send_text(self, text: str) -> None:
+        self.sent_keys.append(text)
+
+    def wait_for(self, pattern: str, timeout: float = 10.0, poll_interval: float = 0.5) -> str:
+        # The auth seam only waits for the Kerberos ``Password:`` prompt; pretend it is up.
+        return "Password: "
 
     # -- assertions helpers ------------------------------------------------------------
     def ran(self, needle: str) -> bool:
@@ -115,6 +170,12 @@ class FakeTmuxDriver:
             self._head_commits.pop(0)
         return value
 
+    def _next_klist(self) -> int:
+        value = self._klist_codes[0]
+        if len(self._klist_codes) > 1:
+            self._klist_codes.pop(0)
+        return value
+
     @staticmethod
     def _sentinel(body: str = "", code: int = 0) -> tuple[str, int]:
         marker = f"__RC_fake_{code}__"
@@ -122,6 +183,13 @@ class FakeTmuxDriver:
         return screen, code
 
     def _respond(self, command: str) -> tuple[str, int]:
+        # Opt-in per-command exit-code overrides (smoke failure injection). Keys are
+        # test-chosen substrings; they take precedence over the structural routing below.
+        for needle, code in self._command_codes.items():
+            if needle in command:
+                return self._sentinel(f"{needle} -> exit {code}", code)
+        if "klist -s" in command:
+            return self._sentinel("", self._next_klist())
         if "base64 -d" in command:
             script = _decode_remote_python(command)
             if "PERMISSION_PAYLOAD_START" in script:

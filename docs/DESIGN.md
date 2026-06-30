@@ -217,8 +217,25 @@ successful Release on both nodes via the new interface (ADR-0004).
 
 ## 10. Open items
 
-All design-tree branches grilled and closed. Remaining work is implementation
-(see §9 phasing), where concrete details will be finalized in code:
+All design-tree branches grilled and closed. The two items left for implementation
+are now resolved in Phase 2 code:
 
-- Consolidated-report JSON field names beyond the `release/1` sketch in §6.1.
-- Per-tool `tui_exit` strategy wiring in the shared `return_to_shell`.
+- **Consolidated-report JSON field names — resolved.** The `edge-deploy/release/1`
+  schema is finalized in `reporting.ReleaseReport.to_payload()`: top-level
+  `schema`, `timestamp`, `operator_email`, `selection`, `publishes[]`, `rollouts[]`,
+  `summary`, `exit_code`. Each `rollouts[]` entry carries
+  `tool, node, status, state_left, deployment_commit, previous_remote_commit,
+  sensitive_changed, drift, smoke, report_path`; `summary` carries
+  `counts` (the four pair statuses plus `published`/`publish_failed`),
+  `handoffs[]` (`kind ∈ publish | mid_state | refused | snapshot`, each with a
+  ready-to-paste `action`), and `overall`.
+- **Per-tool `tui_exit` wiring — resolved (Phase 1).** `TmuxDriver.return_to_shell`
+  already dispatches on the injected `tui_exit` strategy (`ctrl_c` |
+  `dispatch_dynamic` | `none`); Phase 2's per-node pane takes its chrome/`tui_exit`
+  from the first selected tool and relies on each engine call's explicit `cd`
+  (see Phase-2 plan Risk #7).
+
+Remaining cross-repo follow-up (tracked, not in this phase): wire each tool repo's
+`prod_tui` deploy/drift paths to call the package (Plan T7), then remove the
+`EDGE_DEPLOY_*` alias fallback after one green Release on both nodes × both tools
+(ADR-0004 / Plan T9).

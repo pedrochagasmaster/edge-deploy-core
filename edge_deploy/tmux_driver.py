@@ -285,6 +285,16 @@ class TmuxDriver:
             "The credential was likely wrong or expired; request a fresh RSA passcode."
         )
 
+    def await_authenticated(self, *, timeout: float | None = None, poll_interval: float = 1.0) -> None:
+        """Public alias of :meth:`_await_auth_result`: block until the pane reaches a shell.
+
+        Used by the auth seam (:func:`edge_deploy.auth.authenticate_node`) after a secret is
+        submitted. Defaults ``timeout`` to ``ssh_connect_timeout`` and raises
+        :class:`AuthenticationError` if the credential was rejected.
+        """
+        effective = timeout if timeout is not None else float(self.ssh_connect_timeout)
+        self._await_auth_result(timeout=effective, poll_interval=poll_interval)
+
     def stop_session(self) -> None:
         """Kill the local tmux session."""
         self._tmux(
@@ -311,6 +321,17 @@ class TmuxDriver:
 
     def send_text(self, text: str) -> None:
         self.send_keys(text, literal=True)
+        self.send_key("Enter")
+
+    def submit_secret(self, secret: str) -> None:
+        """Type a secret (RSA passcode / Kerberos password) into the pane, then Enter.
+
+        The single secret-bearing seam (ADR-0002): secrets are sent **literally** through
+        ``send_keys``/``send_key`` and never travel through :meth:`run_remote` (which echoes
+        and is captured into reports). Held only transiently by the caller; redaction masks
+        any accidental leak for defence in depth.
+        """
+        self.send_keys(secret, literal=True)
         self.send_key("Enter")
 
     def capture_screen(self, history_lines: int = 0) -> str:

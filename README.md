@@ -35,7 +35,52 @@ py -c "import edge_deploy; print(edge_deploy.__version__)"
 
 `BB_TOKEN` stays an environment variable and is never written to disk or reports.
 
-## CLI (Phase 1 surface)
+## CLI — `release` (the umbrella command)
+
+One command publishes a reviewed Snapshot of a Tool (or **both**) and rolls it out to
+every selected Edge Node, then verifies (drift + smoke). The Operator is prompted (via
+`getpass`) only for the RSA passcode — once per node — and, for `--smoke deep`, a Kerberos
+password.
+
+```bash
+# Publish + roll out both tools to both nodes, then verify (standard smoke):
+py -m edge_deploy release --tool both --nodes 03,04
+
+# Resume / re-deploy an existing Snapshot (skips Publish entirely):
+py -m edge_deploy release --tool robocop --nodes 04 --snapshot <snapshot-sha>
+
+# Deep smoke (robocop's Impala scenario needs Kerberos), stop on first failure:
+py -m edge_deploy release --tool robocop --smoke deep --fail-fast
+```
+
+Flags: `--tool {autobench|robocop|both}` (required), `--nodes 03,04` (default: all
+configured; accepts `03` or `node03`), `--snapshot <sha>` (skip Publish), `--smoke
+{standard|deep}`, `--fail-fast`, `--report-dir <path>` (default
+`./edge-deploy/reports/release-<UTC>/`), `--max-auth-attempts N` (default 3).
+
+Each run writes a detailed per-(tool×node) `OperationReport` JSON plus a consolidated
+`release.json` (`edge-deploy/release/1`) with `summary.counts`, `summary.handoffs[]`
+(ready-to-paste resume commands), and `summary.overall`. The process exit code is non-zero
+if any Rollout failed/refused or any Publish failed (ADR-0003).
+
+> `release --snapshot <sha>` *reuses* an existing Snapshot; the SHA must be present in the
+> tool's local working copy so Drift can read its tree (the run fetches and, if still
+> missing, emits a clear snapshot handoff — see Phase-2 plan Risk #1). This is the opposite
+> of `publish --commit <sha>`, which *creates* a new Snapshot from that source.
+
+## CLI — `publish` (standalone, per tool)
+
+```bash
+py -m edge_deploy publish --tool autobench                 # gate (clean tree + on release_branch + local_check.ps1) -> push Snapshot
+py -m edge_deploy publish --tool robocop --commit <sha>    # name a reviewed source commit (relaxes tree/branch gate)
+py -m edge_deploy publish --tool autobench --no-local-check # escape hatch: bypass the local_check.ps1 gate
+```
+
+`BB_TOKEN` (env) authenticates the push as a Bearer token; it is never written to a report
+(ADR-0002). The Snapshot is built with `git commit-tree` (no working-tree mutation) and its
+message is `Deploy snapshot: <tool> <source-short> on <branch> (<YYYY-MM-DD HH:mm>) [edge-deploy]`.
+
+## CLI — lower-level Phase-1 commands
 
 ```bash
 py -m edge_deploy preflight --node node03
@@ -43,8 +88,7 @@ py -m edge_deploy rollout   --tool robocop --node node03 --commit <snapshot-sha>
 py -m edge_deploy drift     --tool robocop --node node03 --commit <snapshot-sha>
 ```
 
-`--tool` / `--node` resolve against the two config layers. The umbrella `release`
-orchestrator (publish + fan-out + auth seam) is Phase 2.
+`--tool` / `--node` resolve against the two config layers.
 
 ## On-node interface (ADR-0004)
 
