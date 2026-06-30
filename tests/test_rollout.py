@@ -8,10 +8,14 @@ install-decision derived from ``install_trigger_paths``, the non-blocking
 
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
+
 import pytest
 
 from edge_deploy.rollout import (
     ROLLOUT_STATUSES,
+    RemoteGitPreflightError,
     build_install_command,
     build_update_command,
     decide_install_action,
@@ -164,7 +168,13 @@ def test_run_rollout_success_contract(
     assert payload["previous_remote_commit"] == PREVIOUS
     assert payload["changed_paths"] == changed
     assert "refused_paths" not in payload
-    expected_checks = {"update", "final_commit", "install", "permissions"}
+    expected_checks = {
+        "remote_git_preflight",
+        "update",
+        "final_commit",
+        "install",
+        "permissions",
+    }
     if expect_install == "run":
         expected_checks.add("install_preflight")
     assert {check["name"] for check in payload["checks"]} == expected_checks
@@ -205,8 +215,11 @@ def test_run_rollout_refuses_dependency_change_without_running_update(
     payload = report.to_payload()
     assert payload["refused_paths"] == expect_refused
     assert payload["changed_paths"] == changed
-    assert [check["name"] for check in payload["checks"]] == ["dependency_refusal"]
-    assert payload["checks"][0]["passed"] is False
+    assert [check["name"] for check in payload["checks"]] == [
+        "remote_git_preflight",
+        "dependency_refusal",
+    ]
+    assert payload["checks"][1]["passed"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -286,9 +299,67 @@ def test_remote_changed_paths_runs_verify_fetch_diff_separately(load_profile, sa
 
     assert paths == ["benchmark.py"]
     assert driver.ran("git rev-parse --is-inside-work-tree")
-    assert driver.ran("git fetch --prune bitbucket main:refs/remotes/bitbucket/main")
+    assert driver.ran("git fetch --prune bitbucket main")
     assert driver.ran(f"git --no-pager diff --name-only {PREVIOUS} {TARGET}")
     assert not any(">/dev/null" in command for command in driver.commands)
+
+
+def test_remote_changed_paths_repairs_corrupt_tracking_ref(tmp_path: Path) -> None:
+    remote = tmp_path / "remote.git"
+    seed = tmp_path / "seed"
+    node = tmp_path / "node"
+
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True)
+    subprocess.run(["git", "init", "-b", "main", str(seed)], check=True)
+    subprocess.run(["git", "-C", str(seed), "config", "user.name", "Test User"], check=True)
+    subprocess.run(
+        ["git", "-C", str(seed), "config", "user.email", "test@example.com"], check=True
+    )
+    (seed / "README.md").write_text("before\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(seed), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-m", "before"], check=True)
+    subprocess.run(["git", "-C", str(seed), "remote", "add", "origin", str(remote)], check=True)
+    subprocess.run(["git", "-C", str(seed), "push", "origin", "main"], check=True)
+    subprocess.run(["git", "clone", "--branch", "main", str(remote), str(node)], check=True)
+    previous = subprocess.check_output(
+        ["git", "-C", str(node), "rev-parse", "HEAD"], text=True
+    ).strip()
+
+    (seed / "README.md").write_text("after\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(seed), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-m", "after"], check=True)
+    subprocess.run(["git", "-C", str(seed), "push", "origin", "main"], check=True)
+    target = subprocess.check_output(
+        ["git", "-C", str(seed), "rev-parse", "HEAD"], text=True
+    ).strip()
+    remote_ref = node / ".git" / "refs" / "remotes" / "origin" / "main"
+    remote_ref.parent.mkdir(parents=True, exist_ok=True)
+    remote_ref.write_text("", encoding="utf-8")
+
+    class LocalGitDriver:
+        def run_remote(
+            self, command: str, *, timeout: float = 30.0, ensure_shell: bool = True
+        ) -> tuple[str, int]:
+            payload = command.split(" && ", 1)[1]
+            result = subprocess.run(
+                ["bash", "-lc", payload],
+                cwd=node,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            return result.stdout + result.stderr, result.returncode
+
+    paths = remote_changed_paths(
+        LocalGitDriver(), str(node), previous, target, remote="origin", branch="main"
+    )
+
+    assert paths == ["README.md"]
+    tracking_ref = subprocess.check_output(
+        ["git", "-C", str(node), "rev-parse", "refs/remotes/origin/main"], text=True
+    ).strip()
+    assert tracking_ref == target
 
 
 def test_remote_fetch_retries_once_on_transient_failure(load_profile, sample_node, fake_tmux) -> None:
@@ -306,6 +377,68 @@ def test_remote_fetch_retries_once_on_transient_failure(load_profile, sample_nod
     assert paths == ["benchmark.py"]
     fetch_commands = [command for command in driver.commands if "git fetch --prune" in command]
     assert len(fetch_commands) == 2
+
+
+def test_remote_fetch_repairs_corrupt_tracking_ref_once(load_profile, sample_node, fake_tmux) -> None:
+    profile = load_profile("autobench")
+    driver = fake_tmux(
+        changed_paths=["README.md"],
+        fetch_script=[
+            (
+                1,
+                "error: cannot lock ref 'refs/remotes/bitbucket/main': "
+                "unable to resolve reference 'refs/remotes/bitbucket/main'",
+            ),
+            (0, ""),
+        ],
+    )
+
+    paths = remote_changed_paths(driver, profile.repo_path, PREVIOUS, TARGET)
+
+    assert paths == ["README.md"]
+    assert driver.ran("git update-ref -d refs/remotes/bitbucket/main")
+    fetch_commands = [command for command in driver.commands if "git fetch --prune" in command]
+    assert len(fetch_commands) == 2
+
+
+def test_run_rollout_reports_successful_tracking_ref_repair(
+    load_profile, sample_node, fake_tmux
+) -> None:
+    profile = load_profile("autobench")
+    driver = fake_tmux(
+        head_commits=[PREVIOUS, TARGET],
+        changed_paths=["README.md"],
+        fetch_script=[
+            (
+                1,
+                "error: cannot lock ref 'refs/remotes/bitbucket/main': "
+                "unable to resolve reference 'refs/remotes/bitbucket/main'",
+            ),
+            (0, ""),
+        ],
+    )
+
+    report = run_rollout(driver, profile, sample_node, target_commit=TARGET)
+
+    preflight = next(check for check in report.checks if check.name == "remote_git_preflight")
+    assert preflight.passed is True
+    assert preflight.evidence == {
+        "fetch_attempts": 2,
+        "repair_attempted": True,
+        "repair_succeeded": True,
+    }
+
+
+def test_remote_fetch_does_not_repair_unrelated_bad_object(
+    load_profile, sample_node, fake_tmux
+) -> None:
+    profile = load_profile("autobench")
+    driver = fake_tmux(fetch_script=[(128, "fatal: bad object deadbeef")])
+
+    with pytest.raises(RemoteGitPreflightError):
+        remote_changed_paths(driver, profile.repo_path, PREVIOUS, TARGET)
+
+    assert not driver.ran("git update-ref -d")
 
 
 def test_run_rollout_preflight_failure_preserves_evidence(load_profile, sample_node, fake_tmux) -> None:

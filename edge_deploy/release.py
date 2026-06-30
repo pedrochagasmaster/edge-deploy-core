@@ -302,6 +302,30 @@ def _log_preflight_evidence(
         return
 
 
+def _log_successful_preflight_repair(
+    tracker: ReleaseProgressTracker,
+    *,
+    tool: str,
+    node: str,
+    report: OperationReport,
+) -> None:
+    for check in report.checks:
+        if check.name != "remote_git_preflight" or not check.passed or check.evidence is None:
+            continue
+        evidence = check.evidence
+        if not evidence.get("repair_attempted"):
+            return
+        tracker.log(
+            "rollout",
+            (
+                f"repaired remote tracking ref for {tool}/{node}; "
+                f"succeeded={evidence.get('repair_succeeded')} "
+                f"fetch_attempts={evidence.get('fetch_attempts')}"
+            ),
+        )
+        return
+
+
 def _safe_stop(driver: TmuxDriver) -> None:
     try:
         driver.stop_session()
@@ -553,6 +577,9 @@ def run_release(
                             operator_email=operator.operator_email,
                             remote=remote,
                         )
+                    _log_successful_preflight_repair(
+                        tracker, tool=tool, node=node_name, report=report
+                    )
                     if report.status == "failed" and _is_transient_preflight_failure(report):
                         _log_preflight_evidence(
                             tracker, tool=tool, node=node_name, report=report, retry=True
@@ -575,6 +602,9 @@ def run_release(
                                 operator_email=operator.operator_email,
                                 remote=remote,
                             )
+                        _log_successful_preflight_repair(
+                            tracker, tool=tool, node=node_name, report=report
+                        )
                 except (RuntimeError, SessionGoneError, AuthenticationError) as exc:
                     report = _synthetic_report(
                         "failed",

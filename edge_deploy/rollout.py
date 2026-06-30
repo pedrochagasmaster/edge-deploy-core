@@ -57,6 +57,8 @@ class RemoteGitPreflightFailure:
     transient: bool
     attempts: int
     suggested_action: str
+    repair_attempted: bool = False
+    repair_succeeded: bool = False
 
 
 class RemoteGitPreflightError(RuntimeError):
@@ -65,6 +67,14 @@ class RemoteGitPreflightError(RuntimeError):
     def __init__(self, failure: RemoteGitPreflightFailure) -> None:
         self.failure = failure
         super().__init__(failure.suggested_action)
+
+
+@dataclass(frozen=True)
+class RemoteGitPreflightResult:
+    changed_paths: list[str]
+    fetch_attempts: int
+    repair_attempted: bool
+    repair_succeeded: bool
 
 
 @dataclass(frozen=True)
@@ -183,6 +193,26 @@ def _is_transient_git_error(output: str) -> bool:
     return any(marker in lowered for marker in _TRANSIENT_GIT_MARKERS)
 
 
+def _is_repairable_tracking_ref_error(output: str, remote_ref: str) -> bool:
+    lowered = output.lower()
+    expected_ref = remote_ref.lower()
+    unresolved_ref = (
+        f"cannot lock ref '{expected_ref}'" in lowered
+        and f"unable to resolve reference '{expected_ref}'" in lowered
+    )
+    bad_tracking_ref = f"fatal: bad object {expected_ref}" in lowered
+    return unresolved_ref or bad_tracking_ref
+
+
+def _repair_tracking_ref_command(remote_ref: str) -> str:
+    loose_ref = f".git/{remote_ref}"
+    reflog = f".git/logs/{remote_ref}"
+    return (
+        f"{{ git update-ref -d {remote_ref} 2>/dev/null || true; }} && "
+        f"rm -f {loose_ref} {reflog}"
+    )
+
+
 def _suggested_action_for_step(step: str, *, transient: bool) -> str:
     if step == "verify":
         return "confirm the tool repo path exists on the node and is a git checkout"
@@ -203,7 +233,7 @@ def _remote_git_preflight(
     *,
     remote: str = "bitbucket",
     branch: str = "main",
-) -> list[str]:
+) -> RemoteGitPreflightResult:
     """Verify repo, fetch target branch, and diff SHAs as separate remote steps."""
     verify_command = "git rev-parse --is-inside-work-tree"
     screen, code = _remote_git_output(driver, repo_path, verify_command, timeout=30)
@@ -221,15 +251,27 @@ def _remote_git_preflight(
             )
         )
 
-    fetch_command = f"git fetch --prune {remote} {branch}:refs/remotes/{remote}/{branch}"
+    remote_ref = f"refs/remotes/{remote}/{branch}"
+    fetch_command = f"git fetch --prune {remote} {branch}"
     attempts = 0
     last_screen = ""
     last_code = 0
+    repair_attempted = False
+    repair_succeeded = False
     while attempts < 2:
         attempts += 1
         last_screen, last_code = _remote_git_output(driver, repo_path, fetch_command, timeout=90)
         if last_code == 0:
             break
+        if attempts == 1 and _is_repairable_tracking_ref_error(last_screen, remote_ref):
+            repair_attempted = True
+            repair_command = _repair_tracking_ref_command(remote_ref)
+            _repair_screen, repair_code = _remote_git_output(
+                driver, repo_path, repair_command, timeout=30
+            )
+            repair_succeeded = repair_code == 0
+            if repair_code == 0:
+                continue
         if attempts == 1 and _is_transient_git_error(last_screen):
             continue
         break
@@ -244,6 +286,8 @@ def _remote_git_preflight(
                 transient=transient,
                 attempts=attempts,
                 suggested_action=_suggested_action_for_step("fetch", transient=transient),
+                repair_attempted=repair_attempted,
+                repair_succeeded=repair_succeeded,
             )
         )
 
@@ -262,7 +306,12 @@ def _remote_git_preflight(
                 suggested_action=_suggested_action_for_step("diff", transient=transient),
             )
         )
-    return _remote_payload_lines(screen)
+    return RemoteGitPreflightResult(
+        changed_paths=_remote_payload_lines(screen),
+        fetch_attempts=attempts,
+        repair_attempted=repair_attempted,
+        repair_succeeded=repair_succeeded,
+    )
 
 
 def _preflight_failure_report(
@@ -282,6 +331,8 @@ def _preflight_failure_report(
         "transient": failure.transient,
         "attempts": failure.attempts,
         "suggested_action": failure.suggested_action,
+        "repair_attempted": failure.repair_attempted,
+        "repair_succeeded": failure.repair_succeeded,
     }
     check = ReportCheck(
         name="remote_git_preflight",
@@ -346,7 +397,7 @@ def remote_changed_paths(
     """Changed paths between the node's current HEAD and the target Snapshot."""
     return _remote_git_preflight(
         driver, repo_path, previous, target, remote=remote, branch=branch
-    )
+    ).changed_paths
 
 
 def _permission_evidence(driver: TmuxDriver, profile: ToolProfile) -> dict[str, object]:
@@ -411,7 +462,7 @@ def run_rollout(
 
     previous_commit = _remote_rev_parse(driver, repo_path, "HEAD")
     try:
-        changed_paths = remote_changed_paths(
+        preflight = _remote_git_preflight(
             driver, repo_path, previous_commit, target_commit, remote=remote, branch=branch
         )
     except RemoteGitPreflightError as exc:
@@ -423,6 +474,17 @@ def run_rollout(
             previous_commit=previous_commit,
             failure=exc.failure,
         )
+    changed_paths = preflight.changed_paths
+    preflight_check = ReportCheck(
+        "remote_git_preflight",
+        True,
+        "Remote Git preflight passed",
+        {
+            "fetch_attempts": preflight.fetch_attempts,
+            "repair_attempted": preflight.repair_attempted,
+            "repair_succeeded": preflight.repair_succeeded,
+        },
+    )
     sensitive_changed = matching_paths(changed_paths, profile.sensitive_paths)
     refused = matching_paths(changed_paths, profile.dependency_paths)
 
@@ -447,13 +509,13 @@ def run_rollout(
             deployment_commit=target_commit,
             previous_remote_commit=previous_commit,
             install_decision="not_applicable",
-            checks=[check],
+            checks=[preflight_check, check],
             sensitive_changed=sensitive_changed,
             extra={"changed_paths": changed_paths, "refused_paths": refused},
         )
 
     install = decide_install_action(profile, mode=install_mode, changed_paths=changed_paths)
-    checks: list[ReportCheck] = []
+    checks: list[ReportCheck] = [preflight_check]
 
     _update_screen, update_code = driver.run_remote(
         build_update_command(profile, target_commit, remote=remote), timeout=180

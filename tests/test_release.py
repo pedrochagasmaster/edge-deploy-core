@@ -488,6 +488,39 @@ def test_release_retries_transient_git_preflight_once(fake_tmux, tmp_path, patch
     assert len(fetch_commands) == 3
 
 
+def test_release_logs_successful_remote_tracking_ref_repair(
+    fake_tmux, tmp_path, patched_drift
+) -> None:
+    operator = _operator()
+    drivers: dict = {}
+
+    def configure(name, kw):
+        kw["fetch_script"] = [
+            (
+                1,
+                "error: cannot lock ref 'refs/remotes/bitbucket/main': "
+                "unable to resolve reference 'refs/remotes/bitbucket/main'",
+            ),
+            (0, ""),
+        ]
+
+    report = run_release(
+        operator,
+        ReleaseSelection(tools=["autobench"], nodes=["node03"]),
+        report_dir=tmp_path,
+        getpass_fn=_getpass([]),
+        publish_fn=_publishing([]),
+        driver_factory=_make_factory(fake_tmux, drivers, configure=configure),
+        auth_mode="prompt",
+        heartbeat_interval_s=3600.0,
+        stall_threshold_s=7200.0,
+    )
+
+    assert report.exit_code() == 0
+    log_text = (tmp_path / "release.log").read_text(encoding="utf-8")
+    assert "repaired remote tracking ref for autobench/node03" in log_text
+
+
 def test_release_does_not_retry_permanent_git_preflight(fake_tmux, tmp_path, patched_drift) -> None:
     operator = _operator()
     drivers: dict = {}
