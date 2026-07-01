@@ -29,7 +29,7 @@ each tool's own `update.sh`/`install.sh` plus tiny inline Python sent over the
 ## 3. Distribution & layout
 
 ```
-edge-deploy-core/                 # standalone repo, pip install -e on operator
+edge-deploy-core/                 # installable package on operator
   edge_deploy/
     config.py        # OperatorConfig + ToolProfile loaders
     tmux_driver.py   # shared Authenticated Pane driver (chrome injected)

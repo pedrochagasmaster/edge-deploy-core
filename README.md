@@ -12,16 +12,26 @@ under [`docs/adr/`](docs/adr/) for the language and the decisions.
 
 ## Install (operator machine)
 
+Normal tool contributors get this package through their tool repo's dev
+dependencies. Autobench and Dispatch both depend on:
+
+```text
+edge-deploy-core @ git+https://scm.mastercard.int/stash/scm/~e176097/edge-deploy-core.git@main
+```
+
+When you are working on this package itself, install it from this repo:
+
 ```bash
 py -m pip install -e .
 # optional dev tooling (tests + lint)
 py -m pip install -e ".[dev]"
 ```
 
-Confirm the package imports:
+Confirm the package imports and the CLI is available:
 
 ```bash
 py -c "import edge_deploy; print(edge_deploy.__version__)"
+py -m edge_deploy --help
 ```
 
 ## Configuration — two layers

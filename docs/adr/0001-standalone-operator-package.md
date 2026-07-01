@@ -4,8 +4,10 @@ The toolkit executes entirely on the operator's Windows machine (local
 tmux/psmux pane, local git, SSH); the air-gapped Edge Nodes only ever run each
 tool's own `update.sh`/`install.sh` plus inline base64'd Python snippets sent
 over the pane, so they never import this package. We therefore distribute
-`edge-deploy-core` as a standalone package cloned and `pip install -e`'d on the
-operator machine. Each **Tool** repo commits only a small `edge_deploy.yaml`
+`edge-deploy-core` as a standalone package installed on the operator machine.
+Each **Tool** repo declares it as a development/release dependency using the
+corporate Git URL, while package maintainers may use `pip install -e` from a
+local clone. Each **Tool** repo commits only a small `edge_deploy.yaml`
 **Tool Profile**; no library code is vendored into the tools.
 
 ## Considered Options
@@ -22,7 +24,8 @@ operator machine. Each **Tool** repo commits only a small `edge_deploy.yaml`
 ## Consequences
 
 - Single source of truth; no cross-repo code sync.
-- `py -m edge_deploy release --tool both` runs from one place, reading each
+- `py -m edge_deploy release --tool both` runs from any shell with the package
+  installed and a valid operator config, reading each
   tool's working-copy path and Tool Profile.
 - Tools stay almost untouched: only a small committed profile is added.
 - The operator machine becomes a required, configured environment (git, SSH,
