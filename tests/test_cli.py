@@ -20,7 +20,6 @@ from edge_deploy.publish import PublishError, PublishResult
 from edge_deploy.reporting import ReleaseReport
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-PROJECTS_ROOT = Path(__file__).resolve().parents[2]
 
 OPERATOR_CONFIG = """\
 operator_email: operator@example.com
@@ -48,11 +47,13 @@ tools:
 
 
 def _write_operator_config_both(tmp_path: Path) -> Path:
+    autobench_path = _write_tool_profile(tmp_path, "autobench")
+    robocop_path = _write_tool_profile(tmp_path, "robocop")
     config_path = tmp_path / "config-both.yaml"
     config_path.write_text(
         OPERATOR_CONFIG_BOTH.format(
-            autobench_path=(PROJECTS_ROOT / "autobench").as_posix(),
-            robocop_path=(PROJECTS_ROOT / "robocop").as_posix(),
+            autobench_path=autobench_path.as_posix(),
+            robocop_path=robocop_path.as_posix(),
         ),
         encoding="utf-8",
     )
@@ -68,10 +69,39 @@ def _raise_timeout(address: tuple[str, int], timeout: float) -> object:
 
 
 def _write_operator_config(tmp_path: Path) -> Path:
-    autobench_path = (PROJECTS_ROOT / "autobench").as_posix()
+    autobench_path = _write_tool_profile(tmp_path, "autobench")
     config_path = tmp_path / "config.yaml"
-    config_path.write_text(OPERATOR_CONFIG.format(autobench_path=autobench_path), encoding="utf-8")
+    config_path.write_text(
+        OPERATOR_CONFIG.format(autobench_path=autobench_path.as_posix()),
+        encoding="utf-8",
+    )
     return config_path
+
+
+def _write_tool_profile(tmp_path: Path, tool: str) -> Path:
+    repo = tmp_path / tool
+    repo.mkdir(exist_ok=True)
+    remote_name = "autobench" if tool == "autobench" else "dispatch"
+    remote_path = "autobench" if tool == "autobench" else "dispatch"
+    (repo / "edge_deploy.yaml").write_text(
+        f"""\
+tool: {tool}
+repo_path: /ads_storage/{remote_path}
+github_url: https://github.com/pedrochagasmaster/{tool}.git
+bitbucket_url: https://scm.example/{remote_name}.git
+release_branch: main
+runtime_paths: ["src/**/*.py"]
+compile_targets: src
+version_files: [VERSION]
+install_trigger_paths: [requirements.txt]
+dependency_paths: [requirements.txt]
+smoke:
+  standard: ["echo ok"]
+  deep: []
+""",
+        encoding="utf-8",
+    )
+    return repo
 
 
 # ---------------------------------------------------------------------------
@@ -259,9 +289,6 @@ def _patch_driver_factory(monkeypatch, fake) -> None:
 
 
 def test_rollout_command_rolls_out_with_fake_pane(tmp_path, fake_tmux, monkeypatch) -> None:
-    if not (PROJECTS_ROOT / "autobench" / "edge_deploy.yaml").exists():
-        pytest.skip("autobench profile not available")
-
     config_path = _write_operator_config(tmp_path)
     commit = "d" * 40
     fake = fake_tmux(head_commits=["0" * 40, commit], changed_paths=["benchmark.py"])
@@ -276,9 +303,6 @@ def test_rollout_command_rolls_out_with_fake_pane(tmp_path, fake_tmux, monkeypat
 
 
 def test_rollout_command_refused_returns_1(tmp_path, fake_tmux, monkeypatch) -> None:
-    if not (PROJECTS_ROOT / "autobench" / "edge_deploy.yaml").exists():
-        pytest.skip("autobench profile not available")
-
     config_path = _write_operator_config(tmp_path)
     fake = fake_tmux(head_commits=["0" * 40], changed_paths=["requirements.txt"])
     _patch_driver_factory(monkeypatch, fake)
