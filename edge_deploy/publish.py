@@ -88,6 +88,17 @@ def _output_tail_text(text: str, *, limit: int = LOCAL_CHECK_OUTPUT_TAIL_LINES) 
     return "\n".join(lines[-limit:])
 
 
+def _is_generated_release_report_status(line: str) -> bool:
+    return line.startswith("?? edge-deploy/reports/")
+
+
+def _has_blocking_status(status: str) -> bool:
+    return any(
+        line.strip() and not _is_generated_release_report_status(line)
+        for line in status.splitlines()
+    )
+
+
 def run_local_check_ps1(repo_root: Path) -> int:
     """Invoke the repo's committed ``tools/dev/local_check.ps1`` and return its exit code.
 
@@ -184,7 +195,7 @@ def publish_snapshot(
             f"{token_env} is not set in the environment; cannot authenticate the Bitbucket push."
         )
 
-    clean_tree = git(["status", "--porcelain"]).strip() == ""
+    clean_tree = not _has_blocking_status(git(["status", "--porcelain", "--untracked-files=all"]))
     current_branch = git(["rev-parse", "--abbrev-ref", "HEAD"]).strip()
     on_release_branch = current_branch == branch
 

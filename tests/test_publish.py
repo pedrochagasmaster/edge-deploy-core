@@ -136,6 +136,27 @@ def test_publish_refuses_dirty_tree_by_default() -> None:
         publish_snapshot(AUTOBENCH, repo_root="/x", git_runner=git, run_local_check=False)
 
 
+def test_publish_ignores_generated_release_reports_by_default() -> None:
+    git = FakeGit(
+        status=(
+            "?? edge-deploy/reports/release-20260701T194538Z/release.json\n"
+            "?? edge-deploy/reports/release-20260701T194538Z/release.log\n"
+        )
+    )
+
+    result = publish_snapshot(AUTOBENCH, repo_root="/x", git_runner=git, run_local_check=False)
+
+    assert result.status == "published"
+    assert result.gate["clean_tree"] is True
+
+
+def test_publish_rejects_other_edge_deploy_files_by_default() -> None:
+    git = FakeGit(status="?? edge-deploy/config.yaml\n")
+
+    with pytest.raises(PublishError, match="not clean"):
+        publish_snapshot(AUTOBENCH, repo_root="/x", git_runner=git, run_local_check=False)
+
+
 def test_publish_refuses_off_release_branch_by_default() -> None:
     git = FakeGit(branch="feature/x")
 
