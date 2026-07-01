@@ -10,14 +10,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
 import sys
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
+from edge_deploy import __version__
+from edge_deploy.audit import AuditAttempt, AuditSyncError, append_audit_attempt, check_audit_remote
+from edge_deploy.auth import authenticate_node, authenticate_node_via_pane
 from edge_deploy import drift, preflight, rollout
 from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, OperatorConfig, load_tool_profile
 from edge_deploy.publish import PublishError, publish_snapshot
 from edge_deploy.release import ReleaseSelection, resolve_nodes, resolve_tools, run_release
+from edge_deploy.repository import RepositoryError, inspect_repository, require_successful_github_ci
 from edge_deploy.reporting import OperationReport, redact, write_release_report, write_report
 from edge_deploy.tmux_driver import AuthenticationError, SessionGoneError, TmuxDriver
 
@@ -37,9 +44,9 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     release_parser = subparsers.add_parser(
-        "release", help="Publish + roll out a Tool (or both) to one or more Edge Nodes, then verify"
+        "release", help="Publish and deploy the tool in the current checkout"
     )
-    release_parser.add_argument("--tool", required=True, choices=("autobench", "robocop", "both"))
+    release_parser.add_argument("--tool", choices=TOOL_CHOICES, help=argparse.SUPPRESS)
     release_parser.add_argument("--nodes", default=None, help="Comma list (e.g. 03,04); default: all configured nodes")
     release_parser.add_argument("--snapshot", default=None, help="Skip Publish; roll out this existing Snapshot SHA")
     release_parser.add_argument(
@@ -162,9 +169,14 @@ def _print_release_summary(report, consolidated_path: Path) -> None:
 
 
 def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
-    tools = resolve_tools(args.tool)
-    for tool in tools:
-        operator.tool_path(tool)  # validate each selected tool is configured (raises KeyError)
+    repo_root = Path.cwd().resolve()
+    if args.tool:
+        repo_root = Path(operator.tool_path(args.tool)).resolve()
+    profile = load_tool_profile(repo_root)
+    if args.tool and args.tool != profile.tool:
+        raise ValueError(f"--tool {args.tool!r} does not match checkout profile {profile.tool!r}")
+    tools = [profile.tool]
+    effective_operator = replace(operator, tools={profile.tool: str(repo_root)})
     if args.resume:
         report_dir = Path(args.resume)
     elif args.report_dir:
@@ -176,26 +188,127 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
         snapshot_by_tool.update(_load_resume_snapshots(report_dir, tools))
     selection = ReleaseSelection(
         tools=tools,
-        nodes=resolve_nodes(operator, args.nodes),
+        nodes=resolve_nodes(effective_operator, args.nodes),
         snapshot=args.snapshot,
         snapshot_by_tool=snapshot_by_tool,
         smoke=args.smoke,
         fail_fast=args.fail_fast,
     )
+    state = _run_release_preflight(
+        effective_operator,
+        profile,
+        repo_root,
+        selection.nodes,
+        auth_mode=args.auth_mode,
+        max_auth_attempts=args.max_auth_attempts,
+        auth_wait_seconds=args.auth_wait_seconds,
+    )
     report = run_release(
-        operator,
+        effective_operator,
         selection,
         report_dir=report_dir,
         max_auth_attempts=args.max_auth_attempts,
-        auth_mode=args.auth_mode,
+        auth_mode="pane",
         auth_wait_seconds=args.auth_wait_seconds,
         heartbeat_interval_s=args.heartbeat_interval,
         stall_threshold_s=args.stall_threshold,
         progress_fn=lambda message: print(redact(f"[release] {message}")),
     )
     consolidated_path = write_release_report(report_dir / "release.json", report)
+    _record_release_attempt(
+        effective_operator,
+        profile.tool,
+        state.commit,
+        report_dir,
+        report.summary()["overall"],
+    )
+    if report.exit_code() == 0:
+        _tag_successful_release(repo_root, state.commit)
     _print_release_summary(report, consolidated_path)
     return report.exit_code()
+
+
+def _run_release_preflight(
+    operator: OperatorConfig,
+    profile,
+    repo_root: Path,
+    node_names: list[str],
+    *,
+    auth_mode: str,
+    max_auth_attempts: int,
+    auth_wait_seconds: float,
+):
+    if not profile.github_url:
+        raise RepositoryError("edge_deploy.yaml must define github_url")
+    state = inspect_repository(
+        repo_root,
+        tool=profile.tool,
+        expected_origin=profile.github_url,
+        expected_bitbucket=profile.bitbucket_url,
+    )
+    require_successful_github_ci(state)
+    completed = subprocess.run([sys.executable, "-m", "pytest"], cwd=repo_root)
+    if completed.returncode:
+        raise RuntimeError("python -m pytest failed; release blocked")
+    if not operator.audit_repo:
+        raise AuditSyncError("operator config must define audit_repo")
+    check_audit_remote(
+        Path(operator.audit_repo),
+        tool=profile.tool,
+        source_sha=state.commit,
+    )
+
+    for node_name in node_names:
+        node = operator.node(node_name)
+        driver = TmuxDriver.from_node_and_profile(node, profile, retries=2)
+        if auth_mode == "pane" or (auth_mode == "auto" and not sys.stdin.isatty()):
+            authenticate_node_via_pane(
+                driver,
+                node_name,
+                notify_fn=lambda message: print(redact(f"[release] {message}")),
+                wait_timeout=auth_wait_seconds,
+            )
+        else:
+            authenticate_node(
+                driver,
+                node_name,
+                max_attempts=max_auth_attempts,
+                wait_timeout=auth_wait_seconds,
+            )
+    return state
+
+
+def _record_release_attempt(
+    operator: OperatorConfig,
+    tool: str,
+    commit: str,
+    report_dir: Path,
+    status: str,
+) -> str:
+    attempt = AuditAttempt(
+        tool=tool,
+        source_sha=commit,
+        started_at=datetime.now(timezone.utc),
+        report_dir=report_dir,
+        core_version=__version__,
+        operator=operator.operator_email,
+        status=status,
+    )
+    return append_audit_attempt(Path(operator.audit_repo), attempt)
+
+
+def _tag_successful_release(repo_root: Path, commit: str) -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    tag = f"release-{stamp}-{commit[:7]}"
+    subprocess.run(["git", "tag", "-a", tag, commit, "-m", f"Successful release {tag}"], cwd=repo_root, check=True)
+    subprocess.run(["git", "push", "origin", f"refs/tags/{tag}"], cwd=repo_root, check=True)
+    command = ["git"]
+    token = os.environ.get("BB_TOKEN")
+    if token:
+        command.extend(["-c", f"http.extraHeader=Authorization: Bearer {token}"])
+    command.extend(["push", "bitbucket", f"refs/tags/{tag}"])
+    subprocess.run(command, cwd=repo_root, check=True)
+    return tag
 
 
 def _cmd_publish(args: argparse.Namespace, operator: OperatorConfig) -> int:
@@ -284,7 +397,17 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_drift(args, operator)
         if args.command == "preflight":
             return _cmd_preflight(args, operator)
-    except (RuntimeError, PublishError, AuthenticationError, SessionGoneError, KeyError, ValueError) as exc:
+    except (
+        RuntimeError,
+        PublishError,
+        RepositoryError,
+        AuditSyncError,
+        AuthenticationError,
+        SessionGoneError,
+        KeyError,
+        ValueError,
+        subprocess.CalledProcessError,
+    ) as exc:
         print(f"{args.command} failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
     return 2

@@ -14,11 +14,14 @@ tests stay usable in a stripped-down environment.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
-DEFAULT_OPERATOR_CONFIG_PATH = Path.home() / ".edge-deploy" / "config.yaml"
+DEFAULT_OPERATOR_CONFIG_PATH = (
+    Path(os.environ.get("APPDATA", Path.home() / ".config")) / "edge-deploy" / "config.yaml"
+)
 TOOL_PROFILE_FILENAME = "edge_deploy.yaml"
 
 # Valid ``tui_exit`` strategies understood by :class:`~edge_deploy.tmux_driver.TmuxDriver`.
@@ -210,10 +213,12 @@ class NodeConfig:
 
 @dataclass(frozen=True)
 class OperatorConfig:
-    """Operator-machine config: Edge Node inventory + per-tool working-copy paths."""
+    """Private operator identity, node inventory, and audit checkout."""
 
     operator_email: str = ""
+    audit_repo: str = ""
     nodes: dict[str, NodeConfig] = field(default_factory=dict)
+    # Backward-compatible only for lower-level commands. Normal release infers cwd.
     tools: dict[str, str] = field(default_factory=dict)
 
     @classmethod
@@ -230,6 +235,7 @@ class OperatorConfig:
                 tools[str(name)] = str(raw)
         return cls(
             operator_email=str(data.get("operator_email", "") or ""),
+            audit_repo=str(data.get("audit_repo", "") or ""),
             nodes=nodes,
             tools=tools,
         )
@@ -284,6 +290,7 @@ class ToolProfile:
 
     tool: str = ""
     repo_path: str = ""
+    github_url: str = ""
     bitbucket_url: str = ""
     release_branch: str = "main"
     runtime_paths: list[str] = field(default_factory=list)
@@ -301,6 +308,7 @@ class ToolProfile:
         return cls(
             tool=str(data.get("tool", "")),
             repo_path=str(data.get("repo_path", "")),
+            github_url=str(data.get("github_url", "")),
             bitbucket_url=str(data.get("bitbucket_url", "")),
             release_branch=str(data.get("release_branch", "main") or "main"),
             runtime_paths=_as_str_list(data.get("runtime_paths")),

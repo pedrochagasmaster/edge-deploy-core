@@ -1,20 +1,15 @@
-# Operator config for edge-deploy-core.
-# Copy to ~/.edge-deploy/config.yaml and edit for your machine.
-# This is layer 1 (operator machine): Edge Node inventory + per-tool working-copy paths.
-# BB_TOKEN stays an environment variable; it is never stored here.
+# Copy to %APPDATA%/edge-deploy/config.yaml and keep the real file private.
+# BB_TOKEN remains an environment variable.
 
-operator_email: e176097@mastercard.com
+operator_email: operator@example.com
+audit_repo: C:/path/to/edge-deploy-core
 
 nodes:
   node03:
-    host: e176097@hde2stl020003.mastercard.int
+    host: operator@edge-node-03.example
     ssh_options: "-p 2222 -o ServerAliveInterval=30"
     session: edge-node03
   node04:
-    host: e176097@hde2stl020004.mastercard.int
+    host: operator@edge-node-04.example
     ssh_options: "-p 2222 -o ServerAliveInterval=30"
     session: edge-node04
-
-tools:
-  autobench: { path: D:/Projects/autobench }
-  robocop:   { path: D:/Projects/robocop }

@@ -18,11 +18,7 @@ import pytest
 
 from edge_deploy import publish
 from edge_deploy.config import ToolProfile
-from edge_deploy.publish import (
-    PublishError,
-    build_snapshot_message,
-    publish_snapshot,
-)
+from edge_deploy.publish import PublishError, publish_snapshot
 
 TOKEN = "s3cr3t-bearer-token"
 FIXED_CLOCK = lambda: datetime(2026, 6, 29, 23, 0, tzinfo=timezone.utc)  # noqa: E731
@@ -89,12 +85,6 @@ def _token(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_build_snapshot_message_exact_format() -> None:
-    message = build_snapshot_message("autobench", "a1b2c3d", "main", FIXED_CLOCK())
-
-    assert message == "Deploy snapshot: autobench a1b2c3d on main (2026-06-29 23:00) [edge-deploy]"
-
-
 def test_publish_message_uses_injected_clock_and_short() -> None:
     git = FakeGit(short="cafe123")
 
@@ -102,7 +92,7 @@ def test_publish_message_uses_injected_clock_and_short() -> None:
         AUTOBENCH, repo_root="/x", git_runner=git, run_local_check=False, clock=FIXED_CLOCK
     )
 
-    assert result.message == "Deploy snapshot: autobench cafe123 on main (2026-06-29 23:00) [edge-deploy]"
+    assert result.message == "Publish exact source commit cafe123 to bitbucket/main"
 
 
 # ---------------------------------------------------------------------------
@@ -110,26 +100,20 @@ def test_publish_message_uses_injected_clock_and_short() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_publish_reparents_with_commit_tree_parent_and_tree() -> None:
-    git = FakeGit(previous="0f0f0f0f0f0f", tree="7ree7ree7ree", snapshot="5nap5nap")
+def test_publish_preserves_exact_source_sha() -> None:
+    git = FakeGit(previous="0f0f0f0f0f0f", source_commit="a" * 40)
 
     result = publish_snapshot(AUTOBENCH, repo_root="/x", git_runner=git, run_local_check=False)
 
-    assert result.snapshot == "5nap5nap"
+    assert result.snapshot == "a" * 40
+    assert result.source_commit == result.snapshot
     assert result.previous_remote_commit == "0f0f0f0f0f0f"
-    commit_tree = git.commit_tree_call()
-    # commit-tree <tree> -p <remote-parent> -m <message>
-    assert commit_tree[1] == "7ree7ree7ree"
-    assert commit_tree[2] == "-p"
-    assert commit_tree[3] == "0f0f0f0f0f0f"
-    assert commit_tree[4] == "-m"
-    assert "Deploy snapshot: autobench" in commit_tree[5]
-    # The working tree is never mutated: no checkout/reset/commit ran.
-    assert not any(call[0] in {"checkout", "reset", "commit"} for call in git.calls)
+    assert ["merge-base", "--is-ancestor", "0f0f0f0f0f0f", "a" * 40] in git.calls
+    assert not any(call[0] in {"checkout", "reset", "commit", "commit-tree"} for call in git.calls)
 
 
-def test_publish_pushes_with_bearer_header_and_snapshot_refspec() -> None:
-    git = FakeGit(snapshot="5nap5nap")
+def test_publish_pushes_with_bearer_header_and_exact_refspec() -> None:
+    git = FakeGit(source_commit="a" * 40)
 
     publish_snapshot(AUTOBENCH, repo_root="/x", git_runner=git, run_local_check=False)
 
@@ -138,7 +122,7 @@ def test_publish_pushes_with_bearer_header_and_snapshot_refspec() -> None:
     assert push[1] == f"http.extraHeader=Authorization: Bearer {TOKEN}"
     assert push[2] == "push"
     assert push[3] == "bitbucket"
-    assert push[4] == "5nap5nap:refs/heads/main"
+    assert push[4] == f"{'a' * 40}:refs/heads/main"
 
 
 # ---------------------------------------------------------------------------
@@ -209,8 +193,7 @@ def test_publish_commit_override_relaxes_tree_and_branch_gate() -> None:
     assert result.status == "published"
     assert result.gate["clean_tree"] is False
     assert result.gate["on_release_branch"] is False
-    # commit-tree source was the named commit (its ^{tree} was resolved).
-    assert any(call == ["rev-parse", "deadbeefcafe^{tree}"] for call in git.calls)
+    assert any(call == ["rev-parse", "--verify", "deadbeefcafe"] for call in git.calls)
 
 
 def test_publish_requires_token() -> None:
@@ -302,6 +285,10 @@ def test_publish_against_real_repo_advances_remote_main(tmp_path) -> None:
     _git(["push", "bitbucket", "main"], work)
 
     previous = _git(["rev-parse", "main"], work)
+    (work / "benchmark.py").write_text("print('v2')\n", encoding="utf-8")
+    _git(["add", "."], work)
+    _git(["commit", "-m", "reviewed change"], work)
+    source = _git(["rev-parse", "HEAD"], work)
 
     result = publish_snapshot(
         AUTOBENCH, repo_root=work, run_local_check=False, clock=FIXED_CLOCK
@@ -309,9 +296,7 @@ def test_publish_against_real_repo_advances_remote_main(tmp_path) -> None:
 
     assert result.status == "published"
     assert result.previous_remote_commit == previous
-    # The bare remote's main now points at the new Snapshot.
+    # The bare remote's main now points at the exact reviewed source.
     remote_head = _git(["rev-parse", "main"], bare)
-    assert remote_head == result.snapshot
-    # The Snapshot's tree equals the reviewed source tree; its parent is the old remote head.
-    assert _git(["rev-parse", f"{result.snapshot}^{{tree}}"], work) == _git(["rev-parse", "HEAD^{tree}"], work)
+    assert remote_head == result.snapshot == source
     assert _git(["rev-parse", f"{result.snapshot}^"], work) == previous

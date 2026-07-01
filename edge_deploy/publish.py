@@ -167,28 +167,6 @@ def _default_git_runner(repo_root: str | Path) -> GitRunner:
     return run
 
 
-def reparent_snapshot(
-    git: GitRunner,
-    *,
-    source: str,
-    remote: str,
-    branch: str,
-    message: str,
-    token: str,
-) -> str:
-    """Build the Snapshot with ``git commit-tree`` and push it via a Bearer token.
-
-    No working-tree mutation: the snapshot commit is created from ``source``'s tree and the
-    remote parent directly. Returns the new Snapshot SHA.
-    """
-    tree = git(["rev-parse", f"{source}^{{tree}}"]).strip()
-    parent = git(["rev-parse", f"{remote}/{branch}"]).strip()
-    snapshot = git(["commit-tree", tree, "-p", parent, "-m", message]).strip()
-    auth_header = f"http.extraHeader=Authorization: Bearer {token}"
-    git(["-c", auth_header, "push", remote, f"{snapshot}:refs/heads/{branch}"])
-    return snapshot
-
-
 def publish_snapshot(
     profile: ToolProfile,
     *,
@@ -256,21 +234,27 @@ def publish_snapshot(
     source_commit = git(["rev-parse", "--verify", source]).strip()
     source_short = git(["rev-parse", "--short", source]).strip()
 
-    # Refresh the remote-tracking ref so the Snapshot's parent is the *current*
-    # bitbucket/main (authed fetch; http.extraHeader is ignored by non-http remotes).
+    # Refresh and require a fast-forward. Legacy rewritten-snapshot history requires
+    # one explicit operator migration; this code never force-pushes.
     auth_header = f"http.extraHeader=Authorization: Bearer {token}"
     git(["-c", auth_header, "fetch", remote, branch])
     previous_remote_commit = git(["rev-parse", "--verify", f"{remote}/{branch}"]).strip()
+    try:
+        git(["merge-base", "--is-ancestor", previous_remote_commit, source_commit])
+    except PublishError as exc:
+        raise PublishError(
+            f"{remote}/{branch} is not an ancestor of {source_commit}; refusing a "
+            "non-fast-forward publish. Preserve the legacy tip and perform the one-time "
+            "operator migration before retrying."
+        ) from exc
 
-    message = build_snapshot_message(profile.tool, source_short, branch, clock())
-    snapshot = reparent_snapshot(
-        git, source=source, remote=remote, branch=branch, message=message, token=token
-    )
+    message = f"Publish exact source commit {source_short} to {remote}/{branch}"
+    git(["-c", auth_header, "push", remote, f"{source_commit}:refs/heads/{branch}"])
 
     return PublishResult(
         tool=profile.tool,
         status="published",
-        snapshot=snapshot,
+        snapshot=source_commit,
         source_commit=source_commit,
         source_short=source_short,
         branch=branch,

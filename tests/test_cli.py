@@ -114,16 +114,14 @@ def test_parser_help_lists_all_subcommands(capsys) -> None:
 
 def test_parser_parses_release_args() -> None:
     args = cli.build_parser().parse_args(
-        ["release", "--tool", "both", "--nodes", "03,04", "--snapshot", "abc123",
-         "--tool-snapshot", "autobench=aaa", "--auth-mode", "prompt",
+        ["release", "--nodes", "03,04", "--snapshot", "abc123", "--auth-mode", "prompt",
          "--smoke", "deep", "--fail-fast", "--report-dir", "out", "--max-auth-attempts", "5"]
     )
 
     assert args.command == "release"
-    assert args.tool == "both"
+    assert args.tool is None
     assert args.nodes == "03,04"
     assert args.snapshot == "abc123"
-    assert args.tool_snapshot == ["autobench=aaa"]
     assert args.auth_mode == "prompt"
     assert args.smoke == "deep"
     assert args.fail_fast is True
@@ -132,8 +130,9 @@ def test_parser_parses_release_args() -> None:
 
 
 def test_parser_release_defaults() -> None:
-    args = cli.build_parser().parse_args(["release", "--tool", "autobench"])
+    args = cli.build_parser().parse_args(["release"])
 
+    assert args.tool is None
     assert args.nodes is None
     assert args.snapshot is None
     assert args.tool_snapshot is None
@@ -308,20 +307,23 @@ def test_release_command_dispatches_and_writes_consolidated_report(tmp_path, mon
         )
 
     monkeypatch.setattr(cli, "run_release", fake_run_release)
+    monkeypatch.setattr(cli, "_run_release_preflight", lambda *a, **k: SimpleNamespace(commit="a" * 40))
+    monkeypatch.setattr(cli, "_record_release_attempt", lambda *a, **k: "audit")
+    monkeypatch.setattr(cli, "_tag_successful_release", lambda *a, **k: "tag")
     report_dir = tmp_path / "rep"
 
     rc = cli.main(
-        ["--config", str(config_path), "release", "--tool", "both", "--nodes", "03,04",
+        ["--config", str(config_path), "release", "--tool", "autobench", "--nodes", "03,04",
          "--smoke", "deep", "--report-dir", str(report_dir), "--max-auth-attempts", "5"]
     )
 
     assert rc == 0
     selection = captured["selection"]
-    assert selection.tools == ["autobench", "robocop"]
+    assert selection.tools == ["autobench"]
     assert selection.nodes == ["node03", "node04"]
     assert selection.smoke == "deep"
     assert selection.snapshot_by_tool == {}
-    assert captured["auth_mode"] == "auto"
+    assert captured["auth_mode"] == "pane"
     assert callable(captured["progress_fn"])
     assert captured["max_auth_attempts"] == 5
     assert (report_dir / "release.json").exists()
@@ -338,6 +340,8 @@ def test_release_command_nonzero_exit_on_failure(tmp_path, monkeypatch) -> None:
         )
 
     monkeypatch.setattr(cli, "run_release", fake_run_release)
+    monkeypatch.setattr(cli, "_run_release_preflight", lambda *a, **k: SimpleNamespace(commit="a" * 40))
+    monkeypatch.setattr(cli, "_record_release_attempt", lambda *a, **k: "audit")
 
     rc = cli.main(
         ["--config", str(config_path), "release", "--tool", "autobench", "--report-dir", str(tmp_path / "rep")]
@@ -354,10 +358,6 @@ def test_release_command_resume_loads_publish_snapshots(tmp_path, monkeypatch) -
         json.dumps({"tool": "autobench", "status": "published", "deployment_commit": "a" * 40}) + "\n",
         encoding="utf-8",
     )
-    (resume_dir / "publish-robocop.json").write_text(
-        json.dumps({"tool": "robocop", "status": "published", "deployment_commit": "b" * 40}) + "\n",
-        encoding="utf-8",
-    )
     captured: dict = {}
 
     def fake_run_release(operator, selection, *, report_dir, max_auth_attempts, **kwargs) -> ReleaseReport:
@@ -370,12 +370,15 @@ def test_release_command_resume_loads_publish_snapshots(tmp_path, monkeypatch) -
         )
 
     monkeypatch.setattr(cli, "run_release", fake_run_release)
+    monkeypatch.setattr(cli, "_run_release_preflight", lambda *a, **k: SimpleNamespace(commit="a" * 40))
+    monkeypatch.setattr(cli, "_record_release_attempt", lambda *a, **k: "audit")
+    monkeypatch.setattr(cli, "_tag_successful_release", lambda *a, **k: "tag")
 
-    rc = cli.main(["--config", str(config_path), "release", "--tool", "both", "--resume", str(resume_dir)])
+    rc = cli.main(["--config", str(config_path), "release", "--tool", "autobench", "--resume", str(resume_dir)])
 
     assert rc == 0
     assert captured["report_dir"] == resume_dir
-    assert captured["selection"].snapshot_by_tool == {"autobench": "a" * 40, "robocop": "b" * 40}
+    assert captured["selection"].snapshot_by_tool == {"autobench": "a" * 40}
     assert (resume_dir / "release.json").exists()
 
 

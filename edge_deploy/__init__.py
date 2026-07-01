@@ -31,7 +31,7 @@ from edge_deploy.reporting import (
 from edge_deploy.tmux_driver import AuthenticationError, SessionGoneError, TmuxDriver
 from edge_deploy.verify import run_smoke, verify_after_rollout
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 
 __all__ = [
     "DEFAULT_OPERATOR_CONFIG_PATH",
