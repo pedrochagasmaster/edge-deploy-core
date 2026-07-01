@@ -1,11 +1,7 @@
-"""Publish: create and push exactly one **Snapshot** to a Tool's Bitbucket deployment
-remote, returning its SHA. The only step that talks to Bitbucket.
+"""Publish the exact reviewed GitHub commit to a Tool's Bitbucket ``main``.
 
-A Snapshot is a commit whose *tree* is the reviewed source build and whose *parent* is
-the current ``bitbucket/main``. It is built with ``git commit-tree`` (Phase-2 Plan
-Recommendation 2): the snapshot commit object is created directly from the source tree
-and the remote parent **without** touching the working tree, ``HEAD`` or the current
-branch — so there is no detached-HEAD risk and no fragile ``finally``-restore dance.
+Publish is fast-forward-only. It never rewrites commits, force-pushes, or mutates the
+working tree.
 
 Gate (Plan §1.1):
 
@@ -48,11 +44,11 @@ class PublishError(RuntimeError):
 
 @dataclass(frozen=True)
 class PublishResult:
-    """The outcome of one successful Publish (one Snapshot pushed to ``bitbucket/main``)."""
+    """The outcome of one exact source commit pushed to ``bitbucket/main``."""
 
     tool: str
     status: str  # "published"
-    snapshot: str  # new Snapshot SHA (now HEAD of bitbucket/main)
+    snapshot: str  # exact source SHA, retained as a report-schema compatibility key
     source_commit: str
     source_short: str
     branch: str
@@ -76,11 +72,6 @@ class PublishResult:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def build_snapshot_message(tool: str, source_short: str, branch: str, when: datetime) -> str:
-    """The standardized, converged Snapshot message (Plan §1.1)."""
-    return f"Deploy snapshot: {tool} {source_short} on {branch} ({when:%Y-%m-%d %H:%M}) [edge-deploy]"
 
 
 def _resolve_powershell() -> str | None:
@@ -179,7 +170,7 @@ def publish_snapshot(
     git_runner: GitRunner | None = None,
     local_check_runner: Callable[[Path], int] = run_local_check_ps1,
 ) -> PublishResult:
-    """Publish one Snapshot for ``profile`` and return its SHA + provenance.
+    """Publish one exact source commit for ``profile`` and return its provenance.
 
     Raises :class:`PublishError` on any gate failure or git error.
     """

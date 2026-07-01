@@ -50,6 +50,7 @@ def inspect_repository(
     """Require a clean local ``main`` exactly equal to ``origin/main``."""
     root = Path(root).resolve()
     run = runner or _runner(root)
+    run(["git", "fetch", "origin", "main"])
     branch = run(["git", "branch", "--show-current"]).strip()
     if branch != "main":
         raise RepositoryError(f"release requires branch 'main', found {branch!r}")

@@ -17,7 +17,7 @@ from edge_deploy.config import (
     load_operator_config,
     load_tool_profile,
 )
-from edge_deploy.publish import PublishError, PublishResult, build_snapshot_message, publish_snapshot
+from edge_deploy.publish import PublishError, PublishResult, publish_snapshot
 from edge_deploy.release import ReleaseSelection, run_release
 from edge_deploy.reporting import (
     RELEASE_SCHEMA,
@@ -57,7 +57,6 @@ __all__ = [
     "PublishError",
     "PublishResult",
     "publish_snapshot",
-    "build_snapshot_message",
     "run_smoke",
     "verify_after_rollout",
     "ReleaseSelection",

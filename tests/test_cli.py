@@ -403,7 +403,7 @@ def test_publish_command_prints_snapshot(tmp_path, monkeypatch, capsys) -> None:
 
     assert rc == 0
     out = capsys.readouterr().out
-    assert "Published Snapshot: snap123" in out
+    assert "Published commit: snap123" in out
     assert "srcshrt" in out
 
 

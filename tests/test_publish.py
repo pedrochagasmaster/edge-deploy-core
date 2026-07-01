@@ -1,9 +1,4 @@
-"""Publish: BB_TOKEN snapshot publish (gate + ``git commit-tree`` reparent).
-
-Two layers: a fake ``git_runner`` for the unit cases (message exactness, commit-tree
-parent/tree wiring, gate failures, Bearer header on push, token never leaking into the
-result) and a real temporary git repo + local bare remote for the happy path.
-"""
+"""Exact-source, fast-forward-only Publish tests."""
 
 from __future__ import annotations
 
@@ -37,8 +32,6 @@ class FakeGit:
         source_commit: str = "a1b2c3d4e5f6a7b8",
         short: str = "a1b2c3d",
         previous: str = "0f0f0f0f0f0f",
-        tree: str = "7ree7ree7ree",
-        snapshot: str = "5nap5napsnap5nap",
     ) -> None:
         self.calls: list[list[str]] = []
         self.status = status
@@ -46,8 +39,6 @@ class FakeGit:
         self.source_commit = source_commit
         self.short = short
         self.previous = previous
-        self.tree = tree
-        self.snapshot = snapshot
 
     def __call__(self, args) -> str:
         args = list(args)
@@ -61,19 +52,11 @@ class FakeGit:
         if args[:2] == ["rev-parse", "--verify"]:
             ref = args[2]
             return (self.previous if "/" in ref else self.source_commit) + "\n"
-        if args[0] == "rev-parse" and len(args) == 2:
-            return (self.tree if args[1].endswith("^{tree}") else self.previous) + "\n"
-        if args[0] == "commit-tree":
-            return self.snapshot + "\n"
         # fetch / push (with or without the leading -c auth header)
         return ""
 
     def push_call(self) -> list[str] | None:
         return next((call for call in self.calls if "push" in call), None)
-
-    def commit_tree_call(self) -> list[str] | None:
-        return next((call for call in self.calls if call and call[0] == "commit-tree"), None)
-
 
 @pytest.fixture(autouse=True)
 def _token(monkeypatch) -> None:
@@ -96,7 +79,7 @@ def test_publish_message_uses_injected_clock_and_short() -> None:
 
 
 # ---------------------------------------------------------------------------
-# commit-tree reparent wiring
+# Exact-source fast-forward wiring
 # ---------------------------------------------------------------------------
 
 

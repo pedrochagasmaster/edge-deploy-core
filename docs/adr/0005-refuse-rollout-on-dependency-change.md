@@ -2,10 +2,10 @@
 
 Offline wheels do not travel in git (autobench ignores `/offline_packages/*`;
 robocop commits no `.whl` and ignores its deploy zip), so a Bitbucket
-**Snapshot** + `update.sh` cannot deliver new or upgraded dependencies — the air-
+The published source commit + `update.sh` cannot deliver new or upgraded dependencies — the air-
 gapped node's `install.sh` installs only from wheels already present from a prior
 `deploy_and_install.ps1`. Therefore v1 of edge-deploy-core covers the git-update
-path only. When a Snapshot's changed-paths diff touches `requirements.txt` or
+path only. When a release commit's changed-paths diff touches `requirements.txt` or
 `constraints.txt`, the **Rollout** is refused (not warned) with guidance to run
 the offline bundle refresh first, so we never start an offline `install.sh` that
 fails halfway.

@@ -1,27 +1,17 @@
-# Releases continue on failure and never auto-rollback
+# Partial deployments are recorded and never auto-rolled back
 
-A **Release** fans out across independent **Edge Nodes** with manual, serial
-auth, so true all-or-nothing atomicity is impossible. On a failed **Publish** we
-skip that **Tool's** **Rollouts** but continue other tools; on a failed Rollout
-we record it, leave the node in whatever state it reached, and continue the
-remaining Rollouts. The run exits non-zero and the consolidated report flags any
-node left mid-state. Rollback stays an explicit Operator action
-(`--rollback-from`), never automatic, because the Operator often wants the new
-tree left on for debugging. `--fail-fast` is available for operators who prefer
-to stop on the first failure.
+Edge Nodes have independent filesystems, so an all-or-nothing Deploy is not
+possible. A failed node is recorded with the state it reached. Remaining nodes
+may continue unless the Release Operator selected fail-fast behavior.
 
-Remote Git preflight may perform one bounded repair before rollout mutation:
-when fetch identifies the expected remote-tracking ref as unresolvable or a bad
-object, it deletes only that ref and its reflog, then retries fetch once. The
-rollout report and release log record the attempt and result. Unknown Git
-failures still stop for Operator investigation.
+If Publish succeeded but any Deploy or verification failed, the Release is
+unresolved for that source SHA. A retry may resume the same SHA. Releasing a
+different SHA is blocked until the attempt succeeds or an explicit Rollback
+restores a recorded successful release.
 
-## Consequences
+Rollback is never automatic because the failed state may be needed for
+diagnosis. Every attempt, including failures and retries, is appended to the
+private audit branch.
 
-- Maximum progress and full visibility over atomicity.
-- The report schema must distinguish "rolled out", "failed (state left = …)",
-  and "skipped".
-- Known local tracking-ref corruption is self-healing and auditable; repair is
-  restricted to the exact expected ref and never changes the working tree.
-- Recovery is a deliberate follow-up Release (see resume semantics), not an
-  implicit unwind.
+Remote Git preflight may repair only a known corrupt remote-tracking ref and its
+reflog, then retry once. It never changes the working tree.

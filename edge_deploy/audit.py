@@ -138,6 +138,7 @@ def append_audit_attempt(
     worktree = Path(tempfile.mkdtemp(prefix="edge-deploy-audit-"))
     worktree.rmdir()
     added = False
+    destination: Path | None = None
     try:
         remote = _run(
             core_repo,
@@ -171,15 +172,14 @@ def append_audit_attempt(
         _run(worktree, "add", str(_relative_path(attempt)))
         _run(worktree, "commit", "-m", f"audit: {attempt.tool} {attempt.attempt_id} {attempt.status}")
         commit = _run(worktree, "rev-parse", "HEAD").stdout.strip()
-        try:
-            _run(worktree, "push", "bitbucket", "HEAD:refs/heads/release-log")
-        except AuditSyncError:
-            preserved = pending / attempt.attempt_id
-            if preserved.exists():
-                raise AuditSyncError(f"audit outbox collision: {preserved}")
-            _copy_redacted(destination, preserved)
-            raise
+        _run(worktree, "push", "bitbucket", "HEAD:refs/heads/release-log")
         return commit
+    except Exception:
+        if destination is not None and destination.exists():
+            preserved = pending / attempt.attempt_id
+            if not preserved.exists():
+                _copy_redacted(destination, preserved)
+        raise
     finally:
         if added:
             _run(core_repo, "worktree", "remove", "--force", str(worktree), check=False)

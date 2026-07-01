@@ -1,11 +1,7 @@
-"""Release: the umbrella orchestrator (DESIGN §6).
+"""Low-level Deploy orchestration and consolidated reporting.
 
-Fans out over **Tools × Edge Nodes** with one Authenticated Pane per node reused across
-tools, applies the ADR-0003 partial-failure policy, and consolidates everything into a
-single :class:`~edge_deploy.reporting.ReleaseReport`.
-
-Loop order (Plan §4.1): **Publish per tool first** (a broken build never authenticates a
-node), then **nodes outer / tools inner** so single-use RSA is paid once per node.
+The public CLI supplies the Tool inferred from the current checkout and completes all
+hard preflight and authentication gates before calling this engine.
 
 Pair statuses (ADR-0003): ``rolled_out | failed | refused | skipped``. ``run_rollout``
 never returns ``skipped`` (Risk #9), so the orchestrator synthesizes it for
@@ -40,15 +36,11 @@ from edge_deploy.rollout import run_rollout
 from edge_deploy.tmux_driver import AuthenticationError, SessionGoneError, TmuxDriver
 from edge_deploy.verify import verify_after_rollout
 
-# The tools selected by ``--tool both``, in canonical order.
-TOOLS_BOTH = ("autobench", "robocop")
-
-
 @dataclass(frozen=True)
 class ReleaseSelection:
     """A resolved Release request: which tools, which nodes, and how."""
 
-    tools: list[str]  # resolved from --tool {autobench|robocop|both}
+    tools: list[str]  # public CLI supplies exactly the current checkout's tool
     nodes: list[str]  # resolved node names (default: all configured)
     snapshot: str | None = None  # --snapshot <sha> -> skip Publish, roll out an existing Snapshot
     snapshot_by_tool: dict[str, str] | None = None  # per-tool resume map, e.g. {"autobench": "..."}
@@ -57,13 +49,8 @@ class ReleaseSelection:
 
 
 # ---------------------------------------------------------------------------
-# Selection resolution (shared with the CLI)
+# Node selection resolution (shared with the CLI)
 # ---------------------------------------------------------------------------
-
-
-def resolve_tools(tool_arg: str) -> list[str]:
-    """``"both"`` -> both tools; any single tool -> a one-element list."""
-    return list(TOOLS_BOTH) if tool_arg == "both" else [tool_arg]
 
 
 def normalize_node_name(raw: str) -> str:

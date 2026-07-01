@@ -23,7 +23,7 @@ from edge_deploy.auth import authenticate_node, authenticate_node_via_pane
 from edge_deploy import drift, preflight, rollout
 from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, OperatorConfig, load_tool_profile
 from edge_deploy.publish import PublishError, publish_snapshot
-from edge_deploy.release import ReleaseSelection, resolve_nodes, resolve_tools, run_release
+from edge_deploy.release import ReleaseSelection, resolve_nodes, run_release
 from edge_deploy.repository import RepositoryError, inspect_repository, require_successful_github_ci
 from edge_deploy.reporting import OperationReport, redact, write_release_report, write_report
 from edge_deploy.tmux_driver import AuthenticationError, SessionGoneError, TmuxDriver
@@ -34,12 +34,12 @@ TOOL_CHOICES = ("autobench", "robocop")
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m edge_deploy",
-        description="Roll a reviewed Snapshot of a Tool out to an Edge Node, and verify it.",
+        description="Publish and deploy an exact reviewed Tool commit, then verify it.",
     )
     parser.add_argument(
         "--config",
         default=str(DEFAULT_OPERATOR_CONFIG_PATH),
-        help="Operator config path (default: ~/.edge-deploy/config.yaml)",
+        help="Operator config path (default: APPDATA/edge-deploy/config.yaml)",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -70,16 +70,16 @@ def build_parser() -> argparse.ArgumentParser:
     release_parser.add_argument("--heartbeat-interval", type=float, default=30.0)
     release_parser.add_argument("--stall-threshold", type=float, default=300.0)
 
-    publish_parser = subparsers.add_parser("publish", help="Publish one Tool's Snapshot to its Bitbucket remote")
+    publish_parser = subparsers.add_parser("publish", help="Publish one exact Tool commit to Bitbucket")
     publish_parser.add_argument("--tool", required=True, choices=TOOL_CHOICES, help="Per-tool; no 'both'")
     publish_parser.add_argument("--commit", default=None, help="Optional source override (a reviewed commit SHA)")
     publish_parser.add_argument("--no-local-check", action="store_true", help="Bypass the local_check.ps1 gate")
     publish_parser.add_argument("--remote", default="bitbucket")
 
-    rollout_parser = subparsers.add_parser("rollout", help="Roll one Edge Node to an exact Snapshot")
+    rollout_parser = subparsers.add_parser("rollout", help="Roll one Edge Node to an exact commit")
     rollout_parser.add_argument("--tool", required=True, help="Tool name (key in operator config 'tools')")
     rollout_parser.add_argument("--node", required=True, help="Node name (key in operator config 'nodes')")
-    rollout_parser.add_argument("--commit", required=True, help="Snapshot SHA to roll out")
+    rollout_parser.add_argument("--commit", required=True, help="Commit SHA to roll out")
     rollout_parser.add_argument("--install", choices=["auto", "always", "never"], default="auto")
     rollout_parser.add_argument("--json-report", help="Optional path to write the JSON report")
     rollout_parser.add_argument("--reuse-session", action="store_true", help="Require a pre-authenticated pane")
@@ -321,7 +321,7 @@ def _cmd_publish(args: argparse.Namespace, operator: OperatorConfig) -> int:
         commit=args.commit,
         run_local_check=not args.no_local_check,
     )
-    print(f"Published Snapshot: {result.snapshot}")
+    print(f"Published commit: {result.snapshot}")
     print(f"  source: {result.source_short} ({result.source_commit})")
     print(f"  branch: {result.branch}")
     print(f"  previous remote: {result.previous_remote_commit}")

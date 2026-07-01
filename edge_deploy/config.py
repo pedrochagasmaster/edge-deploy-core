@@ -1,11 +1,11 @@
 """Two-layer configuration for edge-deploy-core.
 
-Layer 1 — :class:`OperatorConfig` (operator machine, ``~/.edge-deploy/config.yaml``):
-    Edge Node inventory + per-tool working-copy paths. ``BB_TOKEN`` stays an env var.
+Layer 1 — :class:`OperatorConfig` (``%APPDATA%/edge-deploy/config.yaml``):
+    Operator identity, Edge Node inventory, and the private audit checkout.
 
 Layer 2 — :class:`ToolProfile` (``edge_deploy.yaml`` committed in each Tool repo):
     Tool-specific, node-independent deploy data (paths, smoke commands, TUI chrome,
-    Bitbucket URL, branch, sensitive/dependency paths).
+    GitHub/Bitbucket URLs, branch, sensitive/dependency paths).
 
 YAML is parsed with PyYAML when available, falling back to a minimal dependency-free
 parser (mirroring robocop's ``_fallback_yaml_load``) so command construction and unit
