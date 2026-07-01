@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "edge-deploy-core"
-version = "0.1.0"
+version = "1.0.0"
 description = "Shared deployment toolkit that rolls a reviewed build of a Tool (autobench, robocop/Dispatch) out to the Hadoop Edge Nodes."
 readme = "README.md"
 requires-python = ">=3.10"
