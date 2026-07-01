@@ -46,6 +46,10 @@ A **Publish** fast-forwards the verified GitHub commit to Bitbucket. A
 operator control. A **Rollback** explicitly restores a previously recorded
 successful release.
 
+```powershell
+python -m edge_deploy rollback --tag release-<UTC>-<short-sha>
+```
+
 The release command validates repository state, remotes, post-merge GitHub CI,
 local tests, audit availability, and interactive authentication before remote
 mutation. Successful tool releases receive an immutable

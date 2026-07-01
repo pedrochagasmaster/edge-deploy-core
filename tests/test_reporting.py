@@ -257,10 +257,10 @@ def test_release_report_handoffs_enumerate_followups() -> None:
 
     assert "publish" in by_kind
     assert by_kind["publish"]["tool"] == "robocop"
-    assert "publish --tool robocop" in by_kind["publish"]["action"]
+    assert by_kind["publish"]["action"].endswith("python -m edge_deploy release")
     assert "mid_state" in by_kind
     assert by_kind["mid_state"]["node"] == "node04"
-    assert "--snapshot a1b2c3d4" in by_kind["mid_state"]["action"]
+    assert "release --resume edge-deploy/reports/release-X" in by_kind["mid_state"]["action"].replace("\\", "/")
 
 
 def test_release_report_clean_run_exit_zero() -> None:

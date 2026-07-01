@@ -48,18 +48,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     release_parser.add_argument("--tool", choices=TOOL_CHOICES, help=argparse.SUPPRESS)
     release_parser.add_argument("--nodes", default=None, help="Comma list (e.g. 03,04); default: all configured nodes")
-    release_parser.add_argument("--snapshot", default=None, help="Skip Publish; roll out this existing Snapshot SHA")
-    release_parser.add_argument(
-        "--tool-snapshot",
-        action="append",
-        default=None,
-        metavar="TOOL=SHA",
-        help="Skip Publish for this tool and roll out its existing Snapshot SHA; repeat per tool",
-    )
     release_parser.add_argument(
         "--resume",
         default=None,
-        help="Resume from an existing release report dir by loading publish-<tool>.json snapshots",
+        help="Resume an incomplete attempt from its existing report directory",
     )
     release_parser.add_argument("--smoke", choices=("standard", "deep"), default="standard")
     release_parser.add_argument("--fail-fast", action="store_true", help="Stop on the first non-success (ADR-0003)")
@@ -69,6 +61,19 @@ def build_parser() -> argparse.ArgumentParser:
     release_parser.add_argument("--auth-wait-seconds", type=float, default=300.0)
     release_parser.add_argument("--heartbeat-interval", type=float, default=30.0)
     release_parser.add_argument("--stall-threshold", type=float, default=300.0)
+
+    rollback_parser = subparsers.add_parser(
+        "rollback", help="Restore a previously successful immutable release tag"
+    )
+    rollback_parser.add_argument("--tag", required=True)
+    rollback_parser.add_argument("--nodes", default=None)
+    rollback_parser.add_argument("--smoke", choices=("standard", "deep"), default="standard")
+    rollback_parser.add_argument("--report-dir", default=None)
+    rollback_parser.add_argument("--max-auth-attempts", type=int, default=3)
+    rollback_parser.add_argument("--auth-mode", choices=("auto", "prompt", "pane"), default="auto")
+    rollback_parser.add_argument("--auth-wait-seconds", type=float, default=300.0)
+    rollback_parser.add_argument("--heartbeat-interval", type=float, default=30.0)
+    rollback_parser.add_argument("--stall-threshold", type=float, default=300.0)
 
     publish_parser = subparsers.add_parser("publish", help="Publish one exact Tool commit to Bitbucket")
     publish_parser.add_argument("--tool", required=True, choices=TOOL_CHOICES, help="Per-tool; no 'both'")
@@ -132,16 +137,6 @@ def _default_report_dir() -> Path:
     return Path("edge-deploy") / "reports" / f"release-{stamp}"
 
 
-def _parse_tool_snapshots(values: list[str] | None) -> dict[str, str]:
-    snapshots: dict[str, str] = {}
-    for value in values or []:
-        tool, sep, snapshot = value.partition("=")
-        if not sep or not tool or not snapshot:
-            raise ValueError("--tool-snapshot must be TOOL=SHA")
-        snapshots[tool] = snapshot
-    return snapshots
-
-
 def _load_resume_snapshots(report_dir: Path, tools: list[str]) -> dict[str, str]:
     snapshots: dict[str, str] = {}
     for tool in tools:
@@ -183,13 +178,13 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
         report_dir = Path(args.report_dir)
     else:
         report_dir = _default_report_dir()
-    snapshot_by_tool = _parse_tool_snapshots(args.tool_snapshot)
+    snapshot_by_tool: dict[str, str] = {}
     if args.resume:
         snapshot_by_tool.update(_load_resume_snapshots(report_dir, tools))
     selection = ReleaseSelection(
         tools=tools,
         nodes=resolve_nodes(effective_operator, args.nodes),
-        snapshot=args.snapshot,
+        snapshot=None,
         snapshot_by_tool=snapshot_by_tool,
         smoke=args.smoke,
         fail_fast=args.fail_fast,
@@ -228,6 +223,96 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
     return report.exit_code()
 
 
+def _remote_tag_sha(repo_root: Path, remote: str, tag: str) -> str:
+    completed = subprocess.run(
+        [
+            "git",
+            "ls-remote",
+            "--tags",
+            remote,
+            f"refs/tags/{tag}",
+            f"refs/tags/{tag}^{{}}",
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    rows = [line.split() for line in completed.stdout.splitlines() if line.strip()]
+    dereferenced = [sha for sha, ref in rows if ref.endswith("^{}")]
+    values = dereferenced or [sha for sha, _ref in rows]
+    if not values:
+        raise RepositoryError(f"release tag {tag!r} does not exist on {remote}")
+    return values[-1]
+
+
+def _resolve_release_tag(repo_root: Path, tag: str) -> str:
+    if not tag.startswith("release-"):
+        raise RepositoryError("rollback requires an immutable release-* tag")
+    origin_sha = _remote_tag_sha(repo_root, "origin", tag)
+    bitbucket_sha = _remote_tag_sha(repo_root, "bitbucket", tag)
+    if origin_sha != bitbucket_sha:
+        raise RepositoryError(f"release tag {tag!r} differs between GitHub and Bitbucket")
+    subprocess.run(["git", "fetch", "origin", f"refs/tags/{tag}:refs/tags/{tag}"], cwd=repo_root, check=True)
+    local_sha = subprocess.run(
+        ["git", "rev-parse", f"refs/tags/{tag}^{{commit}}"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    if local_sha != origin_sha:
+        raise RepositoryError(f"local release tag {tag!r} does not match its remotes")
+    return local_sha
+
+
+def _cmd_rollback(args: argparse.Namespace, operator: OperatorConfig) -> int:
+    repo_root = Path.cwd().resolve()
+    profile = load_tool_profile(repo_root)
+    effective_operator = replace(operator, tools={profile.tool: str(repo_root)})
+    target = _resolve_release_tag(repo_root, args.tag)
+    node_names = resolve_nodes(effective_operator, args.nodes)
+    _run_release_preflight(
+        effective_operator,
+        profile,
+        repo_root,
+        node_names,
+        auth_mode=args.auth_mode,
+        max_auth_attempts=args.max_auth_attempts,
+        auth_wait_seconds=args.auth_wait_seconds,
+        release_sha=target,
+        allow_unresolved=True,
+    )
+    report_dir = Path(args.report_dir) if args.report_dir else _default_report_dir()
+    report = run_release(
+        effective_operator,
+        ReleaseSelection(
+            tools=[profile.tool],
+            nodes=node_names,
+            snapshot=target,
+            smoke=args.smoke,
+        ),
+        report_dir=report_dir,
+        max_auth_attempts=args.max_auth_attempts,
+        auth_mode="pane",
+        auth_wait_seconds=args.auth_wait_seconds,
+        heartbeat_interval_s=args.heartbeat_interval,
+        stall_threshold_s=args.stall_threshold,
+        progress_fn=lambda message: print(redact(f"[rollback] {message}")),
+    )
+    consolidated_path = write_release_report(report_dir / "release.json", report)
+    _record_release_attempt(
+        effective_operator,
+        profile.tool,
+        target,
+        report_dir,
+        report.summary()["overall"],
+        linked_attempt=args.tag,
+    )
+    _print_release_summary(report, consolidated_path)
+    return report.exit_code()
+
+
 def _run_release_preflight(
     operator: OperatorConfig,
     profile,
@@ -237,6 +322,8 @@ def _run_release_preflight(
     auth_mode: str,
     max_auth_attempts: int,
     auth_wait_seconds: float,
+    release_sha: str | None = None,
+    allow_unresolved: bool = False,
 ):
     if not profile.github_url:
         raise RepositoryError("edge_deploy.yaml must define github_url")
@@ -255,7 +342,8 @@ def _run_release_preflight(
     check_audit_remote(
         Path(operator.audit_repo),
         tool=profile.tool,
-        source_sha=state.commit,
+        source_sha=release_sha or state.commit,
+        allow_unresolved=allow_unresolved,
     )
 
     for node_name in node_names:
@@ -284,6 +372,7 @@ def _record_release_attempt(
     commit: str,
     report_dir: Path,
     status: str,
+    linked_attempt: str | None = None,
 ) -> str:
     attempt = AuditAttempt(
         tool=tool,
@@ -293,6 +382,7 @@ def _record_release_attempt(
         core_version=__version__,
         operator=operator.operator_email,
         status=status,
+        linked_attempt=linked_attempt,
     )
     return append_audit_attempt(Path(operator.audit_repo), attempt)
 
@@ -389,6 +479,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "release":
             return _cmd_release(args, operator)
+        if args.command == "rollback":
+            return _cmd_rollback(args, operator)
         if args.command == "publish":
             return _cmd_publish(args, operator)
         if args.command == "rollout":

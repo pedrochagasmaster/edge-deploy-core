@@ -85,6 +85,7 @@ def check_audit_remote(
     outbox: Path | None = None,
     tool: str | None = None,
     source_sha: str | None = None,
+    allow_unresolved: bool = False,
 ) -> None:
     """Require the private audit remote to be reachable and locally synchronized."""
     pending = outbox or default_outbox()
@@ -119,7 +120,11 @@ def check_audit_remote(
             f"refs/remotes/bitbucket/release-log:{metadata_paths[-1]}",
         ).stdout
     )
-    if payload.get("status") != "passed" and payload.get("source_sha") != source_sha:
+    if (
+        not allow_unresolved
+        and payload.get("status") != "passed"
+        and payload.get("source_sha") != source_sha
+    ):
         raise AuditSyncError(
             f"latest {tool} release attempt is unresolved at {payload.get('source_sha')}; "
             "resume or roll it back before releasing a different SHA"

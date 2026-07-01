@@ -114,14 +114,13 @@ def test_parser_help_lists_all_subcommands(capsys) -> None:
 
 def test_parser_parses_release_args() -> None:
     args = cli.build_parser().parse_args(
-        ["release", "--nodes", "03,04", "--snapshot", "abc123", "--auth-mode", "prompt",
+        ["release", "--nodes", "03,04", "--auth-mode", "prompt",
          "--smoke", "deep", "--fail-fast", "--report-dir", "out", "--max-auth-attempts", "5"]
     )
 
     assert args.command == "release"
     assert args.tool is None
     assert args.nodes == "03,04"
-    assert args.snapshot == "abc123"
     assert args.auth_mode == "prompt"
     assert args.smoke == "deep"
     assert args.fail_fast is True
@@ -134,8 +133,6 @@ def test_parser_release_defaults() -> None:
 
     assert args.tool is None
     assert args.nodes is None
-    assert args.snapshot is None
-    assert args.tool_snapshot is None
     assert args.auth_mode == "auto"
     assert args.smoke == "standard"
     assert args.fail_fast is False
@@ -157,6 +154,15 @@ def test_parser_accepts_auto_prompt_and_pane_auth_modes() -> None:
     for mode in ("auto", "prompt", "pane"):
         args = cli.build_parser().parse_args(["release", "--tool", "autobench", "--auth-mode", mode])
         assert args.auth_mode == mode
+
+
+def test_parser_parses_explicit_tagged_rollback() -> None:
+    args = cli.build_parser().parse_args(
+        ["rollback", "--tag", "release-20260701T143000Z-a1b2c3d", "--nodes", "03"]
+    )
+    assert args.command == "rollback"
+    assert args.tag == "release-20260701T143000Z-a1b2c3d"
+    assert args.nodes == "03"
 
 
 def test_parser_parses_publish_args() -> None:

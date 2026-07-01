@@ -139,12 +139,10 @@ def _node_suffix(node: Any) -> str:
 
 def _resume_action(rollout: dict[str, Any]) -> str:
     """A ready-to-paste resume command for a mid-state/refused/unavailable pair."""
-    tool = rollout.get("tool", "")
     nodes = _node_suffix(rollout.get("node"))
-    command = f"py -m edge_deploy release --tool {tool} --nodes {nodes}"
-    snapshot = rollout.get("deployment_commit")
-    if snapshot:
-        command += f" --snapshot {snapshot}"
+    report_path = rollout.get("report_path")
+    report_dir = str(Path(report_path).parent) if report_path else "<release-report-dir>"
+    command = f"python -m edge_deploy release --resume {report_dir} --nodes {nodes}"
     return f"investigate {rollout.get('node')}; re-run: {command}"
 
 
@@ -191,7 +189,7 @@ class ReleaseReport:
                     "tool": tool,
                     "node": None,
                     "message": publish.get("error", "publish failed"),
-                    "action": f"fix the publish gate, then re-run: py -m edge_deploy publish --tool {tool}",
+                    "action": "fix the publish gate, then re-run: python -m edge_deploy release",
                 })
         for rollout in self.rollouts:
             status = rollout.get("status")
