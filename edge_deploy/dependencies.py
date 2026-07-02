@@ -15,6 +15,11 @@ from typing import Callable, Mapping, Sequence
 
 from edge_deploy.config import DependencyBundleConfig, ToolProfile
 
+try:  # pragma: no cover - exercised through whichever provider is installed.
+    from packaging.markers import InvalidMarker, Marker, default_environment
+except ImportError:  # pragma: no cover - pip always exists when bundle resolution runs.
+    from pip._vendor.packaging.markers import InvalidMarker, Marker, default_environment
+
 BUNDLE_SCHEMA = "edge-deploy/dependency-bundle/1"
 _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 _WHEEL_RE = re.compile(r"^(?P<name>.+?)-(?P<version>[^-]+)-[^-]+-[^-]+-[^-]+\.whl$", re.IGNORECASE)
@@ -45,6 +50,52 @@ class DeliveredBundle:
 def canonical_dependency_bytes(data: bytes) -> bytes:
     """Normalize Git text inputs to LF so Windows and Linux produce one identity."""
     return data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+
+
+def _target_marker_environment(config: DependencyBundleConfig) -> dict[str, str]:
+    env = default_environment()
+    python_version = config.python_version
+    if python_version.isdigit() and len(python_version) >= 2:
+        python_version = f"{python_version[0]}.{python_version[1:]}"
+    env.update(
+        {
+            "implementation_name": "cpython" if config.implementation == "cp" else config.implementation,
+            "os_name": "posix",
+            "platform_machine": "x86_64",
+            "platform_system": "Linux",
+            "python_full_version": f"{python_version}.0" if python_version.count(".") == 1 else python_version,
+            "python_version": ".".join(python_version.split(".")[:2]),
+            "sys_platform": "linux",
+        }
+    )
+    return env
+
+
+def target_filtered_dependency_bytes(data: bytes, config: DependencyBundleConfig) -> bytes:
+    """Drop requirement lines whose environment marker is false for the bundle target.
+
+    Pip's ``--python-version`` constrains compatible wheels, but requirement-file markers
+    can still be evaluated against the operator interpreter. Filtering the temporary pip
+    input keeps cp310 bundles from selecting Python 3.11+ conditional pins while the
+    manifest still hashes the original Git-normalized dependency files.
+    """
+    normalized = canonical_dependency_bytes(data).decode("utf-8")
+    env = _target_marker_environment(config)
+    kept: list[str] = []
+    for line in normalized.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or ";" not in line:
+            kept.append(line)
+            continue
+        requirement, marker_text = line.split(";", 1)
+        try:
+            marker = Marker(marker_text.split("#", 1)[0].strip())
+        except InvalidMarker:
+            kept.append(line)
+            continue
+        if marker.evaluate(env):
+            kept.append(line)
+    return ("\n".join(kept) + "\n").encode("utf-8")
 
 
 def _sha256(data: bytes) -> str:
@@ -204,7 +255,7 @@ def build_dependency_bundle(
         dependency_files[name] = data
         target = inputs / name
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
+        target.write_bytes(target_filtered_dependency_bytes(data, config))
 
     command = [
         sys.executable,
@@ -334,6 +385,59 @@ finally:
 """
 
 
+def _reuse_check_script(bundle: DependencyBundle) -> str:
+    expected_files = {
+        str(item["path"]): str(item["sha256"])
+        for item in bundle.manifest["files"]  # type: ignore[index]
+    }
+    return f"""
+import hashlib, json, os
+from pathlib import Path
+
+root = Path("/ads_storage") / os.environ["USER"] / ".edge-deploy" / "bundles" / {bundle.tool!r}
+final = root / {bundle.digest!r}
+expected_source = {bundle.source_sha!r}
+expected_digest = {bundle.digest!r}
+expected_files = {expected_files!r}
+
+def sha(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def emit(reused):
+    print("DEPENDENCY_STAGE_START")
+    print(json.dumps({{"remote_dir": str(final), "reused": reused, "bundle_digest": expected_digest}}))
+    print("DEPENDENCY_STAGE_END")
+
+if not final.exists():
+    raise SystemExit("dependency stage missing")
+manifest = json.loads((final / "manifest.json").read_text(encoding="utf-8"))
+if manifest.get("bundle_digest") != expected_digest or manifest.get("source_sha") != expected_source:
+    raise SystemExit("existing stage provenance mismatch")
+staged_files = {{
+    path.relative_to(final).as_posix()
+    for path in final.rglob("*")
+    if path.is_file()
+}}
+if staged_files != set(expected_files) | {{"manifest.json"}}:
+    raise SystemExit("existing stage file set mismatch")
+for name, digest in expected_files.items():
+    if sha(final / name) != digest:
+        raise SystemExit("existing stage checksum mismatch: " + name)
+emit(True)
+"""
+
+
+def _parse_stage_evidence(screen: str) -> dict[str, object] | None:
+    match = re.search(r"DEPENDENCY_STAGE_START\s*(\{.*?\})\s*DEPENDENCY_STAGE_END", screen, re.DOTALL)
+    if not match:
+        return None
+    return json.loads(match.group(1))
+
+
 def deliver_dependency_bundle(
     driver: object,
     profile: ToolProfile,
@@ -353,9 +457,8 @@ def deliver_dependency_bundle(
     )
     if code:
         raise BundleError(f"could not create remote bundle staging directory: {screen.strip()}")
-    driver.upload_file(bundle.archive_path, remote_archive)  # type: ignore[attr-defined]
-    script = _stage_script(bundle, config, remote_archive=remote_archive)
-    encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    reuse_script = _reuse_check_script(bundle)
+    reuse_encoded = base64.b64encode(reuse_script.encode("utf-8")).decode("ascii")
     fallback = (
         "/sys_apps_01/python/python310/bin/python3.10"
         if config.python_version == "3.10"
@@ -363,15 +466,30 @@ def deliver_dependency_bundle(
     )
     python_expr = f"$(command -v python{config.python_version} || printf %s {fallback})"
     screen, code = driver.run_remote(  # type: ignore[attr-defined]
+        f"printf %s {reuse_encoded} | base64 -d | {python_expr} -",
+        timeout=300,
+    )
+    if code == 0:
+        evidence = _parse_stage_evidence(screen)
+        if evidence is None:
+            raise BundleError("remote dependency reuse returned no provenance")
+        return DeliveredBundle(
+            remote_dir=str(evidence["remote_dir"]),
+            reused=bool(evidence["reused"]),
+            evidence=evidence,
+        )
+    driver.upload_file(bundle.archive_path, remote_archive)  # type: ignore[attr-defined]
+    script = _stage_script(bundle, config, remote_archive=remote_archive)
+    encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    screen, code = driver.run_remote(  # type: ignore[attr-defined]
         f"printf %s {encoded} | base64 -d | {python_expr} -",
         timeout=900,
     )
     if code:
         raise BundleError(f"remote dependency verification failed: {screen.strip()}")
-    match = re.search(r"DEPENDENCY_STAGE_START\s*(\{.*?\})\s*DEPENDENCY_STAGE_END", screen, re.DOTALL)
-    if not match:
+    evidence = _parse_stage_evidence(screen)
+    if evidence is None:
         raise BundleError("remote dependency verification returned no provenance")
-    evidence = json.loads(match.group(1))
     return DeliveredBundle(
         remote_dir=str(evidence["remote_dir"]),
         reused=bool(evidence["reused"]),

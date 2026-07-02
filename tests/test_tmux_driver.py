@@ -10,8 +10,10 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import call, patch
 
+import pytest
+
 from edge_deploy.config import NodeConfig
-from edge_deploy.tmux_driver import TmuxDriver
+from edge_deploy.tmux_driver import AuthenticationError, TmuxDriver
 
 ROBO_CHROME = "Active Jobs|esc Back|n New Job"
 AUTOBENCH_CHROME = "Privacy-Compliant Peer Benchmark|Control 3.2 dimensional analysis"
@@ -57,9 +59,9 @@ def test_authenticated_session_exposes_control_socket_for_scp(tmp_path: Path) ->
     assert "user@edge:/remote/bundle.zip" in argv
 
 
-def test_disabled_multiplex_session_omits_control_master_and_uploads_via_authenticated_pane(tmp_path: Path) -> None:
+def test_disabled_multiplex_session_uses_interactive_scp(tmp_path: Path) -> None:
     source = tmp_path / "bundle.zip"
-    source.write_bytes(b"bundle")
+    source.write_bytes(b"bundle" * 4096)
     with patch.dict("edge_deploy.tmux_driver.os.environ", {"EDGE_DEPLOY_SSH_MULTIPLEX": "0"}):
         driver = TmuxDriver("user@edge", "sess", "/repo", ssh_options="-p 2222")
 
@@ -67,22 +69,17 @@ def test_disabled_multiplex_session_omits_control_master_and_uploads_via_authent
     assert "ControlMaster=yes" not in pane_command
     assert "ControlPath=" not in pane_command
 
-    commands: list[str] = []
+    with patch("edge_deploy.tmux_driver.subprocess.run") as run:
+        run.return_value.returncode = 0
+        driver.upload_file(source, "/ads_storage/$USER/.edge-deploy/bundle.zip")
 
-    def fake_run_remote(command: str, **kwargs: object) -> tuple[str, int]:
-        commands.append(command)
-        return "", 0
-
-    with (
-        patch.object(driver, "run_remote", side_effect=fake_run_remote),
-        patch("edge_deploy.tmux_driver.subprocess.run") as run,
-    ):
-        driver.upload_file(source, "/remote/bundle.zip")
-
-    run.assert_not_called()
-    assert commands[0].startswith("mkdir -p /remote")
-    assert any("cat >> /remote/bundle.zip.edge-deploy-" in command for command in commands)
-    assert any("base64.b64decode" in command for command in commands)
+    assert run.call_args.args[0] == [
+        "scp",
+        "-P",
+        "2222",
+        str(source),
+        "user@edge:/ads_storage/user/.edge-deploy/bundle.zip",
+    ]
 
 
 def test_dispatch_dynamic_quits_from_dashboard_top() -> None:
@@ -143,6 +140,22 @@ def test_at_shell_prompt_respects_chrome_and_prompt() -> None:
     assert driver.at_shell_prompt("") is False
 
 
+def test_await_authenticated_fails_when_ssh_closes_after_passcode() -> None:
+    driver = TmuxDriver("user@edge", "session", "/repo")
+    screen = """\
+(user@edge) Enter PASSCODE:
+Connection closed by 10.0.0.5 port 2222
+PS D:\\Projects\\autobench>
+"""
+
+    with (
+        patch.object(driver, "capture_screen", return_value=screen),
+        patch("edge_deploy.tmux_driver.time.sleep"),
+    ):
+        with pytest.raises(AuthenticationError, match="closed the SSH connection"):
+            driver.await_authenticated(timeout=1, poll_interval=0.01)
+
+
 def test_run_remote_returns_output_and_exit_code() -> None:
     driver = TmuxDriver("user@edge", "session", "/repo")
     captured: dict[str, str] = {}
@@ -172,6 +185,35 @@ def test_run_remote_returns_output_and_exit_code() -> None:
     assert "which dispatch" in captured["cmd"]
     # The sentinel is split so the echoed command line can never match it.
     assert "__RC''_" in captured["cmd"]
+
+
+def test_run_remote_pastes_large_commands_through_tmux_buffer() -> None:
+    driver = TmuxDriver("user@edge", "session", "/repo")
+    captured: dict[str, str] = {}
+
+    def fake_wait(pattern: str, **kwargs: object) -> str:
+        nonce = pattern.split("__RC_")[1].split("_(")[0]
+        captured["nonce"] = nonce
+        return f"__START_{nonce}__\n__RC_{nonce}_0__\n"
+
+    with (
+        patch.object(driver, "return_to_shell", return_value=True),
+        patch.object(driver, "send_key") as send_key,
+        patch.object(driver, "send_keys") as send_keys,
+        patch.object(driver, "paste_text", side_effect=lambda text: captured.setdefault("pasted", text)),
+        patch.object(driver, "wait_for", side_effect=fake_wait),
+        patch.object(driver, "capture_screen") as capture_screen,
+    ):
+        capture_screen.side_effect = lambda history_lines=0: (
+            f"__START_{captured['nonce']}__\n__RC_{captured['nonce']}_0__\n"
+        )
+        _screen, code = driver.run_remote("printf " + ("x" * 5000))
+
+    assert code == 0
+    send_keys.assert_not_called()
+    assert "printf " + ("x" * 5000) in captured["pasted"]
+    assert not captured["pasted"].endswith("\n")
+    assert call("Enter") in send_key.call_args_list
 
 
 def test_run_remote_parses_nonzero_exit_code() -> None:

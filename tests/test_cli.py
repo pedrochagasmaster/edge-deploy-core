@@ -616,6 +616,51 @@ def test_resolve_release_tag_accepts_tree_equivalent_mirror(tmp_path, monkeypatc
     assert ["git", "update-ref", "-d", f"refs/edge-deploy/rollback/{tag}"] in commands
 
 
+def test_rollback_seeds_publish_provenance_for_dependency_delivery(tmp_path, monkeypatch) -> None:
+    config_path = _write_operator_config(tmp_path)
+    repo = tmp_path / "autobench"
+    source = "a" * 40
+    snapshot = "d" * 40
+    report_dir = tmp_path / "report"
+    tag = f"release-20260702T013000Z-{source[:7]}"
+    captured: dict = {}
+
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(cli, "_resolve_release_tag_pair", lambda root, release_tag: (source, snapshot))
+    monkeypatch.setattr(cli, "_run_release_preflight", lambda *a, **k: SimpleNamespace(commit=source))
+    monkeypatch.setattr(cli, "_record_release_attempt", lambda *a, **k: "audit")
+
+    def fake_run_release(operator, selection, *, report_dir, max_auth_attempts, **kwargs) -> ReleaseReport:
+        captured["selection"] = selection
+        captured["report_dir"] = report_dir
+        return ReleaseReport(
+            selection={"tools": selection.tools},
+            publishes=[],
+            rollouts=[{"tool": "autobench", "node": "node03", "status": "rolled_out", "state_left": ""}],
+        )
+
+    monkeypatch.setattr(cli, "run_release", fake_run_release)
+
+    rc = cli.main(
+        [
+            "--config",
+            str(config_path),
+            "rollback",
+            "--tag",
+            tag,
+            "--report-dir",
+            str(report_dir),
+        ]
+    )
+
+    assert rc == 0
+    assert captured["selection"].snapshot_by_tool == {"autobench": snapshot}
+    payload = json.loads((report_dir / "publish-autobench.json").read_text(encoding="utf-8"))
+    assert payload["status"] == "published"
+    assert payload["deployment_commit"] == snapshot
+    assert payload["source_commit"] == source
+
+
 def test_resolve_release_tag_rejects_tree_divergence(tmp_path, monkeypatch) -> None:
     origin_sha = "a" * 40
     bitbucket_sha = "d" * 40

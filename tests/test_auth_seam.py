@@ -47,6 +47,7 @@ def test_authenticate_reprompts_on_stale_code(fake_tmux) -> None:
 
     # A stale single-use code forces a fresh re-prompt; both codes were forwarded.
     assert driver.sent_secrets == ["staleCODE", "freshCODE"]
+    assert len(driver.start_session_calls) == 2
 
 
 def test_authenticate_raises_after_exhausting_attempts(fake_tmux) -> None:

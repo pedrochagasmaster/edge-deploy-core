@@ -21,9 +21,7 @@ of being hardcoded Dispatch constants.
 
 from __future__ import annotations
 
-import base64
 import os
-import posixpath
 import re
 import shlex
 import subprocess
@@ -308,6 +306,11 @@ class TmuxDriver:
                     "Edge Node rejected the credential (authentication failed). "
                     "RSA passcodes are single-use and rotate ~every 60s — request a fresh one."
                 )
+            if re.search(r"Connection closed by .* port \d+", plain, re.IGNORECASE):
+                raise AuthenticationError(
+                    "Edge Node closed the SSH connection after credential submission. "
+                    "The passcode was likely stale, wrong, or rejected before a shell prompt appeared."
+                )
             # A re-displayed auth prompt (>= 2 on screen) means the first code was refused.
             if len(re.findall(r"PASSCODE:|[Pp]assword:|PIN:", plain)) >= 2:
                 raise AuthenticationError(
@@ -342,7 +345,7 @@ class TmuxDriver:
     def upload_file(self, source: str | Path, remote_path: str) -> None:
         """Copy a file over the already-authenticated SSH master connection."""
         if not self.use_ssh_multiplex:
-            self._upload_file_via_pane(source, remote_path)
+            self._upload_file_via_interactive_scp(source, remote_path)
             return
         completed = subprocess.run(
             [
@@ -360,42 +363,35 @@ class TmuxDriver:
             detail = (completed.stderr or completed.stdout).strip()
             raise RuntimeError(f"authenticated bundle transfer failed: {detail}")
 
-    def _upload_file_via_pane(self, source: str | Path, remote_path: str) -> None:
-        """Copy a file through the authenticated tmux pane when scp multiplexing is unavailable."""
-        source_path = Path(source)
-        encoded = base64.b64encode(source_path.read_bytes()).decode("ascii")
-        remote_dir = posixpath.dirname(remote_path) or "."
-        upload_id = uuid.uuid4().hex[:12]
-        remote_b64 = f"{remote_path}.edge-deploy-{upload_id}.b64"
-        mkdir_cmd = f"mkdir -p {shlex.quote(remote_dir)} && rm -f {shlex.quote(remote_b64)}"
-        _screen, rc = self.run_remote(mkdir_cmd, timeout=60.0)
-        if rc:
-            raise RuntimeError(f"authenticated bundle transfer failed: could not prepare {remote_dir}")
+    def _scp_options(self) -> list[str]:
+        options = shlex.split(self.ssh_options) if self.ssh_options else []
+        converted: list[str] = []
+        index = 0
+        while index < len(options):
+            item = options[index]
+            if item == "-p":
+                converted.append("-P")
+            elif item.startswith("-p") and len(item) > 2:
+                converted.append("-P" + item[2:])
+            else:
+                converted.append(item)
+            index += 1
+        return converted
 
-        marker = f"__EDGE_DEPLOY_UPLOAD_{upload_id}__"
-        chunk_size = 32768
-        for offset in range(0, len(encoded), chunk_size):
-            chunk = encoded[offset : offset + chunk_size]
-            append_cmd = f"cat >> {shlex.quote(remote_b64)} <<'{marker}'\n{chunk}\n{marker}"
-            _screen, rc = self.run_remote(append_cmd, timeout=120.0)
-            if rc:
-                raise RuntimeError(f"authenticated bundle transfer failed: could not write {remote_b64}")
+    def _upload_file_via_interactive_scp(self, source: str | Path, remote_path: str) -> None:
+        """Copy a file with plain scp when ControlMaster is unavailable.
 
-        decode_script = (
-            "python3 - <<'PY'\n"
-            "import base64, pathlib\n"
-            f"source = pathlib.Path({remote_b64!r})\n"
-            f"target = pathlib.Path({remote_path!r})\n"
-            "target.parent.mkdir(parents=True, exist_ok=True)\n"
-            "target.write_bytes(base64.b64decode(source.read_text(encoding='ascii')))\n"
-            "source.unlink(missing_ok=True)\n"
-            "PY"
-        )
-        _screen, rc = self.run_remote(decode_script, timeout=300.0)
-        if rc:
-            cleanup_cmd = f"rm -f {shlex.quote(remote_b64)}"
-            self.run_remote(cleanup_cmd, timeout=30.0, ensure_shell=False)
-            raise RuntimeError(f"authenticated bundle transfer failed: could not decode {remote_path}")
+        This inherits stdin/stdout/stderr from the operator terminal so OpenSSH can prompt
+        normally for RSA/passcodes.  It is only called after bundle delivery has confirmed
+        that the node does not already have a verified reusable stage.
+        """
+        target = remote_path
+        if "$USER" in target and "@" in self.host:
+            target = target.replace("$USER", self.host.split("@", 1)[0])
+        command = ["scp", *self._scp_options(), str(Path(source)), f"{self.host}:{target}"]
+        completed = subprocess.run(command, check=False)
+        if completed.returncode:
+            raise RuntimeError(f"interactive scp bundle transfer failed with exit {completed.returncode}")
 
     # ------------------------------------------------------------------
     # Pane control (local tmux)
@@ -417,6 +413,24 @@ class TmuxDriver:
     def send_text(self, text: str) -> None:
         self.send_keys(text, literal=True)
         self.send_key("Enter")
+
+    def paste_text(self, text: str) -> None:
+        """Paste larger text into the pane via a tmux buffer.
+
+        ``tmux send-keys`` carries the payload on the local process command line.  On
+        Windows that hits ``CreateProcess`` limits and, with psmux, large here-docs can
+        arrive partially.  Loading a temporary file into a tmux buffer keeps the payload
+        out of argv and lets tmux paste it directly into the authenticated pane.
+        """
+        buffer_name = f"edge-deploy-{uuid.uuid4().hex[:12]}"
+        handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False)
+        try:
+            with handle:
+                handle.write(text)
+            self._tmux(["load-buffer", "-b", buffer_name, handle.name])
+            self._tmux(["paste-buffer", "-d", "-b", buffer_name, "-t", self.session])
+        finally:
+            Path(handle.name).unlink(missing_ok=True)
 
     def submit_secret(self, secret: str) -> None:
         """Type a secret (RSA passcode / Kerberos password) into the pane, then Enter.
@@ -588,7 +602,11 @@ class TmuxDriver:
             f"printf '\\n__START''_{nonce}__\\n'; "
             f"{command}; printf '\\n__RC''_{nonce}_%s__\\n' \"$?\""
         )
-        self.send_keys(marker_cmd)
+        if len(marker_cmd) > 4000:
+            self.paste_text(marker_cmd)
+            self.send_key("Enter")
+        else:
+            self.send_keys(marker_cmd)
 
         pattern = rf"__RC_{nonce}_(\d+)__"
         self.wait_for(pattern, timeout=timeout, poll_interval=0.5)

@@ -281,6 +281,10 @@ def _tree_sha(repo_root: Path, commitish: str) -> str:
 
 
 def _resolve_release_tag(repo_root: Path, tag: str) -> str:
+    return _resolve_release_tag_pair(repo_root, tag)[1]
+
+
+def _resolve_release_tag_pair(repo_root: Path, tag: str) -> tuple[str, str]:
     """Resolve a release tag to the Bitbucket-side commit the nodes can fetch.
 
     GitHub and Bitbucket tags may legitimately point at different commits (ADR-0007:
@@ -313,14 +317,47 @@ def _resolve_release_tag(repo_root: Path, tag: str) -> str:
                 )
         finally:
             subprocess.run(["git", "update-ref", "-d", temp_ref], cwd=repo_root, check=True)
-    return bitbucket_sha
+    return origin_sha, bitbucket_sha
+
+
+def _write_rollback_publish_provenance(
+    report_dir: Path,
+    *,
+    tool: str,
+    source_sha: str,
+    snapshot_sha: str,
+    tag: str,
+) -> None:
+    """Seed resume-style publish provenance for an immutable rollback tag.
+
+    Dependency delivery must build from the reviewed GitHub source SHA, while
+    rollback deploys the tree-equivalent Bitbucket snapshot SHA that Edge nodes
+    can fetch.  The immutable release tag supplies both SHAs, so rollback can use
+    the same provenance contract as a normal v2 resume.
+    """
+    report_dir.mkdir(parents=True, exist_ok=True)
+    (report_dir / f"publish-{tool}.json").write_text(
+        json.dumps(
+            {
+                "tool": tool,
+                "status": "published",
+                "deployment_commit": snapshot_sha,
+                "source_commit": source_sha,
+                "source_short": source_sha[:7],
+                "branch": "rollback",
+                "message": f"Rollback to {tag}",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def _cmd_rollback(args: argparse.Namespace, operator: OperatorConfig) -> int:
     repo_root = Path.cwd().resolve()
     profile = load_tool_profile(repo_root)
     effective_operator = replace(operator, tools={profile.tool: str(repo_root)})
-    target = _resolve_release_tag(repo_root, args.tag)
+    source, target = _resolve_release_tag_pair(repo_root, args.tag)
     node_names = resolve_nodes(effective_operator, args.nodes)
     _run_release_preflight(
         effective_operator,
@@ -334,12 +371,19 @@ def _cmd_rollback(args: argparse.Namespace, operator: OperatorConfig) -> int:
         allow_unresolved=True,
     )
     report_dir = Path(args.report_dir) if args.report_dir else _default_report_dir()
+    _write_rollback_publish_provenance(
+        report_dir,
+        tool=profile.tool,
+        source_sha=source,
+        snapshot_sha=target,
+        tag=args.tag,
+    )
     report = run_release(
         effective_operator,
         ReleaseSelection(
             tools=[profile.tool],
             nodes=node_names,
-            snapshot=target,
+            snapshot_by_tool={profile.tool: target},
             smoke=args.smoke,
         ),
         report_dir=report_dir,
@@ -387,7 +431,7 @@ def _run_release_preflight(
     pytest_command = [sys.executable, "-m", "pytest", "-n", "8", "--dist", "loadfile"]
     completed = subprocess.run(pytest_command, cwd=repo_root)
     if completed.returncode:
-        raise RuntimeError("python -m pytest -n 8 --dist loadfile failed; release blocked")
+        raise RuntimeError("python -m pytest -n 12 --dist loadfile failed; release blocked")
     if not operator.audit_repo:
         raise AuditSyncError("operator config must define audit_repo")
     check_audit_remote(

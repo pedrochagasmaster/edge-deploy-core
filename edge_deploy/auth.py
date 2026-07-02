@@ -55,6 +55,8 @@ def authenticate_node(
             # fresh single-use code, unless this was the last attempt.
             if attempt == max_attempts:
                 raise
+            if driver.start_session(connect_timeout=connect_timeout):
+                return
 
 
 def authenticate_node_via_pane(

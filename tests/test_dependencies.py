@@ -7,7 +7,12 @@ from pathlib import Path
 import pytest
 
 from edge_deploy.config import DependencyBundleConfig, ToolProfile
-from edge_deploy.dependencies import BundleError, create_dependency_bundle, deliver_dependency_bundle
+from edge_deploy.dependencies import (
+    BundleError,
+    create_dependency_bundle,
+    deliver_dependency_bundle,
+    target_filtered_dependency_bytes,
+)
 
 
 def _config() -> DependencyBundleConfig:
@@ -50,6 +55,42 @@ def test_dependency_bundle_identity_canonicalizes_line_endings(tmp_path: Path) -
 
     assert first.digest == second.digest
     assert first.archive_sha256 == second.archive_sha256
+
+
+def test_target_filter_drops_python311_constraint_for_cp310_bundle() -> None:
+    data = (
+        b"scipy==1.16.3; python_version >= \"3.11\"\n"
+        b"scipy==1.15.3; python_version < \"3.11\"\n"
+    )
+
+    filtered = target_filtered_dependency_bytes(data, _config()).decode("utf-8")
+
+    assert "scipy==1.16.3" not in filtered
+    assert "scipy==1.15.3" in filtered
+
+
+def test_dependency_bundle_archives_original_dependency_markers(tmp_path: Path) -> None:
+    wheel = tmp_path / "scipy-1.15.3-cp310-cp310-manylinux2014_x86_64.whl"
+    wheel.write_bytes(b"wheel")
+    constraints = (
+        b"scipy==1.16.3; python_version >= \"3.11\"\n"
+        b"scipy==1.15.3; python_version < \"3.11\"\n"
+    )
+
+    bundle = create_dependency_bundle(
+        tool="demo",
+        source_sha="a" * 40,
+        dependency_files={
+            "requirements.txt": b"scipy>=1.10,<2\n",
+            "constraints.txt": constraints,
+        },
+        wheels=[wheel],
+        config=_config(),
+        output_dir=tmp_path / "bundle",
+    )
+
+    with zipfile.ZipFile(bundle.archive_path) as archive:
+        assert archive.read("requirements/constraints.txt") == constraints
 
 
 def test_dependency_bundle_rejects_unexpected_non_wheel_files(tmp_path: Path) -> None:
@@ -138,6 +179,8 @@ def test_delivery_transfers_then_records_verified_remote_stage(tmp_path: Path) -
         def run_remote(self, command: str, *, timeout: float = 30) -> tuple[str, int]:
             self.calls.append(command)
             if "base64 -d" in command:
+                if len([call for call in self.calls if "base64 -d" in call]) == 1:
+                    return "dependency stage missing", 1
                 return (
                     "DEPENDENCY_STAGE_START\n"
                     f'{{"remote_dir": "/ads_storage/test/.edge-deploy/bundles/demo/{bundle.digest}", '
@@ -164,4 +207,46 @@ def test_delivery_transfers_then_records_verified_remote_stage(tmp_path: Path) -
         )
     ]
     assert delivered.reused is False
+    assert delivered.remote_dir.endswith(bundle.digest)
+
+
+def test_delivery_reuses_verified_remote_stage_without_upload(tmp_path: Path) -> None:
+    wheel = tmp_path / "demo-1.0-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+    bundle = create_dependency_bundle(
+        tool="demo",
+        source_sha="d" * 40,
+        dependency_files={"requirements.txt": b"demo==1.0\n"},
+        wheels=[wheel],
+        config=_config(),
+        output_dir=tmp_path / "bundle",
+    )
+
+    class Driver:
+        def __init__(self) -> None:
+            self.uploads: list[tuple[Path, str]] = []
+
+        def run_remote(self, command: str, *, timeout: float = 30) -> tuple[str, int]:
+            if "base64 -d" in command:
+                return (
+                    "DEPENDENCY_STAGE_START\n"
+                    f'{{"remote_dir": "/ads_storage/test/.edge-deploy/bundles/demo/{bundle.digest}", '
+                    f'"reused": true, "bundle_digest": "{bundle.digest}"}}\n'
+                    "DEPENDENCY_STAGE_END\n",
+                    0,
+                )
+            return "", 0
+
+        def upload_file(self, source: Path, remote_path: str) -> None:
+            self.uploads.append((source, remote_path))
+
+    driver = Driver()
+    delivered = deliver_dependency_bundle(
+        driver,
+        ToolProfile(tool="demo", dependency_bundle=_config()),
+        bundle,
+    )
+
+    assert driver.uploads == []
+    assert delivered.reused is True
     assert delivered.remote_dir.endswith(bundle.digest)
