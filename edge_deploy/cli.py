@@ -21,6 +21,7 @@ from edge_deploy import __version__, drift, preflight, rollout
 from edge_deploy.audit import AuditAttempt, AuditSyncError, append_audit_attempt, check_audit_remote
 from edge_deploy.auth import authenticate_node, authenticate_node_via_pane
 from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, OperatorConfig, load_tool_profile
+from edge_deploy.mirror import MirrorError, mirror_release
 from edge_deploy.publish import PublishError, publish_snapshot
 from edge_deploy.release import ReleaseSelection, resolve_nodes, run_release
 from edge_deploy.reporting import OperationReport, redact, write_release_report, write_report
@@ -80,6 +81,14 @@ def build_parser() -> argparse.ArgumentParser:
     publish_parser.add_argument("--commit", default=None, help="Optional source override (a reviewed commit SHA)")
     publish_parser.add_argument("--no-local-check", action="store_true", help="Bypass the local_check.ps1 gate")
     publish_parser.add_argument("--remote", default="bitbucket")
+
+    mirror_parser = subparsers.add_parser(
+        "mirror", help="Mirror a reviewed core release tag from GitHub to Bitbucket"
+    )
+    mirror_parser.add_argument("--tag", required=True, help="Immutable release tag (e.g. v1.1.0)")
+    mirror_parser.add_argument("--remote", default="bitbucket")
+    mirror_parser.add_argument("--branch", default="main")
+    mirror_parser.add_argument("--repo-root", default=".", help="Core checkout (default: cwd)")
 
     rollout_parser = subparsers.add_parser("rollout", help="Roll one Edge Node to an exact commit")
     rollout_parser.add_argument("--tool", required=True, help="Tool name (key in operator config 'tools')")
@@ -219,9 +228,23 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
         report.summary()["overall"],
     )
     if report.exit_code() == 0:
-        _tag_successful_release(repo_root, state.commit)
+        _tag_successful_release(
+            repo_root,
+            state.commit,
+            deployment_commit=_deployment_commit_for_tool(report, profile.tool, snapshot_by_tool),
+        )
     _print_release_summary(report, consolidated_path)
     return report.exit_code()
+
+
+def _deployment_commit_for_tool(report, tool: str, snapshot_by_tool: dict[str, str]) -> str | None:
+    """The commit actually pushed to the tool's Bitbucket main for this release, if known."""
+    if snapshot_by_tool.get(tool):
+        return snapshot_by_tool[tool]
+    for item in report.publishes:
+        if item.get("tool") == tool and item.get("snapshot"):
+            return str(item["snapshot"])
+    return None
 
 
 def _remote_tag_sha(repo_root: Path, remote: str, tag: str) -> str:
@@ -247,13 +270,27 @@ def _remote_tag_sha(repo_root: Path, remote: str, tag: str) -> str:
     return values[-1]
 
 
+def _tree_sha(repo_root: Path, commitish: str) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", f"{commitish}^{{tree}}"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
 def _resolve_release_tag(repo_root: Path, tag: str) -> str:
+    """Resolve a release tag to the Bitbucket-side commit the nodes can fetch.
+
+    GitHub and Bitbucket tags may legitimately point at different commits (ADR-0007:
+    Bitbucket carries the operator-authored mirror of a GitHub-authored source), so
+    cross-remote equivalence is verified by tree SHA, not commit SHA.
+    """
     if not tag.startswith("release-"):
         raise RepositoryError("rollback requires an immutable release-* tag")
     origin_sha = _remote_tag_sha(repo_root, "origin", tag)
     bitbucket_sha = _remote_tag_sha(repo_root, "bitbucket", tag)
-    if origin_sha != bitbucket_sha:
-        raise RepositoryError(f"release tag {tag!r} differs between GitHub and Bitbucket")
     subprocess.run(["git", "fetch", "origin", f"refs/tags/{tag}:refs/tags/{tag}"], cwd=repo_root, check=True)
     local_sha = subprocess.run(
         ["git", "rev-parse", f"refs/tags/{tag}^{{commit}}"],
@@ -264,7 +301,19 @@ def _resolve_release_tag(repo_root: Path, tag: str) -> str:
     ).stdout.strip()
     if local_sha != origin_sha:
         raise RepositoryError(f"local release tag {tag!r} does not match its remotes")
-    return local_sha
+    if origin_sha != bitbucket_sha:
+        temp_ref = f"refs/edge-deploy/rollback/{tag}"
+        subprocess.run(
+            ["git", "fetch", "bitbucket", f"{bitbucket_sha}:{temp_ref}"], cwd=repo_root, check=True
+        )
+        try:
+            if _tree_sha(repo_root, temp_ref) != _tree_sha(repo_root, origin_sha):
+                raise RepositoryError(
+                    f"release tag {tag!r} is not tree-equivalent between GitHub and Bitbucket"
+                )
+        finally:
+            subprocess.run(["git", "update-ref", "-d", temp_ref], cwd=repo_root, check=True)
+    return bitbucket_sha
 
 
 def _cmd_rollback(args: argparse.Namespace, operator: OperatorConfig) -> int:
@@ -388,7 +437,13 @@ def _record_release_attempt(
     return append_audit_attempt(Path(operator.audit_repo), attempt)
 
 
-def _tag_successful_release(repo_root: Path, commit: str) -> str:
+def _tag_successful_release(repo_root: Path, commit: str, deployment_commit: str | None = None) -> str:
+    """Tag one successful release on both remotes with tree-equivalent targets (ADR-0007).
+
+    GitHub gets the reviewed source commit. Bitbucket gets the commit that was actually
+    deployed there (the operator-authored snapshot when Bitbucket's own-commits hook
+    rejected the GitHub-authored source); both tags share one name and one tree.
+    """
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     tag = f"release-{stamp}-{commit[:7]}"
     subprocess.run(["git", "tag", "-a", tag, commit, "-m", f"Successful release {tag}"], cwd=repo_root, check=True)
@@ -397,8 +452,23 @@ def _tag_successful_release(repo_root: Path, commit: str) -> str:
     token = os.environ.get("BB_TOKEN")
     if token:
         command.extend(["-c", f"http.extraHeader=Authorization: Bearer {token}"])
-    command.extend(["push", "bitbucket", f"refs/tags/{tag}"])
-    subprocess.run(command, cwd=repo_root, check=True)
+    deployed = deployment_commit or commit
+    if deployed == commit:
+        command.extend(["push", "bitbucket", f"refs/tags/{tag}"])
+        subprocess.run(command, cwd=repo_root, check=True)
+        return tag
+    temp_tag = f"edge-deploy-mirror/{tag}"
+    subprocess.run(
+        ["git", "tag", "-a", "-f", temp_tag, deployed,
+         "-m", f"Successful release {tag} (source {commit}) [edge-deploy]"],
+        cwd=repo_root,
+        check=True,
+    )
+    try:
+        command.extend(["push", "bitbucket", f"refs/tags/{temp_tag}:refs/tags/{tag}"])
+        subprocess.run(command, cwd=repo_root, check=True)
+    finally:
+        subprocess.run(["git", "tag", "-d", temp_tag], cwd=repo_root, check=True)
     return tag
 
 
@@ -415,6 +485,22 @@ def _cmd_publish(args: argparse.Namespace, operator: OperatorConfig) -> int:
     print(f"Published commit: {result.snapshot}")
     print(f"  source: {result.source_short} ({result.source_commit})")
     print(f"  branch: {result.branch}")
+    print(f"  previous remote: {result.previous_remote_commit}")
+    print(redact(f"  message: {result.message}"))
+    return 0
+
+
+def _cmd_mirror(args: argparse.Namespace) -> int:
+    result = mirror_release(
+        Path(args.repo_root).resolve(),
+        tag=args.tag,
+        remote=args.remote,
+        branch=args.branch,
+    )
+    print(f"Mirrored {result.tag} to {args.remote} ({result.mode})")
+    print(f"  source commit: {result.source_commit}")
+    print(f"  deployed commit: {result.deployed_commit}")
+    print(f"  shared tree: {result.tree}")
     print(f"  previous remote: {result.previous_remote_commit}")
     print(redact(f"  message: {result.message}"))
     return 0
@@ -471,6 +557,13 @@ def _cmd_preflight(args: argparse.Namespace, operator: OperatorConfig) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "mirror":
+        # Mirror operates on the core checkout itself and needs no operator config.
+        try:
+            return _cmd_mirror(args)
+        except MirrorError as exc:
+            print(f"mirror failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 2
     try:
         operator = OperatorConfig.load(args.config)
     except FileNotFoundError:

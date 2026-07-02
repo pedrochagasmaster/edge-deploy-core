@@ -12,7 +12,17 @@ Only a Release Operator publishes `edge-deploy-core`.
    ```
 
 4. Create the next immutable semantic-version tag from that exact commit.
-5. Push the commit and tag to both `origin` and `bitbucket`.
+5. Push the commit and tag to `origin`, then mirror them to Bitbucket:
+
+   ```powershell
+   git push origin main "refs/tags/vX.Y.Z"
+   python -m edge_deploy mirror --tag vX.Y.Z
+   ```
+
+   Mirror pushes the exact commit when Bitbucket accepts it; when Bitbucket's
+   own-commits hook rejects a GitHub-authored merge commit, it creates an
+   operator-authored mirror commit and tag carrying the identical tree (ADR-0007)
+   and verifies the pushed refs.
 6. Record the redacted release attempt on Bitbucket’s `release-log` branch.
 7. Update the pinned core version in each tool through a normal GitHub pull
    request.
