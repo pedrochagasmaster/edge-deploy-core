@@ -79,6 +79,24 @@ def _copy_redacted(source: Path, destination: Path) -> None:
             target.write_text(redact(text), encoding="utf-8")
 
 
+def _attempt_requires_resolution(metadata: dict, release_payload: dict | None) -> bool:
+    """Return True when a failed audit attempt may have changed deployment state."""
+    if metadata.get("status") == "passed":
+        return False
+    if release_payload is None:
+        return True
+    publishes = release_payload.get("publishes") or []
+    rollouts = release_payload.get("rollouts") or []
+    published = any(item.get("status") == "published" or item.get("snapshot") for item in publishes)
+    rollout_touched_node = any(
+        item.get("status") not in {"skipped", None}
+        or item.get("deployment_commit")
+        or item.get("previous_remote_commit")
+        for item in rollouts
+    )
+    return published or rollout_touched_node
+
+
 def check_audit_remote(
     core_repo: Path,
     *,
@@ -113,16 +131,21 @@ def check_audit_remote(
     metadata_paths = sorted(path for path in paths if path.endswith("/metadata.json"))
     if not metadata_paths:
         return
+    latest_metadata = metadata_paths[-1]
     payload = json.loads(
-        _run(
-            core_repo,
-            "show",
-            f"refs/remotes/bitbucket/release-log:{metadata_paths[-1]}",
-        ).stdout
+        _run(core_repo, "show", f"refs/remotes/bitbucket/release-log:{latest_metadata}").stdout
     )
+    release_payload = None
+    release_path = str(Path(latest_metadata).with_name("release.json")).replace("\\", "/")
+    try:
+        release_payload = json.loads(
+            _run(core_repo, "show", f"refs/remotes/bitbucket/release-log:{release_path}").stdout
+        )
+    except (AuditSyncError, json.JSONDecodeError):
+        release_payload = None
     if (
         not allow_unresolved
-        and payload.get("status") != "passed"
+        and _attempt_requires_resolution(payload, release_payload)
         and payload.get("source_sha") != source_sha
     ):
         raise AuditSyncError(

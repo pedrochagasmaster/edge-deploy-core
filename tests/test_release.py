@@ -173,6 +173,29 @@ def test_release_publish_failure_skips_only_that_tool(fake_tmux, tmp_path, patch
     assert any(h["kind"] == "publish" and h["tool"] == "robocop" for h in report.summary()["handoffs"])
 
 
+def test_release_forwards_local_check_skip_to_publish(fake_tmux, tmp_path, patched_drift) -> None:
+    operator = _operator()
+    events: list = []
+    drivers: dict = {}
+
+    def publish_fn(profile, **kwargs):
+        events.append((profile.tool, kwargs["run_local_check"]))
+        return _publishing([])(profile, **kwargs)
+
+    report = run_release(
+        operator,
+        ReleaseSelection(tools=["autobench"], nodes=["node03"], run_local_check=False),
+        report_dir=tmp_path,
+        getpass_fn=_getpass([]),
+        publish_fn=publish_fn,
+        driver_factory=_make_factory(fake_tmux, drivers),
+        auth_mode="prompt",
+    )
+
+    assert report.exit_code() == 0
+    assert events == [("autobench", False)]
+
+
 def test_release_auth_failure_isolated_to_node(fake_tmux, tmp_path, patched_drift) -> None:
     operator = _operator()
     drivers: dict = {}

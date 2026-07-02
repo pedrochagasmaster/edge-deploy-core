@@ -1,7 +1,10 @@
-"""Publish the exact reviewed GitHub commit to a Tool's Bitbucket ``main``.
+"""Publish the reviewed GitHub commit to a Tool's Bitbucket ``main``.
 
 Publish is fast-forward-only. It never rewrites commits, force-pushes, or mutates the
-working tree.
+working tree. When Bitbucket allows it, the reviewed GitHub commit itself is pushed.
+When Bitbucket's "own commits only" hook rejects GitHub-authored merge commits, Publish
+creates an operator-authored deployment snapshot commit with the reviewed commit's tree
+and the Bitbucket tip as its parent.
 
 Gate (Plan §1.1):
 
@@ -36,6 +39,12 @@ GitRunner = Callable[[Sequence[str]], str]
 
 LOCAL_CHECK_RELATIVE = Path("tools") / "dev" / "local_check.ps1"
 LOCAL_CHECK_OUTPUT_TAIL_LINES = 20
+AMBIGUOUS_PUSH_FAILURE_MARKERS = (
+    "connection was reset",
+    "unexpected disconnect",
+    "remote end hung up",
+    "everything up-to-date",
+)
 
 
 class PublishError(RuntimeError):
@@ -44,11 +53,11 @@ class PublishError(RuntimeError):
 
 @dataclass(frozen=True)
 class PublishResult:
-    """The outcome of one exact source commit pushed to ``bitbucket/main``."""
+    """The outcome of one reviewed source commit published to ``bitbucket/main``."""
 
     tool: str
     status: str  # "published"
-    snapshot: str  # exact source SHA, retained as a report-schema compatibility key
+    snapshot: str  # deployment SHA, retained as a report-schema compatibility key
     source_commit: str
     source_short: str
     branch: str
@@ -97,6 +106,25 @@ def _has_blocking_status(status: str) -> bool:
         line.strip() and not _is_generated_release_report_status(line)
         for line in status.splitlines()
     )
+
+
+def _is_ambiguous_push_failure(exc: PublishError) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in AMBIGUOUS_PUSH_FAILURE_MARKERS)
+
+
+def _is_own_commit_hook_rejection(exc: PublishError) -> bool:
+    message = str(exc).lower()
+    return "you can only push your own commits" in message and "pre-receive hook declined" in message
+
+
+def _is_deployment_snapshot_subject(subject: str) -> bool:
+    return subject.startswith("Deploy snapshot:")
+
+
+def _deployment_snapshot_message(profile: ToolProfile, source_short: str, branch: str, now: datetime) -> str:
+    stamp = now.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    return f"Deploy snapshot: {profile.tool} {source_short} on {branch} ({stamp} UTC) [edge-deploy]"
 
 
 def run_local_check_ps1(repo_root: Path) -> int:
@@ -159,10 +187,15 @@ def _default_git_runner(repo_root: str | Path) -> GitRunner:
             text=True,
         )
         if completed.returncode != 0:
-            # Never echo argv (it may carry the Bearer header); surface stderr only.
+            # Never echo argv (it may carry the Bearer header); surface command output only.
+            detail = "\n".join(
+                part.strip()
+                for part in (completed.stderr, completed.stdout)
+                if part.strip()
+            )
             raise PublishError(
                 f"git {args[0] if args else ''} failed (exit {completed.returncode}): "
-                f"{completed.stderr.strip() or completed.stdout.strip()}"
+                f"{detail}"
             )
         return completed.stdout
 
@@ -181,7 +214,7 @@ def publish_snapshot(
     git_runner: GitRunner | None = None,
     local_check_runner: Callable[[Path], int] = run_local_check_ps1,
 ) -> PublishResult:
-    """Publish one exact source commit for ``profile`` and return its provenance.
+    """Publish one reviewed source commit for ``profile`` and return its provenance.
 
     Raises :class:`PublishError` on any gate failure or git error.
     """
@@ -236,27 +269,59 @@ def publish_snapshot(
     source_commit = git(["rev-parse", "--verify", source]).strip()
     source_short = git(["rev-parse", "--short", source]).strip()
 
-    # Refresh and require a fast-forward. Legacy rewritten-snapshot history requires
-    # one explicit operator migration; this code never force-pushes.
+    # Refresh and require either direct ancestry for exact-SHA publication, or an
+    # existing deployment-snapshot Bitbucket tip for continuing the synthetic chain.
     auth_header = f"http.extraHeader=Authorization: Bearer {token}"
     git(["-c", auth_header, "fetch", remote, branch])
     previous_remote_commit = git(["rev-parse", "--verify", f"{remote}/{branch}"]).strip()
+    remote_is_source_ancestor = True
     try:
         git(["merge-base", "--is-ancestor", previous_remote_commit, source_commit])
     except PublishError as exc:
-        raise PublishError(
-            f"{remote}/{branch} is not an ancestor of {source_commit}; refusing a "
-            "non-fast-forward publish. Preserve the legacy tip and perform the one-time "
-            "operator migration before retrying."
-        ) from exc
+        remote_is_source_ancestor = False
+        previous_subject = git(["log", "-1", "--format=%s", previous_remote_commit]).strip()
+        if not _is_deployment_snapshot_subject(previous_subject):
+            raise PublishError(
+                f"{remote}/{branch} is not an ancestor of {source_commit}; refusing a "
+                "non-fast-forward publish. Preserve the legacy tip and perform the one-time "
+                "operator migration before retrying."
+            ) from exc
 
     message = f"Publish exact source commit {source_short} to {remote}/{branch}"
-    git(["-c", auth_header, "push", remote, f"{source_commit}:refs/heads/{branch}"])
+    deployment_commit = source_commit
+    if remote_is_source_ancestor:
+        try:
+            git(["-c", auth_header, "push", remote, f"{source_commit}:refs/heads/{branch}"])
+        except PublishError as exc:
+            if _is_own_commit_hook_rejection(exc):
+                remote_is_source_ancestor = False
+            elif _is_ambiguous_push_failure(exc):
+                git(["-c", auth_header, "fetch", remote, branch])
+                confirmed_remote_commit = git(["rev-parse", "--verify", f"{remote}/{branch}"]).strip()
+                if confirmed_remote_commit != source_commit:
+                    raise
+            else:
+                raise
+
+    if not remote_is_source_ancestor:
+        message = _deployment_snapshot_message(profile, source_short, branch, clock())
+        deployment_commit = git(
+            ["commit-tree", f"{source_commit}^{{tree}}", "-p", previous_remote_commit, "-m", message]
+        ).strip()
+        try:
+            git(["-c", auth_header, "push", remote, f"{deployment_commit}:refs/heads/{branch}"])
+        except PublishError as exc:
+            if not _is_ambiguous_push_failure(exc):
+                raise
+            git(["-c", auth_header, "fetch", remote, branch])
+            confirmed_remote_commit = git(["rev-parse", "--verify", f"{remote}/{branch}"]).strip()
+            if confirmed_remote_commit != deployment_commit:
+                raise
 
     return PublishResult(
         tool=profile.tool,
         status="published",
-        snapshot=source_commit,
+        snapshot=deployment_commit,
         source_commit=source_commit,
         source_short=source_short,
         branch=branch,

@@ -3,7 +3,14 @@ from datetime import datetime, timezone
 
 import pytest
 
-from edge_deploy.audit import AuditAttempt, AuditSyncError, _copy_redacted, _relative_path, check_audit_remote
+from edge_deploy.audit import (
+    AuditAttempt,
+    AuditSyncError,
+    _attempt_requires_resolution,
+    _copy_redacted,
+    _relative_path,
+    check_audit_remote,
+)
 
 
 def attempt(tmp_path):
@@ -54,3 +61,32 @@ def test_check_audit_remote_blocks_pending_outbox(tmp_path):
     (outbox / "pending").mkdir()
     with pytest.raises(AuditSyncError, match="unsynchronized"):
         check_audit_remote(tmp_path, outbox=outbox)
+
+
+def test_failed_pre_publish_attempt_does_not_require_resolution():
+    metadata = {"status": "failed", "source_sha": "a" * 40}
+    release = {
+        "publishes": [{"status": "failed", "snapshot": None}],
+        "rollouts": [
+            {"status": "skipped", "deployment_commit": None, "previous_remote_commit": None},
+            {"status": "skipped", "deployment_commit": None, "previous_remote_commit": None},
+        ],
+    }
+
+    assert _attempt_requires_resolution(metadata, release) is False
+
+
+def test_failed_post_publish_attempt_requires_resolution():
+    metadata = {"status": "failed", "source_sha": "a" * 40}
+    release = {
+        "publishes": [{"status": "published", "snapshot": "a" * 40}],
+        "rollouts": [{"status": "failed", "deployment_commit": "a" * 40}],
+    }
+
+    assert _attempt_requires_resolution(metadata, release) is True
+
+
+def test_failed_attempt_without_report_requires_resolution():
+    metadata = {"status": "failed", "source_sha": "a" * 40}
+
+    assert _attempt_requires_resolution(metadata, None) is True

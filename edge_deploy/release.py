@@ -36,6 +36,7 @@ from edge_deploy.rollout import run_rollout
 from edge_deploy.tmux_driver import AuthenticationError, SessionGoneError, TmuxDriver
 from edge_deploy.verify import verify_after_rollout
 
+
 @dataclass(frozen=True)
 class ReleaseSelection:
     """A resolved Release request: which tools, which nodes, and how."""
@@ -46,6 +47,7 @@ class ReleaseSelection:
     snapshot_by_tool: dict[str, str] | None = None  # per-tool resume map, e.g. {"autobench": "..."}
     smoke: str = "standard"  # "standard" | "deep"
     fail_fast: bool = False
+    run_local_check: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -449,7 +451,13 @@ def run_release(
             try:
                 progress(f"publishing {tool}")
                 with tracker.tracked(f"publish {tool}", phase="publish", tool=tool):
-                    result = publish_fn(profiles[tool], repo_root=local_roots[tool], remote=remote, clock=clock)
+                    result = publish_fn(
+                        profiles[tool],
+                        repo_root=local_roots[tool],
+                        remote=remote,
+                        clock=clock,
+                        run_local_check=selection.run_local_check,
+                    )
             except PublishError as exc:
                 progress(f"publish failed for {tool}: {exc}")
                 publishes.append({"tool": tool, "status": "failed", "snapshot": None, "error": str(exc)})

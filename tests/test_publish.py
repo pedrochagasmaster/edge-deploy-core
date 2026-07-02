@@ -32,6 +32,11 @@ class FakeGit:
         source_commit: str = "a1b2c3d4e5f6a7b8",
         short: str = "a1b2c3d",
         previous: str = "0f0f0f0f0f0f",
+        push_error: str | None = None,
+        remote_after_push_failure: str | None = None,
+        merge_base_fails: bool = False,
+        previous_subject: str = "Deploy snapshot: autobench cafe123 on main (2026-06-29 23:00 UTC) [edge-deploy]",
+        snapshot_commit: str = "d" * 40,
     ) -> None:
         self.calls: list[list[str]] = []
         self.status = status
@@ -39,6 +44,11 @@ class FakeGit:
         self.source_commit = source_commit
         self.short = short
         self.previous = previous
+        self.push_error = push_error
+        self.remote_after_push_failure = remote_after_push_failure
+        self.merge_base_fails = merge_base_fails
+        self.previous_subject = previous_subject
+        self.snapshot_commit = snapshot_commit
 
     def __call__(self, args) -> str:
         args = list(args)
@@ -52,7 +62,19 @@ class FakeGit:
         if args[:2] == ["rev-parse", "--verify"]:
             ref = args[2]
             return (self.previous if "/" in ref else self.source_commit) + "\n"
+        if args[:3] == ["log", "-1", "--format=%s"]:
+            return self.previous_subject + "\n"
+        if args[:1] == ["commit-tree"]:
+            return self.snapshot_commit + "\n"
+        if args[:2] == ["merge-base", "--is-ancestor"] and self.merge_base_fails:
+            raise PublishError("not an ancestor")
         # fetch / push (with or without the leading -c auth header)
+        if "push" in args and self.push_error is not None:
+            push_error = self.push_error
+            self.push_error = None
+            if self.remote_after_push_failure is not None:
+                self.previous = self.remote_after_push_failure
+            raise PublishError(push_error)
         return ""
 
     def push_call(self) -> list[str] | None:
@@ -106,6 +128,99 @@ def test_publish_pushes_with_bearer_header_and_exact_refspec() -> None:
     assert push[2] == "push"
     assert push[3] == "bitbucket"
     assert push[4] == f"{'a' * 40}:refs/heads/main"
+
+
+def test_publish_accepts_ambiguous_push_failure_when_remote_matches_source() -> None:
+    source = "a" * 40
+    git = FakeGit(
+        source_commit=source,
+        push_error=(
+            "git -c failed (exit 1): error: RPC failed; curl 55 Send failure: Connection was reset\n"
+            "send-pack: unexpected disconnect while reading sideband packet\n"
+            "fatal: the remote end hung up unexpectedly\n"
+            "Everything up-to-date"
+        ),
+        remote_after_push_failure=source,
+    )
+
+    result = publish_snapshot(AUTOBENCH, repo_root="/x", git_runner=git, run_local_check=False)
+
+    assert result.status == "published"
+    assert result.snapshot == source
+    assert git.calls.count(["-c", f"http.extraHeader=Authorization: Bearer {TOKEN}", "fetch", "bitbucket", "main"]) == 2
+
+
+def test_publish_rejects_ambiguous_push_failure_when_remote_does_not_match_source() -> None:
+    git = FakeGit(
+        source_commit="a" * 40,
+        push_error="git -c failed (exit 1): fatal: the remote end hung up unexpectedly",
+        remote_after_push_failure="b" * 40,
+    )
+
+    with pytest.raises(PublishError, match="remote end hung up"):
+        publish_snapshot(AUTOBENCH, repo_root="/x", git_runner=git, run_local_check=False)
+
+
+def test_publish_falls_back_to_snapshot_commit_when_bitbucket_rejects_github_commit() -> None:
+    source = "a" * 40
+    snapshot = "d" * 40
+    previous = "0" * 40
+    git = FakeGit(
+        source_commit=source,
+        short="cafe123",
+        previous=previous,
+        push_error=(
+            "remote: You can only push your own commits in this repository\n"
+            "remote: Commit f745066d6e14d36f2f858a31137b03f9fb2cd7c4 was committed by GitHub <noreply@github.com>\n"
+            "! [remote rejected] main (pre-receive hook declined)"
+        ),
+        snapshot_commit=snapshot,
+    )
+
+    result = publish_snapshot(AUTOBENCH, repo_root="/x", git_runner=git, run_local_check=False, clock=FIXED_CLOCK)
+
+    assert result.snapshot == snapshot
+    assert result.source_commit == source
+    assert result.previous_remote_commit == previous
+    assert [
+        "commit-tree",
+        f"{source}^{{tree}}",
+        "-p",
+        previous,
+        "-m",
+        "Deploy snapshot: autobench cafe123 on main (2026-06-29 23:00 UTC) [edge-deploy]",
+    ] in git.calls
+    assert any(call[-1] == f"{snapshot}:refs/heads/main" for call in git.calls if "push" in call)
+
+
+def test_publish_continues_existing_snapshot_chain_without_source_ancestry() -> None:
+    source = "a" * 40
+    snapshot = "d" * 40
+    previous = "0" * 40
+    git = FakeGit(
+        source_commit=source,
+        short="cafe123",
+        previous=previous,
+        merge_base_fails=True,
+        snapshot_commit=snapshot,
+    )
+
+    result = publish_snapshot(AUTOBENCH, repo_root="/x", git_runner=git, run_local_check=False, clock=FIXED_CLOCK)
+
+    assert result.snapshot == snapshot
+    assert result.source_commit == source
+    assert any(call[-1] == f"{snapshot}:refs/heads/main" for call in git.calls if "push" in call)
+
+
+def test_publish_rejects_non_snapshot_remote_when_source_ancestry_fails() -> None:
+    git = FakeGit(
+        source_commit="a" * 40,
+        merge_base_fails=True,
+        previous_subject="not an edge deploy snapshot",
+    )
+
+    with pytest.raises(PublishError, match="non-fast-forward publish"):
+        publish_snapshot(AUTOBENCH, repo_root="/x", git_runner=git, run_local_check=False)
 
 
 # ---------------------------------------------------------------------------
