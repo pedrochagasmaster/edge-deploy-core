@@ -285,6 +285,31 @@ class SmokeCommands:
 
 
 @dataclass(frozen=True)
+class DependencyBundleConfig:
+    """Target and input contract for a Tool's externally delivered wheel bundle."""
+
+    requirements_file: str = "requirements.txt"
+    constraints_file: str = ""
+    python_version: str = "3.10"
+    implementation: str = "cp"
+    abi: str = "cp310"
+    platform: str = "manylinux2014_x86_64"
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "DependencyBundleConfig | None":
+        if not data:
+            return None
+        return cls(
+            requirements_file=str(data.get("requirements_file", "requirements.txt")),
+            constraints_file=str(data.get("constraints_file", "") or ""),
+            python_version=str(data.get("python_version", "3.10")),
+            implementation=str(data.get("implementation", "cp")),
+            abi=str(data.get("abi", "cp310")),
+            platform=str(data.get("platform", "manylinux2014_x86_64")),
+        )
+
+
+@dataclass(frozen=True)
 class ToolProfile:
     """Deploy-specific differences for one Tool, committed as ``edge_deploy.yaml``."""
 
@@ -298,6 +323,7 @@ class ToolProfile:
     version_files: list[str] = field(default_factory=list)
     install_trigger_paths: list[str] = field(default_factory=list)
     dependency_paths: list[str] = field(default_factory=list)
+    dependency_bundle: DependencyBundleConfig | None = None
     smoke: SmokeCommands = field(default_factory=SmokeCommands)
     sensitive_paths: list[str] = field(default_factory=list)
     tui_chrome_regex: str = ""
@@ -316,6 +342,7 @@ class ToolProfile:
             version_files=_as_str_list(data.get("version_files")),
             install_trigger_paths=_as_str_list(data.get("install_trigger_paths")),
             dependency_paths=_as_str_list(data.get("dependency_paths")),
+            dependency_bundle=DependencyBundleConfig.from_mapping(data.get("dependency_bundle")),
             smoke=SmokeCommands.from_mapping(data.get("smoke")),
             sensitive_paths=_as_str_list(data.get("sensitive_paths")),
             tui_chrome_regex=str(data.get("tui_chrome_regex", "") or ""),

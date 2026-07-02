@@ -9,10 +9,13 @@ install-decision derived from ``install_trigger_paths``, the non-blocking
 from __future__ import annotations
 
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from edge_deploy.config import DependencyBundleConfig
+from edge_deploy.dependencies import create_dependency_bundle
 from edge_deploy.rollout import (
     ROLLOUT_STATUSES,
     RemoteGitPreflightError,
@@ -208,18 +211,49 @@ def test_run_rollout_refuses_dependency_change_without_running_update(
 
     assert report.status == "refused"
     assert report.install_decision == "not_applicable"
-    # The whole point of ADR-0005: nothing is executed on the node.
+    # A lower-level rollout without reviewed-source provenance remains fail-closed.
     assert not driver.ran("./update.sh")
     assert not driver.ran("./install.sh")
 
     payload = report.to_payload()
-    assert payload["refused_paths"] == expect_refused
+    assert payload["dependency_paths"] == expect_refused
     assert payload["changed_paths"] == changed
     assert [check["name"] for check in payload["checks"]] == [
         "remote_git_preflight",
-        "dependency_refusal",
+        "dependency_bundle_unavailable",
     ]
     assert payload["checks"][1]["passed"] is False
+
+
+def test_run_rollout_delivers_dependency_bundle_before_update(
+    tmp_path, load_profile, sample_node, fake_tmux
+) -> None:
+    profile = replace(load_profile("autobench"), dependency_bundle=DependencyBundleConfig())
+    wheel = tmp_path / "demo-1.0-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+    bundle = create_dependency_bundle(
+        tool="autobench",
+        source_sha="a" * 40,
+        dependency_files={"requirements.txt": b"demo==1.0\n"},
+        wheels=[wheel],
+        config=profile.dependency_bundle,
+        output_dir=tmp_path / "bundle",
+    )
+    driver = fake_tmux(head_commits=[PREVIOUS, TARGET], changed_paths=["requirements.txt"])
+
+    report = run_rollout(
+        driver,
+        profile,
+        sample_node,
+        target_commit=TARGET,
+        dependency_bundle=bundle,
+    )
+
+    assert report.status == "rolled_out"
+    names = [check.name for check in report.checks]
+    assert names.index("dependency_delivery") < names.index("update")
+    assert driver.uploads
+    assert driver.ran("EDGE_DEPLOY_BUNDLE_DIR=")
 
 
 # ---------------------------------------------------------------------------

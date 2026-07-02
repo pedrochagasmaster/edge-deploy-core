@@ -22,6 +22,7 @@ from typing import Any, Callable
 
 from edge_deploy.auth import authenticate_node, authenticate_node_via_pane, ensure_kerberos
 from edge_deploy.config import OperatorConfig, load_tool_profile
+from edge_deploy.dependencies import BundleError, DependencyBundle, build_dependency_bundle
 from edge_deploy.progress import ReleaseProgressTracker
 from edge_deploy.publish import PublishError, PublishResult, publish_snapshot
 from edge_deploy.reporting import (
@@ -158,9 +159,7 @@ def _preflight_state_left(report: OperationReport) -> str:
 
 
 def _engine_state_left(report: OperationReport) -> str:
-    if report.status == "refused":
-        return "not started; dependency change refused"
-    if report.status == "failed":
+    if report.status in {"failed", "refused"}:
         failed = [check.message for check in report.checks if not check.passed]
         return "; ".join(failed) or "rollout failed"
     return ""
@@ -183,6 +182,7 @@ def _compact_rollout(
     drift: str = "not_run",
     smoke: str = "not_run",
     report_path: Any = None,
+    dependency: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "tool": tool,
@@ -195,6 +195,7 @@ def _compact_rollout(
         "drift": drift,
         "smoke": smoke,
         "report_path": str(report_path) if report_path else None,
+        "dependency": dependency,
     }
 
 
@@ -250,6 +251,9 @@ def _load_publishes_from_disk(report_dir: Path, tools: list[str]) -> list[dict[s
                 "tool": payload.get("tool", tool),
                 "status": payload.get("status", "failed"),
                 "snapshot": snapshot,
+                "source_commit": payload.get("source_commit")
+                or payload.get("reviewed_commit")
+                or payload.get("extra", {}).get("source_commit"),
                 "source_short": payload.get("source_short") or payload.get("extra", {}).get("source_short"),
                 "branch": payload.get("branch") or payload.get("extra", {}).get("branch"),
                 "previous_remote_commit": payload.get("previous_remote_commit"),
@@ -344,6 +348,7 @@ def run_release(
     stall_threshold_s: float = 300.0,
     progress_fn: Callable[[str], None] | None = None,
     progress_tracker: ReleaseProgressTracker | None = None,
+    dependency_builder: Callable[..., DependencyBundle] = build_dependency_bundle,
 ) -> ReleaseReport:
     """Run one Release and return the consolidated :class:`ReleaseReport`.
 
@@ -366,6 +371,8 @@ def run_release(
     )
 
     publishes: list[dict[str, Any]] = []
+    source_commits: dict[str, str] = {}
+    dependency_bundles: dict[str, DependencyBundle] = {}
     snapshots: dict[str, str] = {}
     pairs = [(node_name, tool) for node_name in node_names for tool in tools]
     recorded: dict[tuple[str, str], dict[str, Any]] = {}
@@ -376,6 +383,14 @@ def run_release(
 
     # ---- PUBLISH (skipped entirely when --snapshot reuses an existing Snapshot) ----
     if selection.snapshot_by_tool:
+        publishes = _load_publishes_from_disk(report_dir, tools)
+        source_commits.update(
+            {
+                str(item["tool"]): str(item["source_commit"])
+                for item in publishes
+                if item.get("source_commit")
+            }
+        )
         for tool in tools:
             snapshot = selection.snapshot_by_tool.get(tool)
             if not snapshot:
@@ -472,6 +487,7 @@ def run_release(
                     stop = True
                 continue
             snapshots[tool] = result.snapshot
+            source_commits[tool] = result.source_commit
             publish_path = _write_publish_report(report_dir, tool, result, local_roots[tool])
             publishes.append({**result.to_payload(), "report_path": str(publish_path)})
             _log_local_check_output(tracker, tool, result.local_check_output_tail)
@@ -555,6 +571,27 @@ def run_release(
                     continue
                 snapshot = snapshots[tool]
                 profile = profiles[tool]
+
+                def bundle_for_tool(
+                    current_tool: str = tool,
+                    current_profile: Any = profile,
+                ) -> DependencyBundle:
+                    if current_tool in dependency_bundles:
+                        return dependency_bundles[current_tool]
+                    source_commit = source_commits.get(current_tool)
+                    if not source_commit:
+                        raise BundleError(
+                            "Dependency delivery requires reviewed-source provenance; "
+                            "resume from the original release report"
+                        )
+                    dependency_bundles[current_tool] = dependency_builder(
+                        current_profile,
+                        repo_root=Path(local_roots[current_tool]),
+                        source_sha=source_commit,
+                        output_root=report_dir / "bundles",
+                    )
+                    return dependency_bundles[current_tool]
+
                 try:
                     progress(f"rolling out {tool}/{node_name} -> {snapshot}")
                     with tracker.tracked(
@@ -571,6 +608,7 @@ def run_release(
                             target_commit=snapshot,
                             operator_email=operator.operator_email,
                             remote=remote,
+                            dependency_bundle_factory=bundle_for_tool,
                         )
                     _log_successful_preflight_repair(
                         tracker, tool=tool, node=node_name, report=report
@@ -596,6 +634,7 @@ def run_release(
                                 target_commit=snapshot,
                                 operator_email=operator.operator_email,
                                 remote=remote,
+                                dependency_bundle_factory=bundle_for_tool,
                             )
                         _log_successful_preflight_repair(
                             tracker, tool=tool, node=node_name, report=report
@@ -635,7 +674,8 @@ def run_release(
                         state_left = _verify_state_left(report)
                 else:
                     state_left = _preflight_state_left(report) if any(
-                        check.name == "remote_git_preflight" for check in report.checks
+                        check.name == "remote_git_preflight" and not check.passed
+                        for check in report.checks
                     ) else _engine_state_left(report)
                     _log_preflight_evidence(tracker, tool=tool, node=node_name, report=report)
 
@@ -652,6 +692,7 @@ def run_release(
                     drift=_drift_result(report.checks),
                     smoke=_smoke_result(report.checks),
                     report_path=path,
+                    dependency=report.extra.get("dependency"),
                 )
                 if report.status != "rolled_out" and selection.fail_fast:
                     stop = True
@@ -675,9 +716,6 @@ def run_release(
                 deployment_commit=snapshots.get(tool),
             )
         )
-
-    if selection.snapshot_by_tool and not publishes:
-        publishes = _load_publishes_from_disk(report_dir, tools)
 
     consolidated = ReleaseReport(
         selection={

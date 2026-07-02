@@ -167,7 +167,7 @@ def test_report_node_name_prefers_name_then_derives_from_host() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Consolidated release report (edge-deploy/release/1)
+# Consolidated release report (edge-deploy/release/2)
 # ---------------------------------------------------------------------------
 
 
@@ -226,7 +226,7 @@ def _sample_release_report() -> ReleaseReport:
 def test_release_report_payload_schema_and_keys() -> None:
     payload = _sample_release_report().to_payload()
 
-    assert payload["schema"] == RELEASE_SCHEMA == "edge-deploy/release/1"
+    assert payload["schema"] == RELEASE_SCHEMA == "edge-deploy/release/2"
     assert payload["timestamp"].endswith("Z")
     assert payload["operator_email"] == "e176097@mastercard.com"
     assert set(payload) == {

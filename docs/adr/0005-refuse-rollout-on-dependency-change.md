@@ -1,4 +1,6 @@
-# v1 covers the git-update path; Rollout refuses on dependency changes
+# Superseded: v1 refused dependency changes
+
+Superseded by ADR-0006 for edge-deploy-core v1.1.0.
 
 Offline wheels do not travel in git (autobench ignores `/offline_packages/*`;
 robocop commits no `.whl` and ignores its deploy zip), so a Bitbucket

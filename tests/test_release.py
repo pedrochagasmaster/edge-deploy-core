@@ -15,6 +15,7 @@ import pytest
 
 from edge_deploy import drift, release
 from edge_deploy.config import NodeConfig, OperatorConfig
+from edge_deploy.dependencies import create_dependency_bundle
 from edge_deploy.publish import PublishError, PublishResult
 from edge_deploy.release import ReleaseSelection, run_release
 
@@ -223,12 +224,25 @@ def test_release_auth_failure_isolated_to_node(fake_tmux, tmp_path, patched_drif
     assert (tmp_path / "rollout-autobench-node03.json").exists()  # synthetic auth report still written
 
 
-def test_release_refused_dependency_change(fake_tmux, tmp_path, patched_drift) -> None:
+def test_release_delivers_dependency_change(fake_tmux, tmp_path, patched_drift) -> None:
     operator = _operator()
     drivers: dict = {}
 
     def configure(name, kw):
-        kw["changed_paths"] = ["requirements.txt"]  # ADR-0005 refuse
+        kw["changed_paths"] = ["requirements.txt"]
+
+    def build(profile, *, source_sha, output_root, **_kwargs):
+        wheel = output_root / "demo-1.0-py3-none-any.whl"
+        wheel.parent.mkdir(parents=True, exist_ok=True)
+        wheel.write_bytes(b"wheel")
+        return create_dependency_bundle(
+            tool=profile.tool,
+            source_sha=source_sha,
+            dependency_files={"requirements.txt": b"demo==1.0\n"},
+            wheels=[wheel],
+            config=profile.dependency_bundle,
+            output_dir=output_root / "fixture",
+        )
 
     report = run_release(
         operator,
@@ -238,13 +252,14 @@ def test_release_refused_dependency_change(fake_tmux, tmp_path, patched_drift) -
         publish_fn=_publishing([]),
         driver_factory=_make_factory(fake_tmux, drivers, configure=configure),
         auth_mode="prompt",
+        dependency_builder=build,
     )
 
-    assert report.rollouts[0]["status"] == "refused"
-    assert report.summary()["counts"]["refused"] == 1
-    assert report.exit_code() == 1
-    assert not drivers["node03"].ran("./update.sh")  # refused before anything ran on the node
-    assert any(h["kind"] == "refused" for h in report.summary()["handoffs"])
+    assert report.rollouts[0]["status"] == "rolled_out"
+    assert report.rollouts[0]["dependency"]["source_sha"] == "src1234abcd"
+    assert report.exit_code() == 0
+    assert drivers["node03"].uploads
+    assert drivers["node03"].ran("./update.sh")
 
 
 # ---------------------------------------------------------------------------

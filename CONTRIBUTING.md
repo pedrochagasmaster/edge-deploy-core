@@ -10,7 +10,7 @@ git switch main
 git pull --ff-only origin main
 git switch -c <short-branch-name>
 python -m pip install -e ".[dev]"
-python -m pytest
+python -m pytest -n 4 --dist loadfile
 ```
 
 Commit the focused change, push the branch to GitHub, and open a pull request

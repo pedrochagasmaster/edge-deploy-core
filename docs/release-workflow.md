@@ -8,7 +8,7 @@ Only a Release Operator publishes `edge-deploy-core`.
 
    ```powershell
    python -m pip install -e ".[dev]"
-   python -m pytest
+   python -m pytest -n 4 --dist loadfile
    ```
 
 4. Create the next immutable semantic-version tag from that exact commit.
@@ -17,6 +17,10 @@ Only a Release Operator publishes `edge-deploy-core`.
 7. Update the pinned core version in each tool through a normal GitHub pull
    request.
 
-The first supported package contract is `v1.0.0`. Never move or reuse a
-published tag. The `release-log` branch is Bitbucket-only and must never be
-pushed to GitHub.
+The dependency-delivery package contract is `v1.1.0`. Never move or reuse a published
+tag. The `release-log` branch is Bitbucket-only and must never be pushed to GitHub.
+
+Dependency bundles are generated under the release report directory and are never
+committed. Per-node reports record build, transfer, verification, installation, and
+resume provenance. A failed dependency phase is resumed from the original report
+directory so the reviewed source SHA remains available.

@@ -25,8 +25,11 @@ import os
 import re
 import shlex
 import subprocess
+import tempfile
 import time
 import uuid
+from hashlib import sha256
+from pathlib import Path
 
 # Matches an ANSI escape sequence so screen text can be inspected as plain text.
 _ANSI_RE = r"\x1b\[[0-9;?]*[ -/]*[@-~]"
@@ -115,6 +118,8 @@ class TmuxDriver:
         self.ssh_connect_timeout = ssh_connect_timeout
         self.retries = retries
         self.retry_backoff = retry_backoff
+        socket_id = sha256(f"{host}\0{session}".encode("utf-8")).hexdigest()[:16]
+        self.control_path = Path(tempfile.gettempdir()) / f"edge-deploy-{socket_id}.sock"
 
     @classmethod
     def from_node_and_profile(
@@ -174,7 +179,16 @@ class TmuxDriver:
         PTY allocation so the remote login shell is fully interactive (correct prompt, job
         control, readline, etc.).
         """
-        ssh_parts = ["ssh", "-t"]
+        ssh_parts = [
+            "ssh",
+            "-t",
+            "-o",
+            "ControlMaster=yes",
+            "-o",
+            f"ControlPath={self.control_path}",
+            "-o",
+            "ControlPersist=no",
+        ]
         if self.ssh_options:
             ssh_parts.extend(shlex.split(self.ssh_options))
         ssh_parts.append(self.host)
@@ -212,6 +226,7 @@ class TmuxDriver:
 
         # Kill any stale local session with the same name.
         self._tmux(["kill-session", "-t", self.session], check=False)
+        self.control_path.unlink(missing_ok=True)
 
         self._tmux(
             [
@@ -301,6 +316,25 @@ class TmuxDriver:
             ["kill-session", "-t", self.session],
             check=False,
         )
+        self.control_path.unlink(missing_ok=True)
+
+    def upload_file(self, source: str | Path, remote_path: str) -> None:
+        """Copy a file over the already-authenticated SSH master connection."""
+        completed = subprocess.run(
+            [
+                "scp",
+                "-o",
+                f"ControlPath={self.control_path}",
+                str(Path(source)),
+                f"{self.host}:{remote_path}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode:
+            detail = (completed.stderr or completed.stdout).strip()
+            raise RuntimeError(f"authenticated bundle transfer failed: {detail}")
 
     # ------------------------------------------------------------------
     # Pane control (local tmux)

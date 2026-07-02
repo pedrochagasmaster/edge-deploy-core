@@ -21,8 +21,10 @@ import fnmatch
 import json
 import re
 from dataclasses import dataclass
+from typing import Callable
 
 from edge_deploy.config import ToolProfile
+from edge_deploy.dependencies import BundleError, DependencyBundle, deliver_dependency_bundle
 from edge_deploy.drift import _extract_payload, _remote_python
 from edge_deploy.reporting import OperationReport, ReportCheck, report_node_name
 from edge_deploy.tmux_driver import TmuxDriver
@@ -149,32 +151,41 @@ def _install_python_expr() -> str:
     )
 
 
-def build_install_command(profile: ToolProfile, *, operator_email: str = "") -> str:
+def build_install_command(
+    profile: ToolProfile, *, operator_email: str = "", bundle_dir: str = ""
+) -> str:
     """``install.sh`` with the standardized python-bin/email env (ADR-0004)."""
     py = _install_python_expr()
     parts: list[str] = []
     if operator_email:
         parts.append(f"EDGE_DEPLOY_EMAIL={operator_email}")
+    if bundle_dir:
+        parts.append(f"EDGE_DEPLOY_BUNDLE_DIR={bundle_dir}")
     parts.append(f"EDGE_DEPLOY_PYTHON_BIN={py}")
     parts.append("./install.sh")
     return " ".join(parts)
 
 
-def build_install_preflight_command(profile: ToolProfile, *, operator_email: str = "") -> str:
+def build_install_preflight_command(
+    profile: ToolProfile, *, operator_email: str = "", bundle_dir: str = ""
+) -> str:
     """Dry-run offline wheel resolution before running install.sh."""
     py = _install_python_expr()
     parts: list[str] = []
     if operator_email:
         parts.append(f"EDGE_DEPLOY_EMAIL={operator_email}")
+    if bundle_dir:
+        parts.append(f"EDGE_DEPLOY_BUNDLE_DIR={bundle_dir}")
     parts.append(f"EDGE_DEPLOY_PYTHON_BIN={py}")
     parts.append(
         "sh -u -c '"
-        "if [ -d offline_packages ] || [ -d vendor ]; then "
+        "bundle=${EDGE_DEPLOY_BUNDLE_DIR:-}; "
+        "if [ -n \"$bundle\" ] && [ -d \"$bundle/wheels\" ]; then "
         "tmp=$(mktemp -d) || exit 1; "
         "\"$EDGE_DEPLOY_PYTHON_BIN\" -m venv \"$tmp/venv\" && "
         "\"$tmp/venv/bin/pip\" install --dry-run --no-index "
-        "--find-links=\"$PWD/offline_packages\" --find-links=\"$PWD/vendor\" "
-        "-r \"$PWD/requirements.txt\"; "
+        "--find-links=\"$bundle/wheels\" "
+        "-r \"$bundle/requirements/requirements.txt\"; "
         "rc=$?; rm -rf \"$tmp\"; exit \"$rc\"; "
         "fi"
         "'"
@@ -450,6 +461,8 @@ def run_rollout(
     install_mode: str = "auto",
     operator_email: str = "",
     remote: str = "bitbucket",
+    dependency_bundle: DependencyBundle | None = None,
+    dependency_bundle_factory: Callable[[], DependencyBundle] | None = None,
 ) -> OperationReport:
     """Roll one Edge Node to ``target_commit`` and return an :class:`OperationReport`.
 
@@ -487,35 +500,139 @@ def run_rollout(
     )
     sensitive_changed = matching_paths(changed_paths, profile.sensitive_paths)
     refused = matching_paths(changed_paths, profile.dependency_paths)
+    bundle_dir = ""
+    dependency_evidence: dict[str, object] | None = None
 
     if refused:
-        # ADR-0005: offline wheels do not travel in git, so a dependency change cannot be
-        # delivered by update.sh. Refuse before running anything on the node.
-        check = ReportCheck(
-            name="dependency_refusal",
-            passed=False,
-            message=(
-                "Refused: dependency files changed and cannot be delivered over the git path "
-                f"({', '.join(refused)}). Run the offline bundle refresh first."
-            ),
-            evidence={"refused_paths": refused},
-        )
-        return OperationReport(
-            operation="rollout",
-            status="refused",
-            node=node_name,
-            host=host,
-            repo_path=repo_path,
-            deployment_commit=target_commit,
-            previous_remote_commit=previous_commit,
-            install_decision="not_applicable",
-            checks=[preflight_check, check],
-            sensitive_changed=sensitive_changed,
-            extra={"changed_paths": changed_paths, "refused_paths": refused},
-        )
+        if dependency_bundle is None and dependency_bundle_factory is not None:
+            try:
+                dependency_bundle = dependency_bundle_factory()
+            except BundleError as exc:
+                check = ReportCheck("dependency_build", False, str(exc))
+                return OperationReport(
+                    operation="rollout",
+                    status="failed",
+                    node=node_name,
+                    host=host,
+                    repo_path=repo_path,
+                    deployment_commit=target_commit,
+                    previous_remote_commit=previous_commit,
+                    install_decision="not_applicable",
+                    checks=[preflight_check, check],
+                    sensitive_changed=sensitive_changed,
+                    extra={"changed_paths": changed_paths, "dependency_paths": refused},
+                )
+        if dependency_bundle is None:
+            check = ReportCheck(
+                name="dependency_bundle_unavailable",
+                passed=False,
+                message="Dependency files changed but no reviewed-source bundle was supplied",
+                evidence={"dependency_paths": refused},
+            )
+            return OperationReport(
+                operation="rollout",
+                status="refused",
+                node=node_name,
+                host=host,
+                repo_path=repo_path,
+                deployment_commit=target_commit,
+                previous_remote_commit=previous_commit,
+                install_decision="not_applicable",
+                checks=[preflight_check, check],
+                sensitive_changed=sensitive_changed,
+                extra={"changed_paths": changed_paths, "dependency_paths": refused},
+            )
+        try:
+            delivered = deliver_dependency_bundle(driver, profile, dependency_bundle)
+        except BundleError as exc:
+            check = ReportCheck("dependency_delivery", False, str(exc))
+            return OperationReport(
+                operation="rollout",
+                status="failed",
+                node=node_name,
+                host=host,
+                repo_path=repo_path,
+                deployment_commit=target_commit,
+                previous_remote_commit=previous_commit,
+                install_decision="not_applicable",
+                checks=[preflight_check, check],
+                sensitive_changed=sensitive_changed,
+                extra={"changed_paths": changed_paths, "dependency_paths": refused},
+            )
+        bundle_dir = delivered.remote_dir
+        dependency_evidence = {
+            **delivered.evidence,
+            "source_sha": dependency_bundle.source_sha,
+            "archive_sha256": dependency_bundle.archive_sha256,
+            "manifest": dependency_bundle.manifest,
+        }
 
     install = decide_install_action(profile, mode=install_mode, changed_paths=changed_paths)
+    if not bundle_dir and install.action == "run" and profile.dependency_bundle is not None:
+        current_bundle = f"/ads_storage/$USER/.edge-deploy/bundles/{profile.tool}/current"
+        _screen, current_code = driver.run_remote(
+            f"test -f {current_bundle}/manifest.json",
+            timeout=30,
+        )
+        if current_code == 0:
+            bundle_dir = current_bundle
+        elif dependency_bundle_factory is None:
+            return OperationReport(
+                operation="rollout",
+                status="refused",
+                node=node_name,
+                host=host,
+                repo_path=repo_path,
+                deployment_commit=target_commit,
+                previous_remote_commit=previous_commit,
+                install_decision="not_applicable",
+                checks=[
+                    preflight_check,
+                    ReportCheck(
+                        "dependency_bootstrap",
+                        False,
+                        "Installation requires a verified bundle, but the node has no active bundle",
+                    ),
+                ],
+                sensitive_changed=sensitive_changed,
+                extra={"changed_paths": changed_paths},
+            )
+        else:
+            try:
+                dependency_bundle = dependency_bundle or dependency_bundle_factory()
+                delivered = deliver_dependency_bundle(driver, profile, dependency_bundle)
+            except BundleError as exc:
+                return OperationReport(
+                    operation="rollout",
+                    status="failed",
+                    node=node_name,
+                    host=host,
+                    repo_path=repo_path,
+                    deployment_commit=target_commit,
+                    previous_remote_commit=previous_commit,
+                    install_decision="not_applicable",
+                    checks=[preflight_check, ReportCheck("dependency_bootstrap", False, str(exc))],
+                    sensitive_changed=sensitive_changed,
+                    extra={"changed_paths": changed_paths},
+                )
+            bundle_dir = delivered.remote_dir
+            dependency_evidence = {
+                **delivered.evidence,
+                "source_sha": dependency_bundle.source_sha,
+                "archive_sha256": dependency_bundle.archive_sha256,
+                "manifest": dependency_bundle.manifest,
+                "bootstrap": True,
+            }
     checks: list[ReportCheck] = [preflight_check]
+    if dependency_evidence is not None:
+        checks.append(
+            ReportCheck(
+                "dependency_delivery",
+                True,
+                "Verified dependency bundle staged before checkout update",
+                dependency_evidence,
+            )
+        )
 
     _update_screen, update_code = driver.run_remote(
         build_update_command(profile, target_commit, remote=remote), timeout=180
@@ -534,7 +651,8 @@ def run_rollout(
 
     if install.action == "run":
         preflight_screen, preflight_code = driver.run_remote(
-            f"cd {repo_path} && {build_install_preflight_command(profile, operator_email=operator_email)}",
+            f"cd {repo_path} && "
+            f"{build_install_preflight_command(profile, operator_email=operator_email, bundle_dir=bundle_dir)}",
             timeout=240,
         )
         checks.append(
@@ -547,7 +665,8 @@ def run_rollout(
         )
         if preflight_code == 0:
             install_screen, install_code = driver.run_remote(
-                f"cd {repo_path} && {build_install_command(profile, operator_email=operator_email)}",
+                f"cd {repo_path} && "
+                f"{build_install_command(profile, operator_email=operator_email, bundle_dir=bundle_dir)}",
                 timeout=240,
             )
             checks.append(
@@ -558,6 +677,20 @@ def run_rollout(
                     {"exit_code": install_code, "output_tail": _output_tail(install_screen)},
                 )
             )
+            if install_code == 0 and bundle_dir and dependency_evidence is not None:
+                _activate_screen, activate_code = driver.run_remote(
+                    f"mkdir -p /ads_storage/$USER/.edge-deploy/bundles/{profile.tool} && "
+                    f"ln -sfn {bundle_dir} "
+                    f"/ads_storage/$USER/.edge-deploy/bundles/{profile.tool}/current",
+                    timeout=30,
+                )
+                checks.append(
+                    ReportCheck(
+                        "dependency_activate",
+                        activate_code == 0,
+                        f"active dependency bundle link exit {activate_code}",
+                    )
+                )
     else:
         checks.append(ReportCheck("install", True, install.reason))
 
@@ -582,5 +715,8 @@ def run_rollout(
         install_decision=install.action,
         checks=checks,
         sensitive_changed=sensitive_changed,
-        extra={"changed_paths": changed_paths},
+        extra={
+            "changed_paths": changed_paths,
+            **({"dependency": dependency_evidence} if dependency_evidence is not None else {}),
+        },
     )
