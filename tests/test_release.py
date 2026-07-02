@@ -7,6 +7,7 @@ real ``run_rollout`` / ``verify`` / auth-seam paths run end to end against the e
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 from edge_deploy import drift, release
-from edge_deploy.config import NodeConfig, OperatorConfig
+from edge_deploy.config import DependencyBundleConfig, NodeConfig, OperatorConfig
 from edge_deploy.dependencies import create_dependency_bundle
 from edge_deploy.publish import PublishError, PublishResult
 from edge_deploy.release import ReleaseSelection, run_release
@@ -224,9 +225,21 @@ def test_release_auth_failure_isolated_to_node(fake_tmux, tmp_path, patched_drif
     assert (tmp_path / "rollout-autobench-node03.json").exists()  # synthetic auth report still written
 
 
-def test_release_delivers_dependency_change(fake_tmux, tmp_path, patched_drift) -> None:
+def test_release_delivers_dependency_change(fake_tmux, tmp_path, patched_drift, monkeypatch) -> None:
     operator = _operator()
     drivers: dict = {}
+
+    # This test must not depend on whether the checked-out sibling Tool has adopted
+    # dependency_bundle config yet; overlay defaults on the loaded profile.
+    real_load = release.load_tool_profile
+
+    def load_with_bundle(root):
+        profile = real_load(root)
+        return dataclasses.replace(
+            profile, dependency_bundle=profile.dependency_bundle or DependencyBundleConfig()
+        )
+
+    monkeypatch.setattr(release, "load_tool_profile", load_with_bundle)
 
     def configure(name, kw):
         kw["changed_paths"] = ["requirements.txt"]
@@ -240,7 +253,9 @@ def test_release_delivers_dependency_change(fake_tmux, tmp_path, patched_drift) 
             source_sha=source_sha,
             dependency_files={"requirements.txt": b"demo==1.0\n"},
             wheels=[wheel],
-            config=profile.dependency_bundle,
+            # Not read from the real sibling profile: this test must not depend on
+            # whether the checked-out Tool has adopted dependency_bundle config yet.
+            config=profile.dependency_bundle or DependencyBundleConfig(),
             output_dir=output_root / "fixture",
         )
 

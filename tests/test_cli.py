@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from edge_deploy import cli
+from edge_deploy.mirror import MirrorError, MirrorResult
 from edge_deploy.publish import PublishError, PublishResult
 from edge_deploy.reporting import ReleaseReport
 
@@ -486,6 +487,156 @@ def test_publish_command_publish_error_returns_2(tmp_path, monkeypatch, capsys) 
 
     assert rc == 2
     assert "publish failed" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# mirror command dispatch (mirror_release monkeypatched)
+# ---------------------------------------------------------------------------
+
+
+def test_parser_parses_mirror_args() -> None:
+    args = cli.build_parser().parse_args(["mirror", "--tag", "v1.1.0", "--remote", "bb", "--branch", "release"])
+
+    assert args.command == "mirror"
+    assert args.tag == "v1.1.0"
+    assert args.remote == "bb"
+    assert args.branch == "release"
+    assert args.repo_root == "."
+
+
+def test_mirror_command_prints_result_and_needs_no_operator_config(tmp_path, monkeypatch, capsys) -> None:
+    captured: dict = {}
+
+    def fake_mirror(repo_root, *, tag, remote, branch) -> MirrorResult:
+        captured.update(repo_root=repo_root, tag=tag, remote=remote, branch=branch)
+        return MirrorResult(
+            tag=tag, mode="mirrored", branch=branch, source_commit="src" + "0" * 37,
+            deployed_commit="dep" + "1" * 37, tree="tree" + "2" * 36,
+            previous_remote_commit="prev" + "3" * 36,
+            message="Mirror release v1.1.0: source src tree tree [edge-deploy]",
+        )
+
+    monkeypatch.setattr(cli, "mirror_release", fake_mirror)
+
+    rc = cli.main(["--config", str(tmp_path / "missing.yaml"), "mirror", "--tag", "v1.1.0"])
+
+    assert rc == 0
+    assert captured["tag"] == "v1.1.0"
+    assert captured["remote"] == "bitbucket"
+    out = capsys.readouterr().out
+    assert "Mirrored v1.1.0 to bitbucket (mirrored)" in out
+    assert "deployed commit: dep" in out
+
+
+def test_mirror_command_error_returns_2(monkeypatch, capsys) -> None:
+    def fake_mirror(repo_root, **kwargs):
+        raise MirrorError("refusing a non-fast-forward mirror")
+
+    monkeypatch.setattr(cli, "mirror_release", fake_mirror)
+
+    rc = cli.main(["mirror", "--tag", "v1.1.0"])
+
+    assert rc == 2
+    assert "mirror failed" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# release tagging and rollback resolution are tree-equivalent (ADR-0007)
+# ---------------------------------------------------------------------------
+
+
+def _fake_git_subprocess(commands: list, stdout_by_ref: dict | None = None):
+    stdout_by_ref = stdout_by_ref or {}
+
+    def fake_run(cmd, cwd=None, check=False, capture_output=False, text=False):
+        commands.append(list(cmd))
+        stdout = ""
+        if cmd[:2] == ["git", "rev-parse"]:
+            stdout = stdout_by_ref.get(cmd[2], "f" * 40) + "\n"
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    return fake_run
+
+
+def test_tag_successful_release_tags_deployment_commit_on_bitbucket(tmp_path, monkeypatch) -> None:
+    commands: list = []
+    monkeypatch.setattr(cli.subprocess, "run", _fake_git_subprocess(commands))
+    monkeypatch.delenv("BB_TOKEN", raising=False)
+    source = "a" * 40
+    deployed = "d" * 40
+
+    tag = cli._tag_successful_release(tmp_path, source, deployment_commit=deployed)
+
+    assert tag.startswith("release-") and tag.endswith(source[:7])
+    temp_tag = f"edge-deploy-mirror/{tag}"
+    tag_creations = [cmd for cmd in commands if cmd[:2] == ["git", "tag"] and "-d" not in cmd]
+    assert ["git", "tag", "-a", tag, source, "-m", f"Successful release {tag}"] in tag_creations
+    assert any(cmd[4] == temp_tag and cmd[5] == deployed for cmd in tag_creations if "-f" in cmd)
+    assert ["git", "push", "origin", f"refs/tags/{tag}"] in commands
+    assert ["git", "push", "bitbucket", f"refs/tags/{temp_tag}:refs/tags/{tag}"] in commands
+    assert ["git", "tag", "-d", temp_tag] in commands  # temp tag cleaned up
+
+
+def test_tag_successful_release_pushes_same_tag_when_exact(tmp_path, monkeypatch) -> None:
+    commands: list = []
+    monkeypatch.setattr(cli.subprocess, "run", _fake_git_subprocess(commands))
+    monkeypatch.delenv("BB_TOKEN", raising=False)
+    source = "a" * 40
+
+    tag = cli._tag_successful_release(tmp_path, source, deployment_commit=source)
+
+    assert ["git", "push", "bitbucket", f"refs/tags/{tag}"] in commands
+    assert not any("edge-deploy-mirror/" in part for cmd in commands for part in cmd)
+
+
+def test_resolve_release_tag_accepts_tree_equivalent_mirror(tmp_path, monkeypatch) -> None:
+    origin_sha = "a" * 40
+    bitbucket_sha = "d" * 40
+    tag = f"release-20260702T013000Z-{origin_sha[:7]}"
+    shas = {"origin": origin_sha, "bitbucket": bitbucket_sha}
+    monkeypatch.setattr(cli, "_remote_tag_sha", lambda root, remote, t: shas[remote])
+    commands: list = []
+    shared_tree = "7" * 40
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        _fake_git_subprocess(
+            commands,
+            {
+                f"refs/tags/{tag}^{{commit}}": origin_sha,
+                f"refs/edge-deploy/rollback/{tag}^{{tree}}": shared_tree,
+                f"{origin_sha}^{{tree}}": shared_tree,
+            },
+        ),
+    )
+
+    resolved = cli._resolve_release_tag(tmp_path, tag)
+
+    assert resolved == bitbucket_sha  # nodes fetch from bitbucket, so roll back to its commit
+    assert ["git", "update-ref", "-d", f"refs/edge-deploy/rollback/{tag}"] in commands
+
+
+def test_resolve_release_tag_rejects_tree_divergence(tmp_path, monkeypatch) -> None:
+    origin_sha = "a" * 40
+    bitbucket_sha = "d" * 40
+    tag = f"release-20260702T013000Z-{origin_sha[:7]}"
+    shas = {"origin": origin_sha, "bitbucket": bitbucket_sha}
+    monkeypatch.setattr(cli, "_remote_tag_sha", lambda root, remote, t: shas[remote])
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        _fake_git_subprocess(
+            [],
+            {
+                f"refs/tags/{tag}^{{commit}}": origin_sha,
+                f"refs/edge-deploy/rollback/{tag}^{{tree}}": "7" * 40,
+                f"{origin_sha}^{{tree}}": "8" * 40,
+            },
+        ),
+    )
+
+    with pytest.raises(cli.RepositoryError, match="not tree-equivalent"):
+        cli._resolve_release_tag(tmp_path, tag)
 
 
 # ---------------------------------------------------------------------------
