@@ -99,6 +99,29 @@ def test_activity_delays_stall_warning(tmp_path) -> None:
     assert not stall_messages
 
 
+def test_heartbeat_does_not_change_last_meaningful_output_timestamp(tmp_path) -> None:
+    clock = FakeClock()
+    tracker = ReleaseProgressTracker(
+        tmp_path,
+        heartbeat_interval_s=1.0,
+        stall_threshold_s=10.0,
+        clock=clock,
+        notify_fn=lambda _message: None,
+    )
+    tracker.start("dependency transfer", phase="dependency", tool="autobench", node="node03")
+    before = json.loads((tmp_path / "release-progress.json").read_text(encoding="utf-8"))
+    clock.advance(2)
+
+    tracker._maybe_heartbeat()
+
+    after = json.loads((tmp_path / "release-progress.json").read_text(encoding="utf-8"))
+    assert (
+        after["active"]["last_meaningful_output_at"]
+        == before["active"]["last_meaningful_output_at"]
+    )
+    assert after["inactive_s"] == 2.0
+
+
 def test_release_log_created_with_phase_transitions_and_redacts_secrets(tmp_path) -> None:
     tracker = ReleaseProgressTracker(tmp_path, notify_fn=lambda _message: None)
     secret = "s3cr3t-bearer-token"

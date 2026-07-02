@@ -7,6 +7,7 @@ the shared ``__RC_<nonce>_<code>__`` exit-code protocol still parses.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import call, patch
 
 from edge_deploy.config import NodeConfig
@@ -31,6 +32,28 @@ def test_from_node_and_profile_injects_profile_strategy(real_profile) -> None:
     assert driver.repo_path == real_profile.repo_path
     assert driver.tui_exit == real_profile.tui_exit
     assert driver.tui_chrome_regex == real_profile.tui_chrome_regex
+
+
+def test_authenticated_session_exposes_control_socket_for_scp(tmp_path: Path) -> None:
+    source = tmp_path / "bundle.zip"
+    source.write_bytes(b"bundle")
+    driver = TmuxDriver("user@edge", "sess", "/repo", ssh_options="-p 2222")
+
+    pane_command = driver._build_pane_command()
+    assert "ControlMaster=yes" in pane_command
+    assert "ControlPath=" in pane_command
+
+    with patch("edge_deploy.tmux_driver.subprocess.run") as run:
+        run.return_value.returncode = 0
+        run.return_value.stdout = ""
+        run.return_value.stderr = ""
+        driver.upload_file(source, "/remote/bundle.zip")
+
+    argv = run.call_args.args[0]
+    assert argv[0] == "scp"
+    assert any(str(item).startswith("ControlPath=") for item in argv)
+    assert str(source) in argv
+    assert "user@edge:/remote/bundle.zip" in argv
 
 
 def test_dispatch_dynamic_quits_from_dashboard_top() -> None:

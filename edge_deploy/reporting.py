@@ -121,11 +121,11 @@ def write_report(path: str | Path, report: OperationReport) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Consolidated release report (edge-deploy/release/1)
+# Consolidated release report (edge-deploy/release/2)
 # ---------------------------------------------------------------------------
 
 # The schema identifier embedded in every consolidated release report.
-RELEASE_SCHEMA = "edge-deploy/release/1"
+RELEASE_SCHEMA = "edge-deploy/release/2"
 
 # Rollout pair statuses that count as actionable failures for the exit code (ADR-0003).
 _FAILED_ROLLOUT_STATUSES = ("failed", "refused")
@@ -148,7 +148,7 @@ def _resume_action(rollout: dict[str, Any]) -> str:
 
 @dataclass
 class ReleaseReport:
-    """The consolidated ``edge-deploy/release/1`` report for one Release run.
+    """The consolidated ``edge-deploy/release/2`` report for one Release run.
 
     Embeds compact per-Publish and per-Rollout summaries (the detailed per-(tool×node)
     :class:`OperationReport` files are referenced via each rollout's ``report_path``).
@@ -211,7 +211,7 @@ class ReleaseReport:
                     "tool": rollout.get("tool", ""),
                     "node": rollout.get("node"),
                     "message": rollout.get("state_left", ""),
-                    "action": "run the offline bundle refresh first, then re-run the Release",
+                    "action": _resume_action(rollout),
                 })
             elif status == "skipped" and "snapshot" in state_left:
                 handoffs.append({

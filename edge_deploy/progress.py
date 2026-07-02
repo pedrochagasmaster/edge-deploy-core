@@ -21,6 +21,7 @@ class ActiveOperation:
     label: str
     started_at: float
     last_activity_at: float
+    last_meaningful_output_at: str
     tmux_session: str | None = None
     tool: str | None = None
     node: str | None = None
@@ -69,6 +70,7 @@ class ReleaseProgressTracker:
     def mark_activity(self) -> None:
         if self._active is not None:
             self._active.last_activity_at = self._clock()
+            self._active.last_meaningful_output_at = utc_iso_timestamp()
             self._stall_warned = False
 
     def start(self, label: str, *, phase: str = "release", tmux_session: str | None = None, **meta: Any) -> None:
@@ -78,6 +80,7 @@ class ReleaseProgressTracker:
             label=label,
             started_at=now,
             last_activity_at=now,
+            last_meaningful_output_at=utc_iso_timestamp(),
             tmux_session=tmux_session,
             tool=meta.get("tool"),
             node=meta.get("node"),
@@ -181,6 +184,7 @@ class ReleaseProgressTracker:
                 "tool": self._active.tool,
                 "node": self._active.node,
                 "tmux_session": self._active.tmux_session,
+                "last_meaningful_output_at": self._active.last_meaningful_output_at,
             }
             payload["inactive_s"] = round(self._inactive_s(), 1)
             if self._inactive_s() >= self.stall_threshold_s:

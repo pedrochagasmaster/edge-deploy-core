@@ -10,6 +10,7 @@ from __future__ import annotations
 from edge_deploy.auth import authenticate_node, authenticate_node_via_pane, ensure_kerberos
 from edge_deploy.config import (
     DEFAULT_OPERATOR_CONFIG_PATH,
+    DependencyBundleConfig,
     NodeConfig,
     OperatorConfig,
     SmokeCommands,
@@ -31,10 +32,11 @@ from edge_deploy.reporting import (
 from edge_deploy.tmux_driver import AuthenticationError, SessionGoneError, TmuxDriver
 from edge_deploy.verify import run_smoke, verify_after_rollout
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = [
     "DEFAULT_OPERATOR_CONFIG_PATH",
+    "DependencyBundleConfig",
     "NodeConfig",
     "OperatorConfig",
     "SmokeCommands",

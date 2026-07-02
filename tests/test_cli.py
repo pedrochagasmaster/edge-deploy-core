@@ -145,7 +145,7 @@ def test_parser_help_lists_all_subcommands(capsys) -> None:
 def test_parser_parses_release_args() -> None:
     args = cli.build_parser().parse_args(
         ["release", "--nodes", "03,04", "--auth-mode", "prompt",
-         "--smoke", "deep", "--fail-fast", "--report-dir", "out", "--max-auth-attempts", "5"]
+         "--smoke", "deep", "--fail-fast", "--no-local-check", "--report-dir", "out", "--max-auth-attempts", "5"]
     )
 
     assert args.command == "release"
@@ -154,6 +154,7 @@ def test_parser_parses_release_args() -> None:
     assert args.auth_mode == "prompt"
     assert args.smoke == "deep"
     assert args.fail_fast is True
+    assert args.no_local_check is True
     assert args.report_dir == "out"
     assert args.max_auth_attempts == 5
 
@@ -166,6 +167,7 @@ def test_parser_release_defaults() -> None:
     assert args.auth_mode == "auto"
     assert args.smoke == "standard"
     assert args.fail_fast is False
+    assert args.no_local_check is False
     assert args.max_auth_attempts == 3
     assert args.heartbeat_interval == 30.0
     assert args.stall_threshold == 300.0
@@ -353,11 +355,46 @@ def test_release_command_dispatches_and_writes_consolidated_report(tmp_path, mon
     assert selection.nodes == ["node03", "node04"]
     assert selection.smoke == "deep"
     assert selection.snapshot_by_tool == {}
+    assert selection.run_local_check is True
     assert captured["auth_mode"] == "pane"
     assert callable(captured["progress_fn"])
     assert captured["max_auth_attempts"] == 5
     assert (report_dir / "release.json").exists()
     assert "Release: passed" in capsys.readouterr().out
+
+
+def test_release_command_forwards_no_local_check(tmp_path, monkeypatch) -> None:
+    config_path = _write_operator_config_both(tmp_path)
+    captured: dict = {}
+
+    def fake_run_release(operator, selection, *, report_dir, max_auth_attempts, **kwargs) -> ReleaseReport:
+        captured["selection"] = selection
+        return ReleaseReport(
+            selection={"tools": selection.tools},
+            publishes=[{"tool": "autobench", "status": "published", "snapshot": "abc"}],
+            rollouts=[{"tool": "autobench", "node": "node03", "status": "rolled_out", "state_left": ""}],
+        )
+
+    monkeypatch.setattr(cli, "run_release", fake_run_release)
+    monkeypatch.setattr(cli, "_run_release_preflight", lambda *a, **k: SimpleNamespace(commit="a" * 40))
+    monkeypatch.setattr(cli, "_record_release_attempt", lambda *a, **k: "audit")
+    monkeypatch.setattr(cli, "_tag_successful_release", lambda *a, **k: "tag")
+
+    rc = cli.main(
+        [
+            "--config",
+            str(config_path),
+            "release",
+            "--tool",
+            "autobench",
+            "--report-dir",
+            str(tmp_path / "rep"),
+            "--no-local-check",
+        ]
+    )
+
+    assert rc == 0
+    assert captured["selection"].run_local_check is False
 
 
 def test_release_command_nonzero_exit_on_failure(tmp_path, monkeypatch) -> None:

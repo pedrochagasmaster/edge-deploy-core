@@ -115,6 +115,7 @@ class FakeTmuxDriver:
         self._fetch_script = list(fetch_script) if fetch_script else [(0, "")]
         self.sent_secrets: list[str] = []
         self.sent_keys: list[str] = []
+        self.uploads: list[tuple[Path, str]] = []
         self.start_session_calls: list[dict[str, Any]] = []
         self.await_timeouts: list[float | None] = []
         # Attributes the CLI/engine read directly off a driver.
@@ -135,6 +136,9 @@ class FakeTmuxDriver:
 
     def stop_session(self) -> None:
         return None
+
+    def upload_file(self, source: Path, remote_path: str) -> None:
+        self.uploads.append((Path(source), remote_path))
 
     def run_remote(self, command: str, *, timeout: float = 30.0, ensure_shell: bool = True) -> tuple[str, int]:
         self.commands.append(command)
@@ -200,6 +204,21 @@ class FakeTmuxDriver:
             return self._sentinel("", self._next_klist())
         if "base64 -d" in command:
             script = _decode_remote_python(command)
+            if "DEPENDENCY_STAGE_START" in script:
+                digest_match = re.search(r"expected_digest = '([0-9a-f]+)'", script)
+                digest = digest_match.group(1) if digest_match else "unknown"
+                body = (
+                    "DEPENDENCY_STAGE_START\n"
+                    + json.dumps(
+                        {
+                            "remote_dir": f"/ads_storage/test/.edge-deploy/bundles/tool/{digest}",
+                            "reused": False,
+                            "bundle_digest": digest,
+                        }
+                    )
+                    + "\nDEPENDENCY_STAGE_END"
+                )
+                return self._sentinel(body, 0)
             if "PERMISSION_PAYLOAD_START" in script:
                 body = (
                     "PERMISSION_PAYLOAD_START\n"
