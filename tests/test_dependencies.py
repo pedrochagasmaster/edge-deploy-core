@@ -176,11 +176,13 @@ def test_delivery_transfers_then_records_verified_remote_stage(tmp_path: Path) -
             self.calls: list[str] = []
             self.uploads: list[tuple[Path, str]] = []
 
-        def run_remote(self, command: str, *, timeout: float = 30) -> tuple[str, int]:
+        def run_remote(
+            self, command: str, *, timeout: float = 30, ensure_shell: bool = True
+        ) -> tuple[str, int]:
             self.calls.append(command)
-            if "base64 -d" in command:
-                if len([call for call in self.calls if "base64 -d" in call]) == 1:
-                    return "dependency stage missing", 1
+            if "EDGE_DEPLOY_REUSE_ONLY=1" in command:
+                return "dependency stage missing", 1
+            if command.endswith(".stage.py"):
                 return (
                     "DEPENDENCY_STAGE_START\n"
                     f'{{"remote_dir": "/ads_storage/test/.edge-deploy/bundles/demo/{bundle.digest}", '
@@ -200,12 +202,12 @@ def test_delivery_transfers_then_records_verified_remote_stage(tmp_path: Path) -
         bundle,
     )
 
-    assert driver.uploads == [
-        (
-            bundle.archive_path,
-            f"/ads_storage/$USER/.edge-deploy/bundles/demo/.incoming/{bundle.digest}.zip",
-        )
-    ]
+    assert len(driver.uploads) == 2
+    assert driver.uploads[0][1].endswith(f"/.incoming/{bundle.digest}.stage.py")
+    assert driver.uploads[1] == (
+        bundle.archive_path,
+        f"/ads_storage/$USER/.edge-deploy/bundles/demo/.incoming/{bundle.digest}.zip",
+    )
     assert delivered.reused is False
     assert delivered.remote_dir.endswith(bundle.digest)
 
@@ -226,8 +228,10 @@ def test_delivery_reuses_verified_remote_stage_without_upload(tmp_path: Path) ->
         def __init__(self) -> None:
             self.uploads: list[tuple[Path, str]] = []
 
-        def run_remote(self, command: str, *, timeout: float = 30) -> tuple[str, int]:
-            if "base64 -d" in command:
+        def run_remote(
+            self, command: str, *, timeout: float = 30, ensure_shell: bool = True
+        ) -> tuple[str, int]:
+            if "EDGE_DEPLOY_REUSE_ONLY=1" in command:
                 return (
                     "DEPENDENCY_STAGE_START\n"
                     f'{{"remote_dir": "/ads_storage/test/.edge-deploy/bundles/demo/{bundle.digest}", '
@@ -247,6 +251,7 @@ def test_delivery_reuses_verified_remote_stage_without_upload(tmp_path: Path) ->
         bundle,
     )
 
-    assert driver.uploads == []
+    assert len(driver.uploads) == 1
+    assert driver.uploads[0][1].endswith(f"/.incoming/{bundle.digest}.stage.py")
     assert delivered.reused is True
     assert delivered.remote_dir.endswith(bundle.digest)

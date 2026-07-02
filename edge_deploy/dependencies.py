@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import re
 import subprocess
 import sys
+import tempfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -306,6 +306,7 @@ from pathlib import Path
 archive = Path(os.path.expandvars({remote_archive!r}))
 root = Path("/ads_storage") / os.environ["USER"] / ".edge-deploy" / "bundles" / {bundle.tool!r}
 final = root / {bundle.digest!r}
+reuse_only = os.environ.get("EDGE_DEPLOY_REUSE_ONLY") == "1"
 expected_source = {bundle.source_sha!r}
 expected_digest = {bundle.digest!r}
 expected_archive = {bundle.archive_sha256!r}
@@ -341,6 +342,9 @@ if final.exists():
     archive.unlink(missing_ok=True)
     emit(True)
     raise SystemExit(0)
+
+if reuse_only:
+    raise SystemExit("dependency stage missing")
 
 size = archive.stat().st_size
 if shutil.disk_usage(root).free < max(size * 3, size + 512 * 1024 * 1024):
@@ -385,52 +389,6 @@ finally:
 """
 
 
-def _reuse_check_script(bundle: DependencyBundle) -> str:
-    expected_files = {
-        str(item["path"]): str(item["sha256"])
-        for item in bundle.manifest["files"]  # type: ignore[index]
-    }
-    return f"""
-import hashlib, json, os
-from pathlib import Path
-
-root = Path("/ads_storage") / os.environ["USER"] / ".edge-deploy" / "bundles" / {bundle.tool!r}
-final = root / {bundle.digest!r}
-expected_source = {bundle.source_sha!r}
-expected_digest = {bundle.digest!r}
-expected_files = {expected_files!r}
-
-def sha(path):
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-def emit(reused):
-    print("DEPENDENCY_STAGE_START")
-    print(json.dumps({{"remote_dir": str(final), "reused": reused, "bundle_digest": expected_digest}}))
-    print("DEPENDENCY_STAGE_END")
-
-if not final.exists():
-    raise SystemExit("dependency stage missing")
-manifest = json.loads((final / "manifest.json").read_text(encoding="utf-8"))
-if manifest.get("bundle_digest") != expected_digest or manifest.get("source_sha") != expected_source:
-    raise SystemExit("existing stage provenance mismatch")
-staged_files = {{
-    path.relative_to(final).as_posix()
-    for path in final.rglob("*")
-    if path.is_file()
-}}
-if staged_files != set(expected_files) | {{"manifest.json"}}:
-    raise SystemExit("existing stage file set mismatch")
-for name, digest in expected_files.items():
-    if sha(final / name) != digest:
-        raise SystemExit("existing stage checksum mismatch: " + name)
-emit(True)
-"""
-
-
 def _parse_stage_evidence(screen: str) -> dict[str, object] | None:
     match = re.search(r"DEPENDENCY_STAGE_START\s*(\{.*?\})\s*DEPENDENCY_STAGE_END", screen, re.DOTALL)
     if not match:
@@ -457,8 +415,20 @@ def deliver_dependency_bundle(
     )
     if code:
         raise BundleError(f"could not create remote bundle staging directory: {screen.strip()}")
-    reuse_script = _reuse_check_script(bundle)
-    reuse_encoded = base64.b64encode(reuse_script.encode("utf-8")).decode("ascii")
+    script = _stage_script(bundle, config, remote_archive=remote_archive)
+    remote_script = (
+        f"/ads_storage/$USER/.edge-deploy/bundles/{profile.tool}/"
+        f".incoming/{bundle.digest}.stage.py"
+    )
+    script_handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False)
+    local_script = Path(script_handle.name)
+    try:
+        with script_handle:
+            script_handle.write(script)
+        driver.upload_file(local_script, remote_script)  # type: ignore[attr-defined]
+    finally:
+        local_script.unlink(missing_ok=True)
+
     fallback = (
         "/sys_apps_01/python/python310/bin/python3.10"
         if config.python_version == "3.10"
@@ -466,23 +436,22 @@ def deliver_dependency_bundle(
     )
     python_expr = f"$(command -v python{config.python_version} || printf %s {fallback})"
     screen, code = driver.run_remote(  # type: ignore[attr-defined]
-        f"printf %s {reuse_encoded} | base64 -d | {python_expr} -",
+        f"EDGE_DEPLOY_REUSE_ONLY=1 {python_expr} {remote_script}",
         timeout=300,
     )
     if code == 0:
         evidence = _parse_stage_evidence(screen)
         if evidence is None:
             raise BundleError("remote dependency reuse returned no provenance")
+        driver.run_remote(f"rm -f {remote_script}", timeout=30, ensure_shell=False)  # type: ignore[attr-defined]
         return DeliveredBundle(
             remote_dir=str(evidence["remote_dir"]),
             reused=bool(evidence["reused"]),
             evidence=evidence,
         )
     driver.upload_file(bundle.archive_path, remote_archive)  # type: ignore[attr-defined]
-    script = _stage_script(bundle, config, remote_archive=remote_archive)
-    encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
     screen, code = driver.run_remote(  # type: ignore[attr-defined]
-        f"printf %s {encoded} | base64 -d | {python_expr} -",
+        f"{python_expr} {remote_script}",
         timeout=900,
     )
     if code:
@@ -490,6 +459,7 @@ def deliver_dependency_bundle(
     evidence = _parse_stage_evidence(screen)
     if evidence is None:
         raise BundleError("remote dependency verification returned no provenance")
+    driver.run_remote(f"rm -f {remote_script}", timeout=30, ensure_shell=False)  # type: ignore[attr-defined]
     return DeliveredBundle(
         remote_dir=str(evidence["remote_dir"]),
         reused=bool(evidence["reused"]),
