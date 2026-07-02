@@ -37,7 +37,8 @@ def test_from_node_and_profile_injects_profile_strategy(real_profile) -> None:
 def test_authenticated_session_exposes_control_socket_for_scp(tmp_path: Path) -> None:
     source = tmp_path / "bundle.zip"
     source.write_bytes(b"bundle")
-    driver = TmuxDriver("user@edge", "sess", "/repo", ssh_options="-p 2222")
+    with patch.dict("edge_deploy.tmux_driver.os.environ", {"EDGE_DEPLOY_SSH_MULTIPLEX": "1"}):
+        driver = TmuxDriver("user@edge", "sess", "/repo", ssh_options="-p 2222")
 
     pane_command = driver._build_pane_command()
     assert "ControlMaster=yes" in pane_command
@@ -54,6 +55,34 @@ def test_authenticated_session_exposes_control_socket_for_scp(tmp_path: Path) ->
     assert any(str(item).startswith("ControlPath=") for item in argv)
     assert str(source) in argv
     assert "user@edge:/remote/bundle.zip" in argv
+
+
+def test_disabled_multiplex_session_omits_control_master_and_uploads_via_authenticated_pane(tmp_path: Path) -> None:
+    source = tmp_path / "bundle.zip"
+    source.write_bytes(b"bundle")
+    with patch.dict("edge_deploy.tmux_driver.os.environ", {"EDGE_DEPLOY_SSH_MULTIPLEX": "0"}):
+        driver = TmuxDriver("user@edge", "sess", "/repo", ssh_options="-p 2222")
+
+    pane_command = driver._build_pane_command()
+    assert "ControlMaster=yes" not in pane_command
+    assert "ControlPath=" not in pane_command
+
+    commands: list[str] = []
+
+    def fake_run_remote(command: str, **kwargs: object) -> tuple[str, int]:
+        commands.append(command)
+        return "", 0
+
+    with (
+        patch.object(driver, "run_remote", side_effect=fake_run_remote),
+        patch("edge_deploy.tmux_driver.subprocess.run") as run,
+    ):
+        driver.upload_file(source, "/remote/bundle.zip")
+
+    run.assert_not_called()
+    assert commands[0].startswith("mkdir -p /remote")
+    assert any("cat >> /remote/bundle.zip.edge-deploy-" in command for command in commands)
+    assert any("base64.b64decode" in command for command in commands)
 
 
 def test_dispatch_dynamic_quits_from_dashboard_top() -> None:
