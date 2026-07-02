@@ -384,9 +384,10 @@ def _run_release_preflight(
         expected_bitbucket=profile.bitbucket_url,
     )
     require_successful_github_ci(state)
-    completed = subprocess.run([sys.executable, "-m", "pytest"], cwd=repo_root)
+    pytest_command = [sys.executable, "-m", "pytest", "-n", "8", "--dist", "loadfile"]
+    completed = subprocess.run(pytest_command, cwd=repo_root)
     if completed.returncode:
-        raise RuntimeError("python -m pytest failed; release blocked")
+        raise RuntimeError("python -m pytest -n 8 --dist loadfile failed; release blocked")
     if not operator.audit_repo:
         raise AuditSyncError("operator config must define audit_repo")
     check_audit_remote(

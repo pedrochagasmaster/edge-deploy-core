@@ -21,7 +21,9 @@ of being hardcoded Dispatch constants.
 
 from __future__ import annotations
 
+import base64
 import os
+import posixpath
 import re
 import shlex
 import subprocess
@@ -33,6 +35,22 @@ from pathlib import Path
 
 # Matches an ANSI escape sequence so screen text can be inspected as plain text.
 _ANSI_RE = r"\x1b\[[0-9;?]*[ -/]*[@-~]"
+
+
+def _ssh_multiplex_enabled() -> bool:
+    """Return whether OpenSSH ControlMaster should be used for the pane.
+
+    Windows OpenSSH/psmux can fail the control socket handshake with
+    ``getsockname failed: Not a socket``. Keep multiplexing as the default on
+    POSIX, allow operators to force either mode, and default Windows to the
+    authenticated-pane transport.
+    """
+    value = os.environ.get("EDGE_DEPLOY_SSH_MULTIPLEX", "").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return os.name != "nt"
 # A bash/sh *primary* prompt at the end of a line (``$`` or ``#``). The ``>`` PS2
 # continuation prompt is intentionally excluded: treating it as a real prompt would let
 # the harness append commands onto a dangling, unterminated line instead of recognising
@@ -120,6 +138,7 @@ class TmuxDriver:
         self.retry_backoff = retry_backoff
         socket_id = sha256(f"{host}\0{session}".encode("utf-8")).hexdigest()[:16]
         self.control_path = Path(tempfile.gettempdir()) / f"edge-deploy-{socket_id}.sock"
+        self.use_ssh_multiplex = _ssh_multiplex_enabled()
 
     @classmethod
     def from_node_and_profile(
@@ -179,16 +198,18 @@ class TmuxDriver:
         PTY allocation so the remote login shell is fully interactive (correct prompt, job
         control, readline, etc.).
         """
-        ssh_parts = [
-            "ssh",
-            "-t",
-            "-o",
-            "ControlMaster=yes",
-            "-o",
-            f"ControlPath={self.control_path}",
-            "-o",
-            "ControlPersist=no",
-        ]
+        ssh_parts = ["ssh", "-t"]
+        if self.use_ssh_multiplex:
+            ssh_parts.extend(
+                [
+                    "-o",
+                    "ControlMaster=yes",
+                    "-o",
+                    f"ControlPath={self.control_path}",
+                    "-o",
+                    "ControlPersist=no",
+                ]
+            )
         if self.ssh_options:
             ssh_parts.extend(shlex.split(self.ssh_options))
         ssh_parts.append(self.host)
@@ -320,6 +341,9 @@ class TmuxDriver:
 
     def upload_file(self, source: str | Path, remote_path: str) -> None:
         """Copy a file over the already-authenticated SSH master connection."""
+        if not self.use_ssh_multiplex:
+            self._upload_file_via_pane(source, remote_path)
+            return
         completed = subprocess.run(
             [
                 "scp",
@@ -335,6 +359,43 @@ class TmuxDriver:
         if completed.returncode:
             detail = (completed.stderr or completed.stdout).strip()
             raise RuntimeError(f"authenticated bundle transfer failed: {detail}")
+
+    def _upload_file_via_pane(self, source: str | Path, remote_path: str) -> None:
+        """Copy a file through the authenticated tmux pane when scp multiplexing is unavailable."""
+        source_path = Path(source)
+        encoded = base64.b64encode(source_path.read_bytes()).decode("ascii")
+        remote_dir = posixpath.dirname(remote_path) or "."
+        upload_id = uuid.uuid4().hex[:12]
+        remote_b64 = f"{remote_path}.edge-deploy-{upload_id}.b64"
+        mkdir_cmd = f"mkdir -p {shlex.quote(remote_dir)} && rm -f {shlex.quote(remote_b64)}"
+        _screen, rc = self.run_remote(mkdir_cmd, timeout=60.0)
+        if rc:
+            raise RuntimeError(f"authenticated bundle transfer failed: could not prepare {remote_dir}")
+
+        marker = f"__EDGE_DEPLOY_UPLOAD_{upload_id}__"
+        chunk_size = 32768
+        for offset in range(0, len(encoded), chunk_size):
+            chunk = encoded[offset : offset + chunk_size]
+            append_cmd = f"cat >> {shlex.quote(remote_b64)} <<'{marker}'\n{chunk}\n{marker}"
+            _screen, rc = self.run_remote(append_cmd, timeout=120.0)
+            if rc:
+                raise RuntimeError(f"authenticated bundle transfer failed: could not write {remote_b64}")
+
+        decode_script = (
+            "python3 - <<'PY'\n"
+            "import base64, pathlib\n"
+            f"source = pathlib.Path({remote_b64!r})\n"
+            f"target = pathlib.Path({remote_path!r})\n"
+            "target.parent.mkdir(parents=True, exist_ok=True)\n"
+            "target.write_bytes(base64.b64decode(source.read_text(encoding='ascii')))\n"
+            "source.unlink(missing_ok=True)\n"
+            "PY"
+        )
+        _screen, rc = self.run_remote(decode_script, timeout=300.0)
+        if rc:
+            cleanup_cmd = f"rm -f {shlex.quote(remote_b64)}"
+            self.run_remote(cleanup_cmd, timeout=30.0, ensure_shell=False)
+            raise RuntimeError(f"authenticated bundle transfer failed: could not decode {remote_path}")
 
     # ------------------------------------------------------------------
     # Pane control (local tmux)
