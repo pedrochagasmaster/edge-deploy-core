@@ -1,4 +1,4 @@
-#Requires -Version 7
+#Requires -Version 5.1
 
 param(
     [Parameter(Mandatory)]
@@ -247,7 +247,7 @@ function Get-PullRequestBody {
     if ($ReleaseKind -eq 'no-deps') {
         return @"
 ## Validation
-- pwsh -NoProfile -File tools/dev/local_check.ps1
+- powershell -NoProfile -File tools/dev/local_check.ps1
 
 ## Release risk
 Cosmetic Python comment only. No runtime or dependency behavior changes.
@@ -256,7 +256,7 @@ Cosmetic Python comment only. No runtime or dependency behavior changes.
 
     return @"
 ## Validation
-- pwsh -NoProfile -File tools/dev/local_check.ps1
+- powershell -NoProfile -File tools/dev/local_check.ps1
 - Effective non-comment requirements compared before and after
 - Bumps edge-deploy-core release extra pin from v1.1.0 to v1.2.0
 
@@ -409,7 +409,7 @@ try {
     Write-Host ''
     Write-Host '==> Local validation' -ForegroundColor Cyan
 
-    pwsh -NoProfile -File tools/dev/local_check.ps1
+    powershell -NoProfile -File tools/dev/local_check.ps1
     Assert-CommandPassed 'Local validation (tools/dev/local_check.ps1)'
 
     git diff --check
