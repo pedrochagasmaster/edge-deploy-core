@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import socket
 import subprocess
 import sys
 from dataclasses import replace
@@ -22,16 +23,20 @@ from edge_deploy.auth import authenticate_node, authenticate_node_via_pane
 from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, OperatorConfig, load_tool_profile
 from edge_deploy.ledger import LedgerError, RunLedger
 from edge_deploy.mirror import MirrorError, mirror_release
-from edge_deploy.phases import PHASE_REGISTRY, EngineMismatchError
-from edge_deploy.phases.verify import ensure_verified
-from edge_deploy.posture import PostureError
+from edge_deploy.phases import PHASE_REGISTRY, EngineMismatchError, enter_phase
+from edge_deploy.phases.deploy import run_deploy
+from edge_deploy.phases.publish import run_publish_phase
+from edge_deploy.phases.tag import _cmd_tag_bitbucket, _cmd_tag_github
+from edge_deploy.phases.verify import VERIFY_SPEC, ensure_verified
+from edge_deploy.posture import PHASE_ENDPOINTS, PostureError, SocketConnector, endpoints_for, probe
 from edge_deploy.publish import PublishError, publish_snapshot
-from edge_deploy.release import ReleaseSelection, resolve_nodes, run_release
-from edge_deploy.reporting import OperationReport, redact, write_release_report, write_report
+from edge_deploy.release import resolve_nodes
+from edge_deploy.reporting import OperationReport, redact, write_report
 from edge_deploy.repository import RepositoryError, inspect_repository
 from edge_deploy.tmux_driver import AuthenticationError, SessionGoneError, TmuxDriver
 
 TOOL_CHOICES = ("autobench", "robocop")
+RELEASE_PHASES = ("verify", "publish", "deploy", "tag_github", "tag_bitbucket")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -173,43 +178,165 @@ def _print_open_run_refusal(run: dict) -> None:
     print(f'  2. abandon it:    python -m edge_deploy abandon --run {run_id} --reason "<why>"')
 
 
-def _snapshot_by_tool_from_ledger(ledger: RunLedger, tool: str) -> dict[str, str]:
-    evidence = ledger.state["phases"]["publish"]["evidence"]
-    snapshot_sha = evidence.get("snapshot_sha")
-    if snapshot_sha:
-        return {tool: str(snapshot_sha)}
-    return {}
+def _deploy_auth_mode(auth_mode: str) -> str:
+    if auth_mode == "pane" or (auth_mode == "auto" and not sys.stdin.isatty()):
+        return "pane"
+    return "prompt"
 
 
-def _mirror_publish_evidence(ledger: RunLedger, report, source_commit: str) -> None:
-    for item in report.publishes:
-        if item.get("status") != "published":
-            continue
-        snapshot = item.get("snapshot")
-        if not snapshot:
-            continue
-        ledger.set_phase(
-            "publish",
-            "passed",
-            evidence={
-                "snapshot_sha": str(snapshot),
-                "source_commit": str(item.get("source_commit") or source_commit),
-            },
+def _phase_already_passed(ledger: RunLedger, phase: str, requested_nodes: list[str]) -> bool:
+    if phase == "deploy":
+        return all(ledger.phase_state("deploy", node=node) == "passed" for node in requested_nodes)
+    return ledger.phase_state(phase) == "passed"
+
+
+def _posture_blocks_phase(
+    phase: str,
+    operator: OperatorConfig,
+    run_id: str,
+    *,
+    connect: SocketConnector | None = None,
+) -> bool:
+    connector = connect or socket.create_connection
+    unreachable = probe(endpoints_for(phase, operator), connect=connector)
+    if not unreachable:
+        return False
+    posture_keys = ", ".join(PHASE_ENDPOINTS[phase])
+    unreachable_hosts = ", ".join(f"{endpoint.host}:{endpoint.port}" for endpoint in unreachable)
+    next_command = f"python -m edge_deploy release --run {run_id}"
+    print(
+        f"phase '{phase}' requires posture [{posture_keys}]; unreachable: {unreachable_hosts}.\n"
+        f"Switch the firewall posture, then re-run: {next_command}"
+    )
+    return True
+
+
+def _run_verify_phase(
+    operator: OperatorConfig,
+    profile,
+    repo_root: Path,
+    ledger: RunLedger,
+    *,
+    force_lock: bool,
+    repo_state=None,
+    connect: SocketConnector | None = None,
+) -> int:
+    run_id = ledger.state["run_id"]
+    next_command = f"python -m edge_deploy verify --run {run_id}"
+    connector = connect or socket.create_connection
+    stack = enter_phase(
+        VERIFY_SPEC,
+        operator,
+        ledger,
+        next_command=next_command,
+        force_lock=force_lock,
+        connect=connector,
+    )
+    try:
+        ensure_verified(
+            operator,
+            profile,
+            repo_root,
+            ledger,
+            reverify=False,
+            repo_state=repo_state,
         )
+        return 0
+    except (RepositoryError, RuntimeError) as exc:
+        print(f"verify failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        stack.close()
 
 
-def _print_release_summary(report, consolidated_path: Path) -> None:
-    summary = report.summary()
-    counts = summary["counts"]
-    print(f"Release: {summary['overall']}")
-    print("counts: " + ", ".join(f"{key}={value}" for key, value in counts.items()))
-    for handoff in summary["handoffs"]:
-        node = handoff.get("node") or "-"
-        print(redact(
-            f"[handoff:{handoff['kind']}] {handoff.get('tool', '')}/{node}: "
-            f"{handoff['message']} -> {handoff['action']}"
-        ))
-    print(f"Consolidated report: {consolidated_path}")
+def _invoke_release_phase(
+    phase: str,
+    args: argparse.Namespace,
+    operator: OperatorConfig,
+    ledger: RunLedger,
+    *,
+    repo_root: Path,
+    profile,
+    effective_operator: OperatorConfig,
+    node_names: list[str],
+    repo_state=None,
+    connect: SocketConnector | None = None,
+) -> int:
+    run_id = ledger.state["run_id"]
+    connector = connect or socket.create_connection
+    if phase == "verify":
+        return _run_verify_phase(
+            effective_operator,
+            profile,
+            repo_root,
+            ledger,
+            force_lock=args.force_lock,
+            repo_state=repo_state,
+            connect=connector,
+        )
+    if phase == "publish":
+        return run_publish_phase(
+            ledger,
+            effective_operator,
+            repo_root,
+            no_local_check=args.no_local_check,
+            force_lock=args.force_lock,
+        )
+    if phase == "deploy":
+        deploy_args = argparse.Namespace(
+            run=run_id,
+            nodes=args.nodes,
+            smoke=args.smoke,
+            auth_mode=_deploy_auth_mode(args.auth_mode),
+            auth_wait_seconds=args.auth_wait_seconds,
+            force_lock=args.force_lock,
+        )
+        return run_deploy(deploy_args, operator)
+    if phase == "tag_github":
+        tag_args = argparse.Namespace(run=run_id, force_lock=args.force_lock)
+        return _cmd_tag_github(tag_args, operator)
+    if phase == "tag_bitbucket":
+        tag_args = argparse.Namespace(run=run_id, force_lock=args.force_lock)
+        return _cmd_tag_bitbucket(tag_args, operator)
+    raise ValueError(f"unknown release phase: {phase}")
+
+
+def _chain_release_phases(
+    args: argparse.Namespace,
+    operator: OperatorConfig,
+    ledger: RunLedger,
+    *,
+    repo_root: Path,
+    profile,
+    effective_operator: OperatorConfig,
+    node_names: list[str],
+    repo_state=None,
+    connect: SocketConnector | None = None,
+) -> int:
+    run_id = ledger.state["run_id"]
+    connector = connect or socket.create_connection
+    for phase in RELEASE_PHASES:
+        if _phase_already_passed(ledger, phase, node_names):
+            continue
+        if _posture_blocks_phase(phase, effective_operator, run_id, connect=connector):
+            return 0
+        code = _invoke_release_phase(
+            phase,
+            args,
+            operator,
+            ledger,
+            repo_root=repo_root,
+            profile=profile,
+            effective_operator=effective_operator,
+            node_names=node_names,
+            repo_state=repo_state,
+            connect=connector,
+        )
+        if code != 0:
+            return code
+        ledger = RunLedger.load(ledger.run_dir)
+    print(f"release complete: {run_id}")
+    return 0
 
 
 def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
@@ -219,7 +346,6 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
     profile = load_tool_profile(repo_root)
     if args.tool and args.tool != profile.tool:
         raise ValueError(f"--tool {args.tool!r} does not match checkout profile {profile.tool!r}")
-    tools = [profile.tool]
     effective_operator = replace(operator, tools={profile.tool: str(repo_root)})
     node_names = resolve_nodes(effective_operator, args.nodes)
     runs_root = _runs_root(repo_root)
@@ -249,61 +375,23 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
             nodes=node_names,
             operator=operator.operator_email,
         )
-    report_dir = ledger.run_dir
-    snapshot_by_tool = _snapshot_by_tool_from_ledger(ledger, profile.tool)
-    selection = ReleaseSelection(
-        tools=tools,
-        nodes=node_names,
-        snapshot=None,
-        snapshot_by_tool=snapshot_by_tool,
-        smoke=args.smoke,
-        fail_fast=args.fail_fast,
-        run_local_check=not args.no_local_check,
-    )
-    with ledger.locked(force=args.force_lock):
-        if repo_state is None:
-            repo_state = inspect_repository(
-                repo_root,
-                tool=profile.tool,
-                expected_origin=profile.github_url,
-                expected_bitbucket=profile.bitbucket_url,
-            )
-        state = _run_release_preflight(
-            effective_operator,
-            profile,
+    if repo_state is None:
+        repo_state = inspect_repository(
             repo_root,
-            node_names,
-            ledger,
-            auth_mode=args.auth_mode,
-            max_auth_attempts=args.max_auth_attempts,
-            auth_wait_seconds=args.auth_wait_seconds,
-            repo_state=repo_state,
+            tool=profile.tool,
+            expected_origin=profile.github_url,
+            expected_bitbucket=profile.bitbucket_url,
         )
-        report = run_release(
-            effective_operator,
-            selection,
-            report_dir=report_dir,
-            max_auth_attempts=args.max_auth_attempts,
-            auth_mode="pane",
-            auth_wait_seconds=args.auth_wait_seconds,
-            heartbeat_interval_s=args.heartbeat_interval,
-            stall_threshold_s=args.stall_threshold,
-            progress_fn=lambda message: print(redact(f"[release] {message}")),
-        )
-        _mirror_publish_evidence(ledger, report, state.commit)
-        consolidated_path = write_release_report(report_dir / "release.json", report)
-        _print_release_summary(report, consolidated_path)
-        return report.exit_code()
-
-
-def _deployment_commit_for_tool(report, tool: str, snapshot_by_tool: dict[str, str]) -> str | None:
-    """The commit actually pushed to the tool's Bitbucket main for this release, if known."""
-    if snapshot_by_tool.get(tool):
-        return snapshot_by_tool[tool]
-    for item in report.publishes:
-        if item.get("tool") == tool and item.get("snapshot"):
-            return str(item["snapshot"])
-    return None
+    return _chain_release_phases(
+        args,
+        operator,
+        ledger,
+        repo_root=repo_root,
+        profile=profile,
+        effective_operator=effective_operator,
+        node_names=node_names,
+        repo_state=repo_state,
+    )
 
 
 def _remote_tag_sha(repo_root: Path, remote: str, tag: str) -> str:
@@ -423,59 +511,34 @@ def _cmd_rollback(args: argparse.Namespace, operator: OperatorConfig) -> int:
         rollback_tag=args.tag,
     )
     report_dir = ledger.run_dir
-    with ledger.locked(force=args.force_lock):
-        _write_rollback_publish_provenance(
-            report_dir,
-            tool=profile.tool,
-            source_sha=source,
-            snapshot_sha=target,
-            tag=args.tag,
-        )
-        ledger.set_phase(
-            "publish",
-            "passed",
-            evidence={"snapshot_sha": target, "source_commit": source},
-        )
-        _run_release_preflight(
-            effective_operator,
-            profile,
-            repo_root,
-            node_names,
-            ledger,
-            auth_mode=args.auth_mode,
-            max_auth_attempts=args.max_auth_attempts,
-            auth_wait_seconds=args.auth_wait_seconds,
-        )
-        report = run_release(
-            effective_operator,
-            ReleaseSelection(
-                tools=[profile.tool],
-                nodes=node_names,
-                snapshot=target,
-                snapshot_by_tool={profile.tool: target},
-                smoke=args.smoke,
-            ),
-            report_dir=report_dir,
-            max_auth_attempts=args.max_auth_attempts,
-            auth_mode="pane",
-            auth_wait_seconds=args.auth_wait_seconds,
-            heartbeat_interval_s=args.heartbeat_interval,
-            stall_threshold_s=args.stall_threshold,
-            progress_fn=lambda message: print(redact(f"[rollback] {message}")),
-        )
-        consolidated_path = write_release_report(report_dir / "release.json", report)
-        _record_release_attempt(
-            effective_operator,
-            profile.tool,
-            target,
-            report_dir,
-            report.summary()["overall"],
-            linked_attempt=args.tag,
-        )
-        if report.exit_code() == 0:
-            ledger.complete()
-        _print_release_summary(report, consolidated_path)
-        return report.exit_code()
+    _write_rollback_publish_provenance(
+        report_dir,
+        tool=profile.tool,
+        source_sha=source,
+        snapshot_sha=target,
+        tag=args.tag,
+    )
+    ledger.set_phase(
+        "publish",
+        "passed",
+        evidence={"snapshot_sha": target, "source_commit": source},
+    )
+    repo_state = inspect_repository(
+        repo_root,
+        tool=profile.tool,
+        expected_origin=profile.github_url,
+        expected_bitbucket=profile.bitbucket_url,
+    )
+    return _chain_release_phases(
+        args,
+        operator,
+        ledger,
+        repo_root=repo_root,
+        profile=profile,
+        effective_operator=effective_operator,
+        node_names=node_names,
+        repo_state=repo_state,
+    )
 
 
 def _run_release_preflight(
@@ -537,93 +600,6 @@ def _record_release_attempt(
         linked_attempt=linked_attempt,
     )
     return append_audit_attempt(Path(operator.audit_repo), attempt)
-
-
-def _tag_push_handoff_lines(tag: str, source_commit: str, deployment_commit: str | None = None) -> list[str]:
-    deployed = deployment_commit or source_commit
-    lines = [
-        "# Edge Deploy release tag handoff",
-        '$ErrorActionPreference = "Stop"',
-        "",
-        "# Phase 1: switch firewall/network posture to GitHub access.",
-        f"git push origin refs/tags/{tag}",
-        'if ($LASTEXITCODE -ne 0) { throw "GitHub tag push failed" }',
-        f'$githubRows = @(git ls-remote --exit-code --tags origin "refs/tags/{tag}^{{}}")',
-        'if ($LASTEXITCODE -ne 0) { throw "GitHub tag verification query failed" }',
-        'if ($githubRows.Count -eq 0) { throw "GitHub tag verification returned no rows" }',
-        r"$githubCommit = ($githubRows[0] -split '\s+')[0]",
-        f'if ($githubCommit -ne "{source_commit}") {{',
-        f'    throw "GitHub tag resolved to $githubCommit; expected {source_commit}"',
-        "}",
-        "",
-        "# Phase 2: switch firewall/network posture to Bitbucket/Edge access.",
-        (
-            'if ([string]::IsNullOrWhiteSpace($env:BB_TOKEN)) '
-            '{ throw "BB_TOKEN is required for Bitbucket tag finalization" }'
-        ),
-    ]
-    if deployed == source_commit:
-        lines.extend(
-            [
-                (
-                    'git -c "http.extraHeader=Authorization: Bearer $env:BB_TOKEN" '
-                    f"push bitbucket refs/tags/{tag}"
-                ),
-                'if ($LASTEXITCODE -ne 0) { throw "Bitbucket tag push failed" }',
-            ]
-        )
-    else:
-        temp_tag = f"edge-deploy-mirror/{tag}"
-        message = f"Successful release {tag} (source {source_commit}) [edge-deploy]"
-        lines.extend(
-            [
-                f'git tag -a -f {temp_tag} {deployed} -m "{message}"',
-                'if ($LASTEXITCODE -ne 0) { throw "Temporary Bitbucket tag creation failed" }',
-                (
-                    'git -c "http.extraHeader=Authorization: Bearer $env:BB_TOKEN" '
-                    f"push bitbucket refs/tags/{temp_tag}:refs/tags/{tag}"
-                ),
-                'if ($LASTEXITCODE -ne 0) { throw "Bitbucket tag push failed" }',
-            ]
-        )
-    lines.extend(
-        [
-            (
-                '$bitbucketRows = @(git -c '
-                '"http.extraHeader=Authorization: Bearer $env:BB_TOKEN" '
-                f'ls-remote --exit-code --tags bitbucket "refs/tags/{tag}^{{}}")'
-            ),
-            'if ($LASTEXITCODE -ne 0) { throw "Bitbucket tag verification query failed" }',
-            'if ($bitbucketRows.Count -eq 0) { throw "Bitbucket tag verification returned no rows" }',
-            r"$bitbucketCommit = ($bitbucketRows[0] -split '\s+')[0]",
-            f'if ($bitbucketCommit -ne "{deployed}") {{',
-            f'    throw "Bitbucket tag resolved to $bitbucketCommit; expected {deployed}"',
-            "}",
-        ]
-    )
-    if deployed != source_commit:
-        lines.extend(
-            [
-                f"git tag -d edge-deploy-mirror/{tag}",
-                'if ($LASTEXITCODE -ne 0) { throw "Temporary Bitbucket tag cleanup failed" }',
-            ]
-        )
-    return lines
-
-
-def _write_tag_push_handoff(
-    report_dir: Path,
-    *,
-    tag: str,
-    source_commit: str,
-    deployment_commit: str | None = None,
-) -> Path:
-    path = report_dir / f"push-{tag}.ps1"
-    path.write_text(
-        "\n".join(_tag_push_handoff_lines(tag, source_commit, deployment_commit)) + "\n",
-        encoding="utf-8",
-    )
-    return path
 
 
 def _cmd_abandon(args: argparse.Namespace, operator: OperatorConfig) -> int:
