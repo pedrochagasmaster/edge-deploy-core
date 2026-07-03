@@ -15,6 +15,7 @@ from edge_deploy.runner import (
     RunnerProtocolError,
     bootstrap_runner,
     read_remote_json,
+    read_remote_text,
     run_step,
     runner_sha256,
 )
@@ -135,6 +136,23 @@ def test_run_step_composes_runner_command_line() -> None:
     assert result == step_payload
     assert driver.commands[0] == f"sh {runner_path} {run_id} {step_name} {encoded}"
     assert json_path in driver.commands[1]
+
+
+def test_read_remote_text_survives_wrapped_base64() -> None:
+    remote_path = "~/.edge-deploy/runs/run-1/steps/git-diff-data.txt"
+    text = "benchmark.py\npyproject.toml\n"
+    content = text.encode("utf-8")
+    digest = hashlib.sha256(content).hexdigest()
+    wrapped = _wrap_base64(base64.b64encode(content).decode("ascii"))
+    screen = (
+        f"\n__EDGE_RESULT_START__\n"
+        f"{wrapped}\n"
+        f"__EDGE_RESULT_SHA_{digest}__\n"
+        f"__EDGE_RESULT_END__\n"
+    )
+    driver = ScriptedDriver(screens=[screen])
+
+    assert read_remote_text(driver, remote_path) == text
 
 
 def test_bootstrap_runner_target_path_embeds_version_and_digest() -> None:

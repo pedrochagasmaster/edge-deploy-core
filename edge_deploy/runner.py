@@ -82,7 +82,7 @@ def bootstrap_runner(driver: TmuxDriver, run_id: str) -> str:
     return remote_path
 
 
-def read_remote_json(driver: TmuxDriver, remote_path: str) -> dict:
+def _read_remote_bytes(driver: TmuxDriver, remote_path: str) -> bytes:
     command = (
         "printf '\\n__EDGE_RESULT_START__\\n'; "
         f"base64 -w0 {remote_path}; "
@@ -114,7 +114,18 @@ def read_remote_json(driver: TmuxDriver, remote_path: str) -> dict:
     actual = hashlib.sha256(decoded).hexdigest()
     if actual != expected:
         raise RunnerProtocolError(f"remote result digest mismatch for {remote_path}")
+    return decoded
 
+
+def read_remote_text(driver: TmuxDriver, remote_path: str) -> str:
+    try:
+        return _read_remote_bytes(driver, remote_path).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RunnerProtocolError(f"invalid UTF-8 in remote read for {remote_path}") from exc
+
+
+def read_remote_json(driver: TmuxDriver, remote_path: str) -> dict:
+    decoded = _read_remote_bytes(driver, remote_path)
     try:
         payload = json.loads(decoded.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
