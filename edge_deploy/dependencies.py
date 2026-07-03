@@ -353,7 +353,7 @@ def deliver_dependency_bundle(
     )
     if code:
         raise BundleError(f"could not create remote bundle staging directory: {screen.strip()}")
-    driver.upload_file(bundle.archive_path, remote_archive)  # type: ignore[attr-defined]
+    _archive_digest = driver.upload_file(bundle.archive_path, remote_archive)  # type: ignore[attr-defined]
     script = _stage_script(bundle, config, remote_archive=remote_archive)
     encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
     fallback = (

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import zipfile
 from pathlib import Path
@@ -147,8 +148,9 @@ def test_delivery_transfers_then_records_verified_remote_stage(tmp_path: Path) -
                 )
             return "", 0
 
-        def upload_file(self, source: Path, remote_path: str) -> None:
+        def upload_file(self, source: Path, remote_path: str) -> str:
             self.uploads.append((source, remote_path))
+            return hashlib.sha256(source.read_bytes()).hexdigest()
 
     driver = Driver()
     delivered = deliver_dependency_bundle(
