@@ -246,7 +246,7 @@ def test_parser_help_lists_all_subcommands(capsys) -> None:
 def test_parser_parses_release_args() -> None:
     args = cli.build_parser().parse_args(
         ["release", "--nodes", "03,04", "--auth-mode", "prompt",
-         "--smoke", "deep", "--fail-fast", "--no-local-check", "--report-dir", "out", "--max-auth-attempts", "5"]
+         "--smoke", "deep", "--fail-fast", "--no-local-check", "--max-auth-attempts", "5"]
     )
 
     assert args.command == "release"
@@ -256,7 +256,6 @@ def test_parser_parses_release_args() -> None:
     assert args.smoke == "deep"
     assert args.fail_fast is True
     assert args.no_local_check is True
-    assert args.report_dir == "out"
     assert args.max_auth_attempts == 5
 
 

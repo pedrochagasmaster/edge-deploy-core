@@ -177,7 +177,7 @@ class ReleaseProgressTracker:
             session = self._active.tmux_session or "(unknown)"
             safe_action = (
                 "check the tmux pane for prompts or hung output; "
-                "if idle, interrupt safely and resume with --resume"
+                "if idle, interrupt safely and run: python -m edge_deploy status"
             )
             warning = (
                 f"stall warning: {label} has had no activity for {inactive}s; "

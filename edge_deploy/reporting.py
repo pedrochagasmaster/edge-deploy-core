@@ -131,19 +131,16 @@ RELEASE_SCHEMA = "edge-deploy/release/2"
 _FAILED_ROLLOUT_STATUSES = ("failed", "refused")
 
 
-def _node_suffix(node: Any) -> str:
-    """``"node04"`` -> ``"04"`` for a copy-pasteable ``--nodes`` argument in handoffs."""
-    name = str(node or "")
-    return name[len("node"):] if name.startswith("node") else name
-
-
 def _resume_action(rollout: dict[str, Any]) -> str:
     """A ready-to-paste resume command for a mid-state/refused/unavailable pair."""
-    nodes = _node_suffix(rollout.get("node"))
+    node = rollout.get("node", "")
     report_path = rollout.get("report_path")
-    report_dir = str(Path(report_path).parent) if report_path else "<release-report-dir>"
-    command = f"python -m edge_deploy release --resume {report_dir} --nodes {nodes}"
-    return f"investigate {rollout.get('node')}; re-run: {command}"
+    if report_path:
+        run_id = Path(report_path).parent.name
+        command = f"python -m edge_deploy deploy --run {run_id} --nodes {node}"
+    else:
+        command = "python -m edge_deploy status"
+    return f"investigate {node}; re-run: {command}"
 
 
 @dataclass

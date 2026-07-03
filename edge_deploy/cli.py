@@ -62,7 +62,6 @@ def build_parser() -> argparse.ArgumentParser:
     release_parser.add_argument("--force-lock", action="store_true")
     release_parser.add_argument("--smoke", choices=("standard", "deep"), default="standard")
     release_parser.add_argument("--fail-fast", action="store_true", help="Stop on the first non-success (ADR-0003)")
-    release_parser.add_argument("--report-dir", default=None, help="Default: ./edge-deploy/reports/release-<UTC>/")
     release_parser.add_argument("--max-auth-attempts", type=int, default=3)
     release_parser.add_argument("--auth-mode", choices=("prompt", "pane"), default="prompt")
     release_parser.add_argument("--auth-wait-seconds", type=float, default=300.0)
@@ -77,7 +76,6 @@ def build_parser() -> argparse.ArgumentParser:
     rollback_parser.add_argument("--nodes", default=None)
     rollback_parser.add_argument("--force-lock", action="store_true")
     rollback_parser.add_argument("--smoke", choices=("standard", "deep"), default="standard")
-    rollback_parser.add_argument("--report-dir", default=None)
     rollback_parser.add_argument("--max-auth-attempts", type=int, default=3)
     rollback_parser.add_argument("--auth-mode", choices=("prompt", "pane"), default="prompt")
     rollback_parser.add_argument("--auth-wait-seconds", type=float, default=300.0)
@@ -160,11 +158,6 @@ def _emit(report: OperationReport, json_report: str | None) -> None:
 
 def _runs_root(repo_root: Path) -> Path:
     return repo_root / "edge-deploy" / "runs"
-
-
-def _default_report_dir() -> Path:
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return Path("edge-deploy") / "reports" / f"release-{stamp}"
 
 
 def _print_open_run_refusal(run: dict) -> None:

@@ -189,7 +189,7 @@ def _sample_release_report() -> ReleaseReport:
                 "branch": "main",
                 "previous_remote_commit": "9999",
                 "message": "Deploy snapshot: autobench a1b2c3d on main (2026-06-29 23:00) [edge-deploy]",
-                "report_path": "edge-deploy/reports/release-X/publish-autobench.json",
+                "report_path": "edge-deploy/runs/run-20260703T120000Z-aa6d9a5/publish-autobench.json",
             },
             {
                 "tool": "robocop", "status": "failed", "snapshot": None,
@@ -200,13 +200,13 @@ def _sample_release_report() -> ReleaseReport:
             {
                 "tool": "autobench", "node": "node03", "status": "rolled_out", "state_left": "",
                 "deployment_commit": "a1b2c3d4", "drift": "passed", "smoke": "passed",
-                "report_path": "edge-deploy/reports/release-X/rollout-autobench-node03.json",
+                "report_path": "edge-deploy/runs/run-20260703T120000Z-aa6d9a5/rollout-autobench-node03.json",
             },
             {
                 "tool": "autobench", "node": "node04", "status": "failed",
                 "state_left": "rolled out but verification failed: runtime_drift",
                 "deployment_commit": "a1b2c3d4", "drift": "failed", "smoke": "not_run",
-                "report_path": "edge-deploy/reports/release-X/rollout-autobench-node04.json",
+                "report_path": "edge-deploy/runs/run-20260703T120000Z-aa6d9a5/rollout-autobench-node04.json",
             },
             {
                 "tool": "robocop", "node": "node03", "status": "skipped",
@@ -260,7 +260,8 @@ def test_release_report_handoffs_enumerate_followups() -> None:
     assert by_kind["publish"]["action"].endswith("python -m edge_deploy release")
     assert "mid_state" in by_kind
     assert by_kind["mid_state"]["node"] == "node04"
-    assert "release --resume edge-deploy/reports/release-X" in by_kind["mid_state"]["action"].replace("\\", "/")
+    action = by_kind["mid_state"]["action"].replace("\\", "/")
+    assert "deploy --run run-20260703T120000Z-aa6d9a5 --nodes node04" in action
 
 
 def test_release_report_clean_run_exit_zero() -> None:

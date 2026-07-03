@@ -38,24 +38,25 @@ From the clean GitHub `main` checkout of the tool being released:
 ```powershell
 python -m pip install -e ".[dev,release]"
 python -m pytest
-python -m edge_deploy release
+python -m edge_deploy status
+python -m edge_deploy release --tool autobench
 ```
 
-A **Publish** fast-forwards the verified GitHub commit to Bitbucket. A
-**Deploy** applies that exact commit to Edge. A **Release** performs both under
-operator control. A **Rollback** explicitly restores a previously recorded
-successful release.
+Each release creates a durable **run** under `edge-deploy/runs/`. Phases are
+short, idempotent commands (`verify`, `publish-phase`, `deploy`, `tag-github`,
+`tag-bitbucket`) that declare which firewall posture they need. Use `status` to
+see per-phase state and the exact next command.
 
 ```powershell
 python -m edge_deploy rollback --tag release-<UTC>-<short-sha>
 ```
 
-The release command validates repository state, remotes, post-merge GitHub CI,
-local tests, audit availability, and interactive authentication before remote
-mutation. Successful tool releases receive an immutable
-`release-<UTC>-<short-sha>` tag on GitHub and Bitbucket.
+Successful tool releases receive an immutable `release-<UTC>-<short-sha>` tag on
+GitHub and Bitbucket. Redacted release bundles are appended to the Bitbucket-only
+`release-log` branch of this repository.
 
-Redacted release bundles are appended to the Bitbucket-only `release-log`
-branch of this repository. See [docs/release-workflow.md](docs/release-workflow.md)
-for the operator procedure and [docs/DESIGN.md](docs/DESIGN.md) for engine
-internals.
+See [docs/release-workflow.md](docs/release-workflow.md) for the operator
+procedure and [docs/DESIGN.md](docs/DESIGN.md) for engine internals. Architecture
+decisions: [ADR-0008](docs/adr/0008-run-ledger-and-posture-phases.md) (run
+ledger and phases), [ADR-0009](docs/adr/0009-on-node-runner-file-evidence.md)
+(runner and file evidence).
