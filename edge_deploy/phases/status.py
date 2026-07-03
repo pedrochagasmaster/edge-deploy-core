@@ -121,7 +121,7 @@ def print_run_statuses(
     return 0
 
 
-def _cmd_status(args: argparse.Namespace, operator: OperatorConfig) -> int:
+def _cmd_status(args: argparse.Namespace, operator: OperatorConfig | None) -> int:
     del operator
     repo_root = Path.cwd().resolve()
     runs_root = _runs_root(repo_root)
