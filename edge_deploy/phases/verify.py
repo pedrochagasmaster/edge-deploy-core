@@ -10,7 +10,7 @@ from pathlib import Path
 
 from edge_deploy.config import OperatorConfig, load_tool_profile
 from edge_deploy.ledger import RunLedger
-from edge_deploy.phases import PhaseSpec, enter_phase
+from edge_deploy.phases import PhaseSpec, enter_phase, load_run
 from edge_deploy.posture import PHASE_ENDPOINTS
 from edge_deploy.repository import RepositoryError, inspect_repository, require_successful_github_ci
 
@@ -28,22 +28,52 @@ def ensure_verified(
 ):
     if not profile.github_url:
         raise RepositoryError("edge_deploy.yaml must define github_url")
+
+    if ledger.state.get("kind") == "rollback":
+        tag = ledger.state.get("rollback_tag")
+        if ledger.phase_state("verify") != "skipped":
+            ledger.set_phase(
+                "verify",
+                "skipped",
+                evidence={
+                    "reason": "rollback tag provides reviewed source and snapshot SHA",
+                    "rollback_tag": tag,
+                    "source_sha": ledger.state["source_sha"],
+                },
+            )
+            ledger.record_event("phase_skipped", phase="verify")
+        print(f"verify: skipped for rollback run (tag {tag} provides reviewed SHA)")
+        return repo_state or inspect_repository(
+            repo_root,
+            tool=profile.tool,
+            expected_origin=profile.github_url,
+            expected_bitbucket=profile.bitbucket_url,
+        )
+
     state = repo_state or inspect_repository(
         repo_root,
         tool=profile.tool,
         expected_origin=profile.github_url,
         expected_bitbucket=profile.bitbucket_url,
     )
-    if (
-        not reverify
-        and ledger.phase_state("verify") == "passed"
-        and ledger.state["source_sha"] == state.commit
-    ):
-        sha7 = state.commit[:7]
-        print(f"verify: already passed for {sha7} (skipping)")
-        ledger.record_event("phase_skipped", phase="verify")
-        return state
     try:
+        if ledger.state.get("kind", "release") == "release":
+            bound_sha = ledger.state["source_sha"]
+            if state.commit != bound_sha:
+                raise RepositoryError(
+                    f"checkout drift: run expects source {bound_sha[:7]} but checkout is "
+                    f"{state.commit[:7]}; switch the tool checkout to the reviewed commit "
+                    f"or abandon the run"
+                )
+        if (
+            not reverify
+            and ledger.phase_state("verify") == "passed"
+            and ledger.state["source_sha"] == state.commit
+        ):
+            sha7 = state.commit[:7]
+            print(f"verify: already passed for {sha7} (skipping)")
+            ledger.record_event("phase_skipped", phase="verify")
+            return state
         require_successful_github_ci(state)
         pytest_command = [sys.executable, "-m", "pytest", "-n", "8", "--dist", "loadfile"]
         completed = subprocess.run(pytest_command, cwd=repo_root)
@@ -71,12 +101,7 @@ def ensure_verified(
 
 
 def _cmd_verify(args: argparse.Namespace, operator: OperatorConfig) -> int:
-    runs_root = Path.cwd().resolve() / "edge-deploy" / "runs"
-    run_dir = runs_root / args.run
-    if not run_dir.is_dir() or not (run_dir / "state.json").is_file():
-        print(f"no such run: {args.run} under {runs_root}", file=sys.stderr)
-        return 2
-    ledger = RunLedger.load(run_dir)
+    ledger, repo_root = load_run(args, operator)
     tool = ledger.state["tool"]
     repo_root = Path(operator.tool_path(tool)).resolve()
     profile = load_tool_profile(repo_root)
