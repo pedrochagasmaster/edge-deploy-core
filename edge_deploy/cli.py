@@ -23,6 +23,8 @@ from edge_deploy.auth import authenticate_node, authenticate_node_via_pane
 from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, OperatorConfig, load_tool_profile
 from edge_deploy.ledger import LedgerError, RunLedger
 from edge_deploy.mirror import MirrorError, mirror_release
+from edge_deploy.phases import PHASE_REGISTRY, EngineMismatchError
+from edge_deploy.posture import PostureError
 from edge_deploy.publish import PublishError, publish_snapshot
 from edge_deploy.release import ReleaseSelection, resolve_nodes, run_release
 from edge_deploy.reporting import OperationReport, redact, write_release_report, write_report
@@ -113,6 +115,9 @@ def build_parser() -> argparse.ArgumentParser:
     abandon_parser = subparsers.add_parser("abandon", help="Abandon an open run")
     abandon_parser.add_argument("--run", required=True)
     abandon_parser.add_argument("--reason", required=True)
+
+    for _spec, register_fn in sorted(PHASE_REGISTRY, key=lambda item: item[0].order):
+        register_fn(subparsers)
 
     return parser
 
@@ -724,6 +729,9 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_drift(args, operator)
         if args.command == "preflight":
             return _cmd_preflight(args, operator)
+        func = getattr(args, "func", None)
+        if func is not None:
+            return func(args, operator)
     except (
         RuntimeError,
         PublishError,
@@ -732,6 +740,8 @@ def main(argv: list[str] | None = None) -> int:
         AuthenticationError,
         SessionGoneError,
         LedgerError,
+        EngineMismatchError,
+        PostureError,
         KeyError,
         ValueError,
         subprocess.CalledProcessError,
