@@ -17,6 +17,15 @@ Live stack inspection of the stalled Autobench PR #35 controllers confirmed
 both were waiting in `getpass()` inside `_run_release_preflight`, not in
 dependency-bundle construction, transfer, or installation.
 
+The already-published PR #35 Bitbucket snapshot introduces a second retry
+problem. Its operator-authored commit is tree-equivalent to reviewed GitHub
+source `aa6d9a5f0fa5481ad75b938022b6a78b50b14a38`, but it is not that source
+commit's ancestor. A fresh `publish_snapshot` call therefore creates another
+synthetic commit instead of reusing
+`dd6907b77a94fcd85e97792b572caca3634c7a18`. Release retries need an idempotent
+way to select an existing tree-equivalent Bitbucket tip while retaining the
+reviewed-source provenance required by dependency delivery.
+
 ## Goals
 
 - Give authentication one owner: `run_release`.
@@ -27,6 +36,8 @@ dependency-bundle construction, transfer, or installation.
 - Create durable progress evidence before the first authentication prompt.
 - Preserve the existing authenticated node-pane transport and dependency
   delivery behavior.
+- Reuse the current Bitbucket deployment snapshot when its Git tree is
+  identical to the reviewed source tree.
 - Complete the Autobench PR #35 rollout from the exact published Bitbucket
   snapshot after the engine fix is verified.
 
@@ -71,6 +82,24 @@ that pane, see `[nodeNN] Enter RSA PASSCODE:`, and enter the secret directly.
 `authenticate_node` will forward the transient value into the corresponding
 node pane using the existing secret-safe path.
 
+### Idempotent publication
+
+After fetching the configured Bitbucket release branch, `publish_snapshot`
+will resolve the reviewed source tree and current remote-tip tree. When those
+tree SHAs are equal, publication will:
+
+- keep the current remote tip as the deployment snapshot;
+- skip `commit-tree` and skip the branch push;
+- return a normal successful `PublishResult` containing both the reviewed
+  source commit and reused deployment commit;
+- record a message stating that an existing tree-equivalent snapshot was
+  reused.
+
+Tree equality is the safety boundary established by ADR-0007. A different
+remote tree retains the existing exact-commit or operator-authored synthetic
+snapshot behavior. The reuse path never accepts an arbitrary operator assertion
+and never fabricates a resume report.
+
 ### Runtime invocation
 
 The Autobench PR #35 release controller will be started in a new, dedicated
@@ -96,7 +125,8 @@ cannot consume input or conflict with node-session names.
 2. Local preflight validates repository, CI, tests, and audit state without
    opening SSH sessions.
 3. `run_release` creates the report directory and progress tracker.
-4. Publish or resume establishes the exact deployment snapshot.
+4. Publish establishes the exact deployment snapshot, reusing the current
+   Bitbucket tip when its tree equals the reviewed source tree.
 5. For each node, `run_release` creates or reuses the node tmux driver.
 6. In prompt mode, the attached controller pane reads one PASSCODE with
    `getpass` and forwards it to that node pane.
@@ -118,6 +148,8 @@ No credential is written at any step.
   it must not trigger an automatic fallback to a hidden desktop prompt.
 - Dependency delivery and install failures retain their existing fail-closed
   reports and resume semantics.
+- A remote tip with a different tree is never reused; publication follows the
+  existing push or synthetic-snapshot path.
 
 ## Testing
 
@@ -128,6 +160,10 @@ Regression coverage will prove:
 - Prompt authentication occurs exactly once per node.
 - The report directory and initial progress log exist when the injected
   `getpass` callback is invoked.
+- A tree-equivalent Bitbucket tip is reused without `commit-tree` or a Git
+  push, and the result records reviewed-source and deployment SHAs.
+- A tree-divergent Bitbucket tip continues through the existing synthetic
+  snapshot path.
 - Existing pane and auto-mode authentication tests continue to pass.
 - The full suite passes with `python -m pytest -n 4 --dist loadfile`.
 
