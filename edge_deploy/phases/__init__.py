@@ -64,3 +64,6 @@ def enter_phase(
         stack.close()
         raise
     return stack
+
+
+from edge_deploy.phases import tag as _tag  # noqa: E402, F401

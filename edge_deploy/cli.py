@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 from dataclasses import replace
@@ -291,20 +290,6 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
         )
         _mirror_publish_evidence(ledger, report, state.commit)
         consolidated_path = write_release_report(report_dir / "release.json", report)
-        _record_release_attempt(
-            effective_operator,
-            profile.tool,
-            state.commit,
-            report_dir,
-            report.summary()["overall"],
-        )
-        if report.exit_code() == 0:
-            _tag_successful_release(
-                repo_root,
-                state.commit,
-                deployment_commit=_deployment_commit_for_tool(report, profile.tool, snapshot_by_tool),
-            )
-            ledger.complete()
         _print_release_summary(report, consolidated_path)
         return report.exit_code()
 
@@ -568,39 +553,91 @@ def _record_release_attempt(
     return append_audit_attempt(Path(operator.audit_repo), attempt)
 
 
-def _tag_successful_release(repo_root: Path, commit: str, deployment_commit: str | None = None) -> str:
-    """Tag one successful release on both remotes with tree-equivalent targets (ADR-0007).
-
-    GitHub gets the reviewed source commit. Bitbucket gets the commit that was actually
-    deployed there (the operator-authored snapshot when Bitbucket's own-commits hook
-    rejected the GitHub-authored source); both tags share one name and one tree.
-    """
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    tag = f"release-{stamp}-{commit[:7]}"
-    subprocess.run(["git", "tag", "-a", tag, commit, "-m", f"Successful release {tag}"], cwd=repo_root, check=True)
-    subprocess.run(["git", "push", "origin", f"refs/tags/{tag}"], cwd=repo_root, check=True)
-    command = ["git"]
-    token = os.environ.get("BB_TOKEN")
-    if token:
-        command.extend(["-c", f"http.extraHeader=Authorization: Bearer {token}"])
-    deployed = deployment_commit or commit
-    if deployed == commit:
-        command.extend(["push", "bitbucket", f"refs/tags/{tag}"])
-        subprocess.run(command, cwd=repo_root, check=True)
-        return tag
-    temp_tag = f"edge-deploy-mirror/{tag}"
-    subprocess.run(
-        ["git", "tag", "-a", "-f", temp_tag, deployed,
-         "-m", f"Successful release {tag} (source {commit}) [edge-deploy]"],
-        cwd=repo_root,
-        check=True,
+def _tag_push_handoff_lines(tag: str, source_commit: str, deployment_commit: str | None = None) -> list[str]:
+    deployed = deployment_commit or source_commit
+    lines = [
+        "# Edge Deploy release tag handoff",
+        '$ErrorActionPreference = "Stop"',
+        "",
+        "# Phase 1: switch firewall/network posture to GitHub access.",
+        f"git push origin refs/tags/{tag}",
+        'if ($LASTEXITCODE -ne 0) { throw "GitHub tag push failed" }',
+        f'$githubRows = @(git ls-remote --exit-code --tags origin "refs/tags/{tag}^{{}}")',
+        'if ($LASTEXITCODE -ne 0) { throw "GitHub tag verification query failed" }',
+        'if ($githubRows.Count -eq 0) { throw "GitHub tag verification returned no rows" }',
+        r"$githubCommit = ($githubRows[0] -split '\s+')[0]",
+        f'if ($githubCommit -ne "{source_commit}") {{',
+        f'    throw "GitHub tag resolved to $githubCommit; expected {source_commit}"',
+        "}",
+        "",
+        "# Phase 2: switch firewall/network posture to Bitbucket/Edge access.",
+        (
+            'if ([string]::IsNullOrWhiteSpace($env:BB_TOKEN)) '
+            '{ throw "BB_TOKEN is required for Bitbucket tag finalization" }'
+        ),
+    ]
+    if deployed == source_commit:
+        lines.extend(
+            [
+                (
+                    'git -c "http.extraHeader=Authorization: Bearer $env:BB_TOKEN" '
+                    f"push bitbucket refs/tags/{tag}"
+                ),
+                'if ($LASTEXITCODE -ne 0) { throw "Bitbucket tag push failed" }',
+            ]
+        )
+    else:
+        temp_tag = f"edge-deploy-mirror/{tag}"
+        message = f"Successful release {tag} (source {source_commit}) [edge-deploy]"
+        lines.extend(
+            [
+                f'git tag -a -f {temp_tag} {deployed} -m "{message}"',
+                'if ($LASTEXITCODE -ne 0) { throw "Temporary Bitbucket tag creation failed" }',
+                (
+                    'git -c "http.extraHeader=Authorization: Bearer $env:BB_TOKEN" '
+                    f"push bitbucket refs/tags/{temp_tag}:refs/tags/{tag}"
+                ),
+                'if ($LASTEXITCODE -ne 0) { throw "Bitbucket tag push failed" }',
+            ]
+        )
+    lines.extend(
+        [
+            (
+                '$bitbucketRows = @(git -c '
+                '"http.extraHeader=Authorization: Bearer $env:BB_TOKEN" '
+                f'ls-remote --exit-code --tags bitbucket "refs/tags/{tag}^{{}}")'
+            ),
+            'if ($LASTEXITCODE -ne 0) { throw "Bitbucket tag verification query failed" }',
+            'if ($bitbucketRows.Count -eq 0) { throw "Bitbucket tag verification returned no rows" }',
+            r"$bitbucketCommit = ($bitbucketRows[0] -split '\s+')[0]",
+            f'if ($bitbucketCommit -ne "{deployed}") {{',
+            f'    throw "Bitbucket tag resolved to $bitbucketCommit; expected {deployed}"',
+            "}",
+        ]
     )
-    try:
-        command.extend(["push", "bitbucket", f"refs/tags/{temp_tag}:refs/tags/{tag}"])
-        subprocess.run(command, cwd=repo_root, check=True)
-    finally:
-        subprocess.run(["git", "tag", "-d", temp_tag], cwd=repo_root, check=True)
-    return tag
+    if deployed != source_commit:
+        lines.extend(
+            [
+                f"git tag -d edge-deploy-mirror/{tag}",
+                'if ($LASTEXITCODE -ne 0) { throw "Temporary Bitbucket tag cleanup failed" }',
+            ]
+        )
+    return lines
+
+
+def _write_tag_push_handoff(
+    report_dir: Path,
+    *,
+    tag: str,
+    source_commit: str,
+    deployment_commit: str | None = None,
+) -> Path:
+    path = report_dir / f"push-{tag}.ps1"
+    path.write_text(
+        "\n".join(_tag_push_handoff_lines(tag, source_commit, deployment_commit)) + "\n",
+        encoding="utf-8",
+    )
+    return path
 
 
 def _cmd_abandon(args: argparse.Namespace, operator: OperatorConfig) -> int:
