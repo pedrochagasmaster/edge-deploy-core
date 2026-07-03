@@ -134,6 +134,7 @@ class TmuxDriver:
         width: int = 120,
         height: int = 40,
         retries: int = 0,
+        pane_log_path: Path | None = None,
     ) -> "TmuxDriver":
         """Build a driver from a :class:`NodeConfig` and a :class:`ToolProfile`.
 

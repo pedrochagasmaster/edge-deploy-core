@@ -12,6 +12,7 @@ publish-failed tools, snapshot-unavailable resumes (Risk #1), and pairs left unt
 from __future__ import annotations
 
 import getpass
+import inspect
 import json
 import subprocess
 import sys
@@ -326,6 +327,24 @@ def _safe_stop(driver: TmuxDriver) -> None:
         pass
 
 
+def _driver_factory_with_pane_log(
+    driver_factory: Callable[..., TmuxDriver],
+    pane_log_dir: Path | None,
+) -> Callable[..., TmuxDriver]:
+    if pane_log_dir is None:
+        return driver_factory
+    accepts_pane = "pane_log_path" in inspect.signature(driver_factory).parameters
+
+    def factory(node: object, profile: object, **kwargs: Any) -> TmuxDriver:
+        extra: dict[str, Any] = {}
+        if accepts_pane:
+            node_name = getattr(node, "name", "node")
+            extra["pane_log_path"] = pane_log_dir / f"pane-{node_name}.log"
+        return driver_factory(node, profile, **kwargs, **extra)
+
+    return factory
+
+
 # ---------------------------------------------------------------------------
 # The orchestrator
 # ---------------------------------------------------------------------------
@@ -349,6 +368,7 @@ def run_release(
     progress_fn: Callable[[str], None] | None = None,
     progress_tracker: ReleaseProgressTracker | None = None,
     dependency_builder: Callable[..., DependencyBundle] = build_dependency_bundle,
+    pane_log_dir: str | Path | None = None,
 ) -> ReleaseReport:
     """Run one Release and return the consolidated :class:`ReleaseReport`.
 
@@ -357,6 +377,10 @@ def run_release(
     consolidated report and uses :meth:`ReleaseReport.exit_code` as the process exit code.
     """
     report_dir = Path(report_dir)
+    effective_driver_factory = _driver_factory_with_pane_log(
+        driver_factory,
+        Path(pane_log_dir) if pane_log_dir is not None else None,
+    )
     tools = selection.tools
     node_names = selection.nodes
     profiles = {tool: load_tool_profile(operator.tool_path(tool)) for tool in tools}
@@ -499,7 +523,7 @@ def run_release(
             if stop:
                 break
             node = operator.node(node_name)
-            driver = driver_factory(node, profiles[tools[0]])  # chrome/tui_exit from the first tool (Risk #7)
+            driver = effective_driver_factory(node, profiles[tools[0]])  # chrome/tui_exit from the first tool (Risk #7)
 
             try:
                 if effective_auth_mode == "pane":
