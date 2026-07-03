@@ -64,3 +64,11 @@ def enter_phase(
         stack.close()
         raise
     return stack
+
+
+from edge_deploy.phases.deploy import (  # noqa: E402, I001
+    DEPLOY_SPEC,
+    register as register_deploy,
+)
+
+PHASE_REGISTRY.append((DEPLOY_SPEC, register_deploy))
