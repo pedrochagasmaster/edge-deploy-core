@@ -116,3 +116,19 @@ def test_engine_identity_content_sha256(tmp_path: Path) -> None:
 
     (copy_dir / "extra_module.py").write_text("# added\n", encoding="utf-8")
     assert _content_sha256(copy_dir) != digest
+
+    nested_dir = copy_dir / "nested_pkg"
+    nested_dir.mkdir()
+    (nested_dir / "nested_module.py").write_text("# nested\n", encoding="utf-8")
+    assert _content_sha256(copy_dir) != digest
+
+
+def test_acquire_lock_reentrant_same_instance(tmp_path: Path) -> None:
+    ledger = _create_ledger(tmp_path)
+    ledger.acquire_lock()
+    ledger.acquire_lock()
+    assert (ledger.run_dir / "run.lock").is_file()
+    ledger.release_lock()
+    assert (ledger.run_dir / "run.lock").is_file()
+    ledger.release_lock()
+    assert not (ledger.run_dir / "run.lock").is_file()
