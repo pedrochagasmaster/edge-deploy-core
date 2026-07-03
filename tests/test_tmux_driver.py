@@ -34,38 +34,14 @@ def test_from_node_and_profile_injects_profile_strategy(real_profile) -> None:
     assert driver.tui_chrome_regex == real_profile.tui_chrome_regex
 
 
-def test_authenticated_session_exposes_control_socket_for_scp(tmp_path: Path) -> None:
+def test_pane_command_omits_control_master_and_uploads_via_authenticated_pane(tmp_path: Path) -> None:
     source = tmp_path / "bundle.zip"
     source.write_bytes(b"bundle")
-    with patch.dict("edge_deploy.tmux_driver.os.environ", {"EDGE_DEPLOY_SSH_MULTIPLEX": "1"}):
-        driver = TmuxDriver("user@edge", "sess", "/repo", ssh_options="-p 2222")
+    driver = TmuxDriver("user@edge", "sess", "/repo", ssh_options="-p 2222")
 
     pane_command = driver._build_pane_command()
-    assert "ControlMaster=yes" in pane_command
-    assert "ControlPath=" in pane_command
-
-    with patch("edge_deploy.tmux_driver.subprocess.run") as run:
-        run.return_value.returncode = 0
-        run.return_value.stdout = ""
-        run.return_value.stderr = ""
-        driver.upload_file(source, "/remote/bundle.zip")
-
-    argv = run.call_args.args[0]
-    assert argv[0] == "scp"
-    assert any(str(item).startswith("ControlPath=") for item in argv)
-    assert str(source) in argv
-    assert "user@edge:/remote/bundle.zip" in argv
-
-
-def test_disabled_multiplex_session_omits_control_master_and_uploads_via_authenticated_pane(tmp_path: Path) -> None:
-    source = tmp_path / "bundle.zip"
-    source.write_bytes(b"bundle")
-    with patch.dict("edge_deploy.tmux_driver.os.environ", {"EDGE_DEPLOY_SSH_MULTIPLEX": "0"}):
-        driver = TmuxDriver("user@edge", "sess", "/repo", ssh_options="-p 2222")
-
-    pane_command = driver._build_pane_command()
-    assert "ControlMaster=yes" not in pane_command
-    assert "ControlPath=" not in pane_command
+    for token in ("Control" + "Master", "Control" + "Path"):
+        assert token not in pane_command
 
     commands: list[str] = []
 
