@@ -18,7 +18,6 @@ from pathlib import Path
 
 from edge_deploy import __version__, drift, preflight, rollout
 from edge_deploy.audit import AuditAttempt, AuditSyncError, append_audit_attempt, check_audit_remote
-from edge_deploy.auth import authenticate_node, authenticate_node_via_pane
 from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, OperatorConfig, load_tool_profile
 from edge_deploy.mirror import MirrorError, mirror_release
 from edge_deploy.publish import PublishError, publish_snapshot
@@ -224,10 +223,6 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
         effective_operator,
         profile,
         repo_root,
-        selection.nodes,
-        auth_mode=args.auth_mode,
-        max_auth_attempts=args.max_auth_attempts,
-        auth_wait_seconds=args.auth_wait_seconds,
         release_sha=release_sha,
         expected_checkout_sha=release_sha,
     )
@@ -237,7 +232,7 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
         selection,
         report_dir=report_dir,
         max_auth_attempts=args.max_auth_attempts,
-        auth_mode="pane",
+        auth_mode=args.auth_mode,
         auth_wait_seconds=args.auth_wait_seconds,
         heartbeat_interval_s=args.heartbeat_interval,
         stall_threshold_s=args.stall_threshold,
@@ -391,10 +386,6 @@ def _cmd_rollback(args: argparse.Namespace, operator: OperatorConfig) -> int:
         effective_operator,
         profile,
         repo_root,
-        node_names,
-        auth_mode=args.auth_mode,
-        max_auth_attempts=args.max_auth_attempts,
-        auth_wait_seconds=args.auth_wait_seconds,
         release_sha=target,
         allow_unresolved=True,
     )
@@ -416,7 +407,7 @@ def _cmd_rollback(args: argparse.Namespace, operator: OperatorConfig) -> int:
         ),
         report_dir=report_dir,
         max_auth_attempts=args.max_auth_attempts,
-        auth_mode="pane",
+        auth_mode=args.auth_mode,
         auth_wait_seconds=args.auth_wait_seconds,
         heartbeat_interval_s=args.heartbeat_interval,
         stall_threshold_s=args.stall_threshold,
@@ -439,11 +430,7 @@ def _run_release_preflight(
     operator: OperatorConfig,
     profile,
     repo_root: Path,
-    node_names: list[str],
     *,
-    auth_mode: str,
-    max_auth_attempts: int,
-    auth_wait_seconds: float,
     release_sha: str | None = None,
     expected_checkout_sha: str | None = None,
     allow_unresolved: bool = False,
@@ -464,7 +451,7 @@ def _run_release_preflight(
     pytest_command = [sys.executable, "-m", "pytest", "-n", "8", "--dist", "loadfile"]
     completed = subprocess.run(pytest_command, cwd=repo_root)
     if completed.returncode:
-        raise RuntimeError("python -m pytest -n 12 --dist loadfile failed; release blocked")
+        raise RuntimeError("python -m pytest -n 8 --dist loadfile failed; release blocked")
     if not operator.audit_repo:
         raise AuditSyncError("operator config must define audit_repo")
     check_audit_remote(
@@ -473,24 +460,6 @@ def _run_release_preflight(
         source_sha=release_sha or state.commit,
         allow_unresolved=allow_unresolved,
     )
-
-    for node_name in node_names:
-        node = operator.node(node_name)
-        driver = TmuxDriver.from_node_and_profile(node, profile, retries=2)
-        if auth_mode == "pane" or (auth_mode == "auto" and not sys.stdin.isatty()):
-            authenticate_node_via_pane(
-                driver,
-                node_name,
-                notify_fn=lambda message: print(redact(f"[release] {message}")),
-                wait_timeout=auth_wait_seconds,
-            )
-        else:
-            authenticate_node(
-                driver,
-                node_name,
-                max_attempts=max_auth_attempts,
-                wait_timeout=auth_wait_seconds,
-            )
     return state
 
 

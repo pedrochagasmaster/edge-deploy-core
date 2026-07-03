@@ -142,6 +142,41 @@ def test_release_full_matrix_succeeds(fake_tmux, tmp_path, patched_drift) -> Non
     assert (tmp_path / "release.log").exists()
 
 
+def test_release_prompt_auth_is_tracked_before_one_prompt_per_node(
+    fake_tmux, tmp_path, patched_drift
+) -> None:
+    operator = _operator()
+    drivers: dict = {}
+    prompts: list[str] = []
+
+    def tracked_getpass(prompt: str) -> str:
+        assert (tmp_path / "release.log").exists()
+        progress = json.loads(
+            (tmp_path / "release-progress.json").read_text(encoding="utf-8")
+        )
+        active = progress["active"]
+        assert active["phase"] == "auth"
+        assert active["node"] in {"node03", "node04"}
+        assert active["node"] in prompt
+        prompts.append(prompt)
+        return "12345678"
+
+    report = run_release(
+        operator,
+        ReleaseSelection(tools=["autobench"], nodes=["node03", "node04"]),
+        report_dir=tmp_path,
+        getpass_fn=tracked_getpass,
+        publish_fn=_publishing([]),
+        driver_factory=_make_factory(fake_tmux, drivers),
+        auth_mode="prompt",
+    )
+
+    assert report.exit_code() == 0
+    assert len(prompts) == 2
+    assert sum("node03" in prompt for prompt in prompts) == 1
+    assert sum("node04" in prompt for prompt in prompts) == 1
+
+
 # ---------------------------------------------------------------------------
 # Partial failure (ADR-0003) + synthetic skipped (Risk #9)
 # ---------------------------------------------------------------------------

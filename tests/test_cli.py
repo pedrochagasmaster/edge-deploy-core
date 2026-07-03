@@ -347,7 +347,8 @@ def test_release_command_dispatches_and_writes_consolidated_report(tmp_path, mon
 
     rc = cli.main(
         ["--config", str(config_path), "release", "--tool", "autobench", "--nodes", "03,04",
-         "--smoke", "deep", "--report-dir", str(report_dir), "--max-auth-attempts", "5"]
+         "--smoke", "deep", "--report-dir", str(report_dir), "--max-auth-attempts", "5",
+         "--auth-mode", "prompt"]
     )
 
     assert rc == 0
@@ -357,7 +358,7 @@ def test_release_command_dispatches_and_writes_consolidated_report(tmp_path, mon
     assert selection.smoke == "deep"
     assert selection.snapshot_by_tool == {}
     assert selection.run_local_check is True
-    assert captured["auth_mode"] == "pane"
+    assert captured["auth_mode"] == "prompt"
     assert callable(captured["progress_fn"])
     assert captured["max_auth_attempts"] == 5
     assert (report_dir / "release.json").exists()
@@ -515,6 +516,55 @@ def test_release_command_resume_rejects_missing_source_provenance(tmp_path, monk
     assert "source_commit" in capsys.readouterr().err
 
 
+def test_release_preflight_only_runs_local_gates(tmp_path, monkeypatch) -> None:
+    source = "a" * 40
+    state = SimpleNamespace(commit=source)
+    profile = SimpleNamespace(
+        tool="autobench",
+        github_url="https://github.example/autobench.git",
+        bitbucket_url="https://bitbucket.example/autobench.git",
+    )
+    operator = SimpleNamespace(audit_repo=str(tmp_path / "audit"))
+    audit_calls: list[dict] = []
+
+    monkeypatch.setattr(cli, "inspect_repository", lambda *args, **kwargs: state)
+    monkeypatch.setattr(cli, "require_successful_github_ci", lambda actual: None)
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0),
+    )
+    monkeypatch.setattr(
+        cli,
+        "check_audit_remote",
+        lambda audit_repo, **kwargs: audit_calls.append(
+            {"audit_repo": audit_repo, **kwargs}
+        ),
+    )
+    monkeypatch.setattr(
+        cli.TmuxDriver,
+        "from_node_and_profile",
+        lambda *args, **kwargs: pytest.fail("release preflight must not construct a node driver"),
+    )
+
+    actual = cli._run_release_preflight(
+        operator,
+        profile,
+        tmp_path,
+        release_sha=source,
+    )
+
+    assert actual is state
+    assert audit_calls == [
+        {
+            "audit_repo": tmp_path / "audit",
+            "tool": "autobench",
+            "source_sha": source,
+            "allow_unresolved": False,
+        }
+    ]
+
+
 def test_release_preflight_rejects_resume_when_checkout_advanced(tmp_path, monkeypatch) -> None:
     source = "a" * 40
     current = "b" * 40
@@ -536,10 +586,6 @@ def test_release_preflight_rejects_resume_when_checkout_advanced(tmp_path, monke
             operator,
             profile,
             tmp_path,
-            [],
-            auth_mode="pane",
-            max_auth_attempts=1,
-            auth_wait_seconds=1,
             release_sha=source,
             expected_checkout_sha=source,
         )
@@ -772,6 +818,7 @@ def test_rollback_seeds_publish_provenance_for_dependency_delivery(tmp_path, mon
     def fake_run_release(operator, selection, *, report_dir, max_auth_attempts, **kwargs) -> ReleaseReport:
         captured["selection"] = selection
         captured["report_dir"] = report_dir
+        captured["auth_mode"] = kwargs["auth_mode"]
         return ReleaseReport(
             selection={"tools": selection.tools},
             publishes=[],
@@ -789,11 +836,14 @@ def test_rollback_seeds_publish_provenance_for_dependency_delivery(tmp_path, mon
             tag,
             "--report-dir",
             str(report_dir),
+            "--auth-mode",
+            "prompt",
         ]
     )
 
     assert rc == 0
     assert captured["selection"].snapshot_by_tool == {"autobench": snapshot}
+    assert captured["auth_mode"] == "prompt"
     payload = json.loads((report_dir / "publish-autobench.json").read_text(encoding="utf-8"))
     assert payload["status"] == "published"
     assert payload["deployment_commit"] == snapshot
