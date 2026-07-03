@@ -11,17 +11,15 @@ publish-failed tools, snapshot-unavailable resumes (Risk #1), and pairs left unt
 
 from __future__ import annotations
 
-import getpass
 import inspect
 import json
 import subprocess
-import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from edge_deploy.auth import authenticate_node, authenticate_node_via_pane, ensure_kerberos
+from edge_deploy.auth import AuthBroker, ensure_kerberos
 from edge_deploy.config import OperatorConfig, load_tool_profile
 from edge_deploy.dependencies import BundleError, DependencyBundle, build_dependency_bundle
 from edge_deploy.progress import ReleaseProgressTracker
@@ -130,15 +128,6 @@ def _smoke_result(checks: list[ReportCheck]) -> str:
     if not smoke:
         return "not_run"
     return "passed" if all(check.passed for check in smoke) else "failed"
-
-
-def _resolve_auth_mode(auth_mode: str) -> str:
-    """Resolve ``auto`` to prompt (interactive stdin) or pane (non-interactive)."""
-    if auth_mode != "auto":
-        return auth_mode
-    if sys.stdin.isatty():
-        return "prompt"
-    return "pane"
 
 
 def _is_transient_preflight_failure(report: OperationReport) -> bool:
@@ -355,13 +344,12 @@ def run_release(
     selection: ReleaseSelection,
     *,
     report_dir: str | Path,
-    getpass_fn: Callable[[str], str] = getpass.getpass,
     publish_fn: Callable[..., PublishResult] = publish_snapshot,
     driver_factory: Callable[..., TmuxDriver] = TmuxDriver.from_node_and_profile,
     clock: Callable[[], datetime] = _utc_now,
     remote: str = "bitbucket",
     max_auth_attempts: int = 3,
-    auth_mode: str = "auto",
+    auth_mode: str = "prompt",
     auth_wait_seconds: float = 300.0,
     heartbeat_interval_s: float = 30.0,
     stall_threshold_s: float = 300.0,
@@ -385,8 +373,6 @@ def run_release(
     node_names = selection.nodes
     profiles = {tool: load_tool_profile(operator.tool_path(tool)) for tool in tools}
     local_roots = {tool: operator.tool_path(tool) for tool in tools}
-    effective_auth_mode = _resolve_auth_mode(auth_mode)
-
     tracker = progress_tracker or ReleaseProgressTracker(
         report_dir,
         heartbeat_interval_s=heartbeat_interval_s,
@@ -401,6 +387,7 @@ def run_release(
     pairs = [(node_name, tool) for node_name in node_names for tool in tools]
     recorded: dict[tuple[str, str], dict[str, Any]] = {}
     stop = False  # set by --fail-fast on the first non-success
+    broker = AuthBroker(tracker, auth_mode, auth_wait_seconds, max_auth_attempts)
 
     def progress(message: str) -> None:
         tracker.emit(message)
@@ -526,39 +513,15 @@ def run_release(
             driver = effective_driver_factory(node, profiles[tools[0]])  # chrome/tui_exit from the first tool (Risk #7)
 
             try:
-                if effective_auth_mode == "pane":
-                    if auth_mode == "auto" and not sys.stdin.isatty():
-                        progress(
-                            "non-interactive terminal detected; using tmux pane auth — "
-                            "attach to the node session and enter the current PASSCODE"
-                        )
-                    with tracker.tracked(
-                        f"auth {node_name}",
-                        phase="auth",
-                        node=node_name,
-                        tmux_session=getattr(driver, "session", None),
-                    ):
-                        authenticate_node_via_pane(
-                            driver,
-                            node_name,
-                            notify_fn=progress,
-                            wait_timeout=auth_wait_seconds,
-                        )
-                else:
+                if auth_mode == "prompt":
                     progress(f"waiting for {node_name} RSA prompt")
-                    with tracker.tracked(
-                        f"auth {node_name}",
-                        phase="auth",
-                        node=node_name,
-                        tmux_session=getattr(driver, "session", None),
-                    ):
-                        authenticate_node(
-                            driver,
-                            node_name,
-                            getpass_fn=getpass_fn,
-                            max_attempts=max_auth_attempts,
-                            wait_timeout=auth_wait_seconds,
-                        )
+                with tracker.tracked(
+                    f"auth {node_name}",
+                    phase="auth",
+                    node=node_name,
+                    tmux_session=getattr(driver, "session", None),
+                ):
+                    broker.ensure_authenticated(driver, node_name)
             except (AuthenticationError, SessionGoneError, TimeoutError) as exc:
                 # Never block other nodes (ADR-0003): record every still-open pair as failed.
                 for tool in tools:
@@ -588,7 +551,7 @@ def run_release(
             # Kerberos is paid once per node, and only when a selected tool has deep smoke.
             kerb_check: ReportCheck | None = None
             if selection.smoke == "deep" and any(profiles[tool].smoke.deep for tool in tools):
-                kerb_check = ensure_kerberos(driver, node_name, getpass_fn=getpass_fn)
+                kerb_check = ensure_kerberos(driver, node_name)
 
             for tool in tools:
                 if (node_name, tool) in recorded or tool not in snapshots:

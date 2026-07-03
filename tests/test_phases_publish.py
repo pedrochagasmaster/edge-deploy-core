@@ -248,7 +248,7 @@ def test_check_audit_remote_in_publish_not_preflight(
             return SimpleNamespace()
 
     monkeypatch.setattr(cli, "TmuxDriver", FakeTmuxDriver)
-    monkeypatch.setattr(cli, "authenticate_node", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "AuthBroker", lambda *a, **k: SimpleNamespace(ensure_authenticated=lambda *a, **k: None))
 
     cli._run_release_preflight(
         operator,

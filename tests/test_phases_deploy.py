@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from edge_deploy import drift, release
+from edge_deploy import auth, drift, release
 from edge_deploy.config import NodeConfig, OperatorConfig
 from edge_deploy.ledger import RunLedger
 from edge_deploy.phases.deploy import run_deploy
@@ -115,11 +115,9 @@ def _make_factory(fake_tmux, drivers: dict):
     return factory
 
 
-def _getpass(_events):
-    def getpass_fn(prompt: str) -> str:
-        return "12345678"
-
-    return getpass_fn
+@pytest.fixture(autouse=True)
+def _default_prompt_auth(monkeypatch):
+    monkeypatch.setattr(auth, "_prompt_for_secret", lambda prompt: "12345678")
 
 
 def _deploy_args(run_id: str, **kwargs) -> SimpleNamespace:
@@ -192,7 +190,6 @@ def test_deploy_excludes_already_passed_nodes(
         return release.run_release(
             op,
             selection,
-            getpass_fn=_getpass([]),
             driver_factory=_make_factory(fake_tmux, drivers),
             heartbeat_interval_s=3600.0,
             stall_threshold_s=7200.0,
@@ -235,7 +232,6 @@ def test_deploy_writes_ledger_states_from_report(
         lambda op, selection, **kwargs: release.run_release(
             op,
             selection,
-            getpass_fn=_getpass([]),
             driver_factory=configure_factory,
             heartbeat_interval_s=3600.0,
             stall_threshold_s=7200.0,
@@ -265,7 +261,6 @@ def test_deploy_happy_path_marks_all_nodes_passed(
         lambda op, selection, **kwargs: release.run_release(
             op,
             selection,
-            getpass_fn=_getpass([]),
             driver_factory=_make_factory(fake_tmux, drivers),
             heartbeat_interval_s=3600.0,
             stall_threshold_s=7200.0,

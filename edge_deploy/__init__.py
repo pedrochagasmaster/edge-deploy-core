@@ -7,7 +7,7 @@ in each Tool repo) rather than in branches in code.
 
 from __future__ import annotations
 
-from edge_deploy.auth import authenticate_node, authenticate_node_via_pane, ensure_kerberos
+from edge_deploy.auth import AuthBroker, ensure_kerberos
 from edge_deploy.config import (
     DEFAULT_OPERATOR_CONFIG_PATH,
     DependencyBundleConfig,
@@ -53,8 +53,7 @@ __all__ = [
     "AuthenticationError",
     "SessionGoneError",
     "TmuxDriver",
-    "authenticate_node",
-    "authenticate_node_via_pane",
+    "AuthBroker",
     "ensure_kerberos",
     "PublishError",
     "PublishResult",

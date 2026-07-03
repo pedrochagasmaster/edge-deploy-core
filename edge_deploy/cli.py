@@ -2,7 +2,7 @@
 
 Resolves ``--tool`` / ``--node`` against the two config layers (OperatorConfig + the
 tool's ToolProfile), establishes an Authenticated Pane, and calls the engine. The umbrella
-``release`` orchestrator (Publish + fan-out + getpass auth seam) and the standalone
+``release`` orchestrator (Publish + fan-out + auth broker) and the standalone
 ``publish`` command are wired here on top of the Phase-1 ``rollout`` / ``drift`` engine.
 """
 
@@ -19,7 +19,7 @@ from pathlib import Path
 
 from edge_deploy import __version__, drift, preflight, rollout
 from edge_deploy.audit import AuditAttempt, AuditSyncError, append_audit_attempt
-from edge_deploy.auth import authenticate_node, authenticate_node_via_pane
+from edge_deploy.auth import AuthBroker
 from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, OperatorConfig, load_tool_profile
 from edge_deploy.ledger import LedgerError, RunLedger
 from edge_deploy.mirror import MirrorError, mirror_release
@@ -29,6 +29,7 @@ from edge_deploy.phases.publish import run_publish_phase
 from edge_deploy.phases.tag import _cmd_tag_bitbucket, _cmd_tag_github
 from edge_deploy.phases.verify import VERIFY_SPEC, ensure_verified
 from edge_deploy.posture import PHASE_ENDPOINTS, PostureError, SocketConnector, endpoints_for, probe
+from edge_deploy.progress import ReleaseProgressTracker
 from edge_deploy.publish import PublishError, publish_snapshot
 from edge_deploy.release import resolve_nodes
 from edge_deploy.reporting import OperationReport, redact, write_report
@@ -62,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
     release_parser.add_argument("--fail-fast", action="store_true", help="Stop on the first non-success (ADR-0003)")
     release_parser.add_argument("--report-dir", default=None, help="Default: ./edge-deploy/reports/release-<UTC>/")
     release_parser.add_argument("--max-auth-attempts", type=int, default=3)
-    release_parser.add_argument("--auth-mode", choices=("auto", "prompt", "pane"), default="auto")
+    release_parser.add_argument("--auth-mode", choices=("prompt", "pane"), default="prompt")
     release_parser.add_argument("--auth-wait-seconds", type=float, default=300.0)
     release_parser.add_argument("--heartbeat-interval", type=float, default=30.0)
     release_parser.add_argument("--stall-threshold", type=float, default=300.0)
@@ -77,7 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     rollback_parser.add_argument("--smoke", choices=("standard", "deep"), default="standard")
     rollback_parser.add_argument("--report-dir", default=None)
     rollback_parser.add_argument("--max-auth-attempts", type=int, default=3)
-    rollback_parser.add_argument("--auth-mode", choices=("auto", "prompt", "pane"), default="auto")
+    rollback_parser.add_argument("--auth-mode", choices=("prompt", "pane"), default="prompt")
     rollback_parser.add_argument("--auth-wait-seconds", type=float, default=300.0)
     rollback_parser.add_argument("--heartbeat-interval", type=float, default=30.0)
     rollback_parser.add_argument("--stall-threshold", type=float, default=300.0)
@@ -176,12 +177,6 @@ def _print_open_run_refusal(run: dict) -> None:
     print("Choose one:")
     print(f"  1. continue it:   python -m edge_deploy release --run {run_id}")
     print(f'  2. abandon it:    python -m edge_deploy abandon --run {run_id} --reason "<why>"')
-
-
-def _deploy_auth_mode(auth_mode: str) -> str:
-    if auth_mode == "pane" or (auth_mode == "auto" and not sys.stdin.isatty()):
-        return "pane"
-    return "prompt"
 
 
 def _phase_already_passed(ledger: RunLedger, phase: str, requested_nodes: list[str]) -> bool:
@@ -287,7 +282,7 @@ def _invoke_release_phase(
             run=run_id,
             nodes=args.nodes,
             smoke=args.smoke,
-            auth_mode=_deploy_auth_mode(args.auth_mode),
+            auth_mode=args.auth_mode,
             auth_wait_seconds=args.auth_wait_seconds,
             force_lock=args.force_lock,
         )
@@ -565,20 +560,12 @@ def _run_release_preflight(
     for node_name in node_names:
         node = operator.node(node_name)
         driver = TmuxDriver.from_node_and_profile(node, profile, retries=2)
-        if auth_mode == "pane" or (auth_mode == "auto" and not sys.stdin.isatty()):
-            authenticate_node_via_pane(
-                driver,
-                node_name,
-                notify_fn=lambda message: print(redact(f"[release] {message}")),
-                wait_timeout=auth_wait_seconds,
-            )
-        else:
-            authenticate_node(
-                driver,
-                node_name,
-                max_attempts=max_auth_attempts,
-                wait_timeout=auth_wait_seconds,
-            )
+        tracker = ReleaseProgressTracker(
+            ledger.run_dir,
+            notify_fn=lambda message: print(redact(f"[release] {message}")),
+        )
+        broker = AuthBroker(tracker, auth_mode, auth_wait_seconds, max_auth_attempts)
+        broker.ensure_authenticated(driver, node_name)
     return state
 
 
