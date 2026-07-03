@@ -237,10 +237,9 @@ def test_check_audit_remote_in_publish_not_preflight(
         "run",
         lambda *a, **k: SimpleNamespace(returncode=0),
     )
-    monkeypatch.setattr(cli, "require_successful_github_ci", lambda state: None)
     monkeypatch.setattr(
         cli,
-        "inspect_repository",
+        "ensure_verified",
         lambda *a, **k: SimpleNamespace(commit=SOURCE_SHA),
     )
     class FakeTmuxDriver:
@@ -256,6 +255,7 @@ def test_check_audit_remote_in_publish_not_preflight(
         profile,
         repo_root,
         ["node03"],
+        ledger,
         auth_mode="prompt",
         max_auth_attempts=1,
         auth_wait_seconds=1.0,

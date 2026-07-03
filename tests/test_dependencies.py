@@ -8,6 +8,7 @@ import pytest
 
 from edge_deploy.config import DependencyBundleConfig, ToolProfile
 from edge_deploy.dependencies import BundleError, create_dependency_bundle, deliver_dependency_bundle
+from tests.conftest import FakeTmuxDriver
 
 
 def _config() -> DependencyBundleConfig:
@@ -129,39 +130,87 @@ def test_delivery_transfers_then_records_verified_remote_stage(tmp_path: Path) -
         config=_config(),
         output_dir=tmp_path / "bundle",
     )
+    run_id = "run-test-delivery"
+    remote_dir = f"/ads_storage/test/.edge-deploy/bundles/demo/{bundle.digest}"
+    evidence = {
+        "remote_dir": remote_dir,
+        "reused": False,
+        "bundle_digest": bundle.digest,
+    }
+    driver = FakeTmuxDriver(
+        runner_step_results={
+            "dependency-stage": {
+                "schema": "edge-deploy/step/1",
+                "step": "dependency-stage",
+                "exit_code": 0,
+                "started_at": "2026-07-03T12:00:00Z",
+                "finished_at": "2026-07-03T12:00:01Z",
+                "stdout_tail": "",
+            },
+            "dependency-stage-evidence": evidence,
+        }
+    )
 
-    class Driver:
-        def __init__(self) -> None:
-            self.calls: list[str] = []
-            self.uploads: list[tuple[Path, str]] = []
-
-        def run_remote(self, command: str, *, timeout: float = 30) -> tuple[str, int]:
-            self.calls.append(command)
-            if "base64 -d" in command:
-                return (
-                    "DEPENDENCY_STAGE_START\n"
-                    f'{{"remote_dir": "/ads_storage/test/.edge-deploy/bundles/demo/{bundle.digest}", '
-                    f'"reused": false, "bundle_digest": "{bundle.digest}"}}\n'
-                    "DEPENDENCY_STAGE_END\n",
-                    0,
-                )
-            return "", 0
-
-        def upload_file(self, source: Path, remote_path: str) -> None:
-            self.uploads.append((source, remote_path))
-
-    driver = Driver()
     delivered = deliver_dependency_bundle(
         driver,
         ToolProfile(tool="demo", dependency_bundle=_config()),
         bundle,
+        run_id=run_id,
     )
 
-    assert driver.uploads == [
-        (
-            bundle.archive_path,
-            f"/ads_storage/$USER/.edge-deploy/bundles/demo/.incoming/{bundle.digest}.zip",
-        )
-    ]
+    assert any(
+        remote == f"/ads_storage/$USER/.edge-deploy/bundles/demo/.incoming/{bundle.digest}.zip"
+        for _, remote in driver.uploads
+    )
+    assert any("stage-" in remote and remote.endswith(".py") for _, remote in driver.uploads)
+    assert any("runner-" in remote for _, remote in driver.uploads)
+    assert driver.runner_step_commands
+    assert driver.runner_step_commands[0][1] == run_id
+    assert driver.runner_step_commands[0][2] == "dependency-stage"
+    assert any("__EDGE_RESULT_START__" in command for command in driver.commands)
     assert delivered.reused is False
+    assert delivered.remote_dir == remote_dir
+    assert delivered.evidence == evidence
+
+
+def test_delivery_reuse_path_unchanged(tmp_path: Path) -> None:
+    wheel = tmp_path / "demo-1.0-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+    bundle = create_dependency_bundle(
+        tool="demo",
+        source_sha="d" * 40,
+        dependency_files={"requirements.txt": b"demo==1.0\n"},
+        wheels=[wheel],
+        config=_config(),
+        output_dir=tmp_path / "bundle",
+    )
+    remote_dir = f"/ads_storage/test/.edge-deploy/bundles/demo/{bundle.digest}"
+    evidence = {
+        "remote_dir": remote_dir,
+        "reused": True,
+        "bundle_digest": bundle.digest,
+    }
+    driver = FakeTmuxDriver(
+        runner_step_results={
+            "dependency-stage": {
+                "schema": "edge-deploy/step/1",
+                "step": "dependency-stage",
+                "exit_code": 0,
+                "started_at": "2026-07-03T12:00:00Z",
+                "finished_at": "2026-07-03T12:00:01Z",
+                "stdout_tail": "",
+            },
+            "dependency-stage-evidence": evidence,
+        }
+    )
+
+    delivered = deliver_dependency_bundle(
+        driver,
+        ToolProfile(tool="demo", dependency_bundle=_config()),
+        bundle,
+        run_id="run-reuse",
+    )
+
+    assert delivered.reused is True
     assert delivered.remote_dir.endswith(bundle.digest)
+    assert set(delivered.evidence.keys()) >= {"remote_dir", "reused", "bundle_digest"}
