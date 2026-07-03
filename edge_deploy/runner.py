@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from edge_deploy.tmux_driver import TmuxDriver
 
-RUNNER_VERSION = "1"
+RUNNER_VERSION = "2"
 
 RUNNER_SCRIPT = """#!/bin/sh
 set -eu
@@ -21,6 +21,7 @@ set -eu
 run_id="$1"
 step_name="$2"
 b64_command="$3"
+bundle_dir="${4:--}"
 
 steps_dir="$HOME/.edge-deploy/runs/${run_id}/steps"
 mkdir -p "$steps_dir"
@@ -31,6 +32,11 @@ json_file="${steps_dir}/${step_name}.json"
 started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 cmd=$(printf '%s' "$b64_command" | base64 -d)
 exit_code=0
+if [ "$step_name" = "install" ] && [ "$bundle_dir" != "-" ]; then
+  export EDGE_DEPLOY_BUNDLE_DIR="$bundle_dir"
+  export PIP_NO_INDEX=1
+  export PIP_FIND_LINKS="${bundle_dir}/wheels"
+fi
 sh -c "$cmd" >"$out_file" 2>&1 || exit_code=$?
 finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -143,9 +149,14 @@ def run_step(
     command: str,
     *,
     timeout: float,
+    bundle_dir: str | None = None,
 ) -> dict:
     encoded = base64.b64encode(command.encode("utf-8")).decode("ascii")
-    remote_command = f"sh {runner_path} {run_id} {step_name} {encoded}"
+    if step_name == "install":
+        bundle_arg = bundle_dir if bundle_dir else "-"
+        remote_command = f"sh {runner_path} {run_id} {step_name} {encoded} {bundle_arg}"
+    else:
+        remote_command = f"sh {runner_path} {run_id} {step_name} {encoded}"
     driver.run_remote(remote_command, timeout=timeout)
 
     json_path = f"~/.edge-deploy/runs/{run_id}/steps/{step_name}.json"

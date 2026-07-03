@@ -147,6 +147,7 @@ class FakeTmuxDriver:
         self._fetch_script = list(fetch_script) if fetch_script else [(0, "")]
         self.runner_step_results = dict(runner_step_results) if runner_step_results else {}
         self.runner_step_commands: list[tuple[str, str, str]] = []
+        self.runner_install_bundle_args: list[str] = []
         self.sent_secrets: list[str] = []
         self.sent_keys: list[str] = []
         self.uploads: list[tuple[Path, str]] = []
@@ -323,10 +324,12 @@ class FakeTmuxDriver:
         for needle, code in self._command_codes.items():
             if needle in command:
                 return self._sentinel(f"{needle} -> exit {code}", code)
-        runner_match = re.search(r"sh (\S*runner-\S+\.sh) (\S+) (\S+)", command)
+        runner_match = re.search(r"sh (\S*runner-\S+\.sh) (\S+) (\S+)(?: (\S+))?", command)
         if runner_match:
-            runner_path, run_id, step_name = runner_match.groups()
+            runner_path, run_id, step_name, bundle_arg = runner_match.groups()
             self.runner_step_commands.append((runner_path, run_id, step_name))
+            if step_name == "install" and bundle_arg is not None:
+                self.runner_install_bundle_args.append(bundle_arg)
             return self._sentinel("", 0)
         if "__EDGE_RESULT_START__" in command and "base64 -w0" in command:
             path_match = re.search(r"base64 -w0 ([^;\s]+)", command)

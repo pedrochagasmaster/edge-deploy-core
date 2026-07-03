@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from edge_deploy.runner import (
+    RUNNER_SCRIPT,
     RUNNER_VERSION,
     RunnerProtocolError,
     bootstrap_runner,
@@ -166,3 +167,78 @@ def test_bootstrap_runner_target_path_embeds_version_and_digest() -> None:
     _source, uploaded_remote = driver.uploads[0]
     assert uploaded_remote == remote_path
     assert driver.upload_contents[0].startswith("#!/bin/sh")
+
+
+def test_runner_script_install_step_exports_bundle_env_when_bundle_dir_set() -> None:
+    assert '[ "$step_name" = "install" ]' in RUNNER_SCRIPT
+    assert '[ "$bundle_dir" != "-" ]' in RUNNER_SCRIPT
+    assert 'export EDGE_DEPLOY_BUNDLE_DIR="$bundle_dir"' in RUNNER_SCRIPT
+    assert "export PIP_NO_INDEX=1" in RUNNER_SCRIPT
+    assert 'export PIP_FIND_LINKS="${bundle_dir}/wheels"' in RUNNER_SCRIPT
+
+
+def test_run_install_step_passes_bundle_dir_as_fourth_arg() -> None:
+    runner_path = "~/.edge-deploy/runner-2-deadbeef.sh"
+    run_id = "run-20260703T120000Z-aa6d9a5"
+    step_name = "install"
+    command = "cd /repo && ./install.sh"
+    bundle_dir = "/ads_storage/test/.edge-deploy/bundles/autobench/abc12345"
+    encoded = base64.b64encode(command.encode("utf-8")).decode("ascii")
+    step_payload: dict[str, Any] = {
+        "schema": "edge-deploy/step/1",
+        "step": step_name,
+        "exit_code": 0,
+        "started_at": "2026-07-03T12:00:00Z",
+        "finished_at": "2026-07-03T12:00:01Z",
+        "stdout_tail": "done",
+    }
+    json_path = f"~/.edge-deploy/runs/{run_id}/steps/{step_name}.json"
+    driver = ScriptedDriver(
+        screens=[
+            "__RC_fake_0__",
+            build_d8_screen(json_path, step_payload),
+        ]
+    )
+
+    result = run_step(
+        driver,
+        runner_path,
+        run_id,
+        step_name,
+        command,
+        timeout=240.0,
+        bundle_dir=bundle_dir,
+    )
+
+    assert result == step_payload
+    assert (
+        driver.commands[0]
+        == f"sh {runner_path} {run_id} {step_name} {encoded} {bundle_dir}"
+    )
+
+
+def test_run_install_step_passes_dash_when_bundle_dir_absent() -> None:
+    runner_path = "~/.edge-deploy/runner-2-deadbeef.sh"
+    run_id = "run-20260703T120000Z-aa6d9a5"
+    step_name = "install"
+    command = "cd /repo && ./install.sh"
+    encoded = base64.b64encode(command.encode("utf-8")).decode("ascii")
+    step_payload: dict[str, Any] = {
+        "schema": "edge-deploy/step/1",
+        "step": step_name,
+        "exit_code": 0,
+        "started_at": "2026-07-03T12:00:00Z",
+        "finished_at": "2026-07-03T12:00:01Z",
+        "stdout_tail": "done",
+    }
+    json_path = f"~/.edge-deploy/runs/{run_id}/steps/{step_name}.json"
+    driver = ScriptedDriver(
+        screens=[
+            "__RC_fake_0__",
+            build_d8_screen(json_path, step_payload),
+        ]
+    )
+
+    run_step(driver, runner_path, run_id, step_name, command, timeout=240.0)
+
+    assert driver.commands[0] == f"sh {runner_path} {run_id} {step_name} {encoded} -"
