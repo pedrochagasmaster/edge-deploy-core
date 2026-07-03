@@ -151,6 +151,7 @@ class TmuxDriver:
             tui_chrome_regex=profile.tui_chrome_regex,  # type: ignore[attr-defined]
             tui_exit=profile.tui_exit,  # type: ignore[attr-defined]
             retries=retries,
+            pane_log_path=pane_log_path,
         )
 
     # ------------------------------------------------------------------
