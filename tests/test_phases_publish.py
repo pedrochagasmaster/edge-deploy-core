@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from edge_deploy import cli
-from edge_deploy.config import OperatorConfig, load_tool_profile
+from edge_deploy.config import OperatorConfig
 from edge_deploy.ledger import RunLedger
 from edge_deploy.phases.publish import PUBLISH_SPEC, run_publish_phase
 from edge_deploy.publish import PublishResult
@@ -218,49 +218,24 @@ def test_publish_records_evidence(
     assert (ledger.run_dir / "publish-autobench.json").is_file()
 
 
-def test_check_audit_remote_in_publish_not_preflight(
+def test_check_audit_remote_runs_in_publish_phase(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The audit-remote gate needs Bitbucket, so it belongs to the publish
+    # phase; the old pre-publish preflight (which also pre-authenticated
+    # nodes) was deleted outright rather than relocated.
+    assert not hasattr(cli, "_run_release_preflight")
+
     repo_root = _write_tool_profile(tmp_path)
     config_path = _write_operator_config(tmp_path, repo_root)
     ledger = _create_ledger(repo_root, verify_state="passed")
     operator = _operator(config_path)
-    profile = load_tool_profile(repo_root)
     audit_calls: list[tuple] = []
 
     def track_audit(*args, **kwargs) -> None:
         audit_calls.append((args, kwargs))
 
     monkeypatch.setattr("edge_deploy.phases.publish.check_audit_remote", track_audit)
-    monkeypatch.setattr(
-        cli.subprocess,
-        "run",
-        lambda *a, **k: SimpleNamespace(returncode=0),
-    )
-    monkeypatch.setattr(
-        cli,
-        "ensure_verified",
-        lambda *a, **k: SimpleNamespace(commit=SOURCE_SHA),
-    )
-    class FakeTmuxDriver:
-        @classmethod
-        def from_node_and_profile(cls, node, profile, retries=2):
-            return SimpleNamespace()
-
-    monkeypatch.setattr(cli, "TmuxDriver", FakeTmuxDriver)
-    monkeypatch.setattr(cli, "AuthBroker", lambda *a, **k: SimpleNamespace(ensure_authenticated=lambda *a, **k: None))
-
-    cli._run_release_preflight(
-        operator,
-        profile,
-        repo_root,
-        ["node03"],
-        ledger,
-        auth_mode="prompt",
-        max_auth_attempts=1,
-        auth_wait_seconds=1.0,
-    )
-    assert audit_calls == []
 
     _patch_posture_and_engine(monkeypatch, ledger)
     run_publish_phase(

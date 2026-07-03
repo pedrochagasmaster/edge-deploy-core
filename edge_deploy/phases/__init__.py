@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import argparse
 import socket
+import sys
 from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
+from pathlib import Path
 
 from edge_deploy.config import OperatorConfig
-from edge_deploy.ledger import RunLedger, engine_identity
+from edge_deploy.ledger import LedgerError, RunLedger, engine_identity
 from edge_deploy.posture import require_posture
 
 SocketConnector = Callable[[tuple[str, int], float], object]
@@ -30,6 +33,42 @@ class EngineMismatchError(RuntimeError):
     """Raised when the run ledger engine identity differs from this process."""
 
 
+def _runs_root(repo_root: Path) -> Path:
+    return repo_root / "edge-deploy" / "runs"
+
+
+def load_run(args: argparse.Namespace, operator: OperatorConfig) -> tuple[RunLedger, Path]:
+    """Locate a run directory under configured tool roots, then cwd."""
+    for tool_path in operator.tools.values():
+        repo_root = Path(tool_path).resolve()
+        runs_root = _runs_root(repo_root)
+        run_dir = runs_root / args.run
+        if run_dir.is_dir() and (run_dir / "state.json").is_file():
+            return RunLedger.load(run_dir), repo_root
+
+    repo_root = Path.cwd().resolve()
+    runs_root = _runs_root(repo_root)
+    run_dir = runs_root / args.run
+    if not run_dir.is_dir() or not (run_dir / "state.json").is_file():
+        print(f"no such run: {args.run} under {runs_root}", file=sys.stderr)
+        raise SystemExit(2)
+    return RunLedger.load(run_dir), repo_root
+
+
+def run_repo_root(ledger: RunLedger, operator: OperatorConfig, fallback: Path) -> Path:
+    """The tool checkout a run operates on.
+
+    The operator ``tools`` mapping is optional ("backward-compatible only" per
+    docs/DESIGN.md; the real config defines none), so fall back to the repo root
+    the run was found under (:func:`load_run`'s validated cwd fallback) instead
+    of raising ``KeyError`` from ``operator.tool_path``.
+    """
+    tool = ledger.state["tool"]
+    if tool in operator.tools:
+        return Path(operator.tools[tool]).resolve()
+    return fallback
+
+
 def enter_phase(
     spec: PhaseSpec,
     operator: OperatorConfig | None,
@@ -39,6 +78,13 @@ def enter_phase(
     force_lock: bool = False,
     connect: SocketConnector | None = None,
 ) -> ExitStack:
+    run_status = ledger.state["status"]
+    if run_status != "open":
+        run_id = ledger.state["run_id"]
+        raise LedgerError(
+            f"phase '{spec.name}' refused: run {run_id} is {run_status}"
+        )
+
     stack = ExitStack()
     ledger.acquire_lock(force=force_lock)
     stack.callback(ledger.release_lock)

@@ -32,7 +32,9 @@ def _phase_passed(ledger: RunLedger, phase: str) -> bool:
     if phase == "deploy":
         deploy = ledger.state["phases"]["deploy"]
         return all(node["state"] == "passed" for node in deploy.values())
-    return ledger.phase_state(phase) == "passed"
+    # "skipped" is satisfied (e.g. verify on a rollback run); pointing "next:"
+    # at a permanently-skipped phase would strand the operator on it forever.
+    return ledger.phase_state(phase) in ("passed", "skipped")
 
 
 def _format_publish_line(ledger: RunLedger) -> str:

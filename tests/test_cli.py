@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from edge_deploy import cli
-from edge_deploy.ledger import RunLedger
+from edge_deploy.ledger import RunLedger, RunLockError
 from edge_deploy.mirror import MirrorError, MirrorResult
 from edge_deploy.publish import PublishError, PublishResult
 
@@ -246,7 +246,7 @@ def test_parser_help_lists_all_subcommands(capsys) -> None:
 def test_parser_parses_release_args() -> None:
     args = cli.build_parser().parse_args(
         ["release", "--nodes", "03,04", "--auth-mode", "prompt",
-         "--smoke", "deep", "--fail-fast", "--no-local-check", "--report-dir", "out", "--max-auth-attempts", "5"]
+         "--smoke", "deep", "--fail-fast", "--no-local-check", "--max-auth-attempts", "5"]
     )
 
     assert args.command == "release"
@@ -256,7 +256,6 @@ def test_parser_parses_release_args() -> None:
     assert args.smoke == "deep"
     assert args.fail_fast is True
     assert args.no_local_check is True
-    assert args.report_dir == "out"
     assert args.max_auth_attempts == 5
 
 
@@ -446,6 +445,95 @@ def test_release_chain_completes_all_phases(tmp_path, monkeypatch, capsys) -> No
     assert loaded.phase_state("tag_github") == "passed"
     assert loaded.phase_state("tag_bitbucket") == "passed"
     assert f"release complete: {loaded.state['run_id']}" in out
+
+
+def test_release_chain_holds_lock_between_phases(tmp_path, monkeypatch, capsys) -> None:
+    config_path = _write_operator_config_both(tmp_path)
+    autobench_path = _autobench_repo_root(tmp_path)
+    _patch_inspect_repository(monkeypatch, commit=SOURCE_SHA)
+    monkeypatch.setattr(cli.socket, "create_connection", _reachable_connect)
+
+    phases_checked: list[str] = []
+
+    def fake_ensure_verified(operator, profile, repo_root, ledger, **kwargs):
+        foreign = RunLedger.load(ledger.run_dir)
+        with pytest.raises(RunLockError):
+            foreign.acquire_lock()
+        phases_checked.append("verify")
+        ledger.set_phase(
+            "verify",
+            "passed",
+            evidence={
+                "commit": SOURCE_SHA,
+                "ci": "success",
+                "tests": "passed",
+                "verified_at": "2026-07-03T12:00:00+00:00",
+            },
+        )
+        return SimpleNamespace(commit=SOURCE_SHA)
+
+    def fake_publish(ledger, operator, repo_root, **kwargs):
+        foreign = RunLedger.load(ledger.run_dir)
+        with pytest.raises(RunLockError):
+            foreign.acquire_lock()
+        phases_checked.append("publish")
+        ledger.set_phase(
+            "publish",
+            "passed",
+            evidence={"snapshot_sha": SNAPSHOT_SHA, "source_commit": SOURCE_SHA},
+        )
+        return 0
+
+    def fake_deploy(args, operator):
+        from edge_deploy.phases.deploy import _load_run
+
+        ledger, _repo_root = _load_run(args, operator)
+        foreign = RunLedger.load(ledger.run_dir)
+        with pytest.raises(RunLockError):
+            foreign.acquire_lock()
+        phases_checked.append("deploy")
+        for node in ledger.state["nodes"]:
+            ledger.set_phase("deploy", "passed", node=node, evidence={"status": "rolled_out"})
+        return 0
+
+    def fake_tag_github(args, operator):
+        from edge_deploy.phases.deploy import _load_run
+
+        ledger, _repo_root = _load_run(args, operator)
+        foreign = RunLedger.load(ledger.run_dir)
+        with pytest.raises(RunLockError):
+            foreign.acquire_lock()
+        phases_checked.append("tag_github")
+        ledger.set_phase("tag_github", "passed", evidence={"tag": RELEASE_TAG, "pushed_sha": SOURCE_SHA})
+        return 0
+
+    def fake_tag_bitbucket(args, operator):
+        from edge_deploy.phases.deploy import _load_run
+
+        ledger, _repo_root = _load_run(args, operator)
+        foreign = RunLedger.load(ledger.run_dir)
+        with pytest.raises(RunLockError):
+            foreign.acquire_lock()
+        phases_checked.append("tag_bitbucket")
+        ledger.set_phase("tag_bitbucket", "passed", evidence={"tag": RELEASE_TAG, "pushed_sha": SNAPSHOT_SHA})
+        ledger.complete()
+        return 0
+
+    monkeypatch.setattr(cli, "ensure_verified", fake_ensure_verified)
+    monkeypatch.setattr(cli, "run_publish_phase", fake_publish)
+    monkeypatch.setattr(cli, "run_deploy", fake_deploy)
+    monkeypatch.setattr(cli, "_cmd_tag_github", fake_tag_github)
+    monkeypatch.setattr(cli, "_cmd_tag_bitbucket", fake_tag_bitbucket)
+    monkeypatch.setattr(cli, "probe", lambda *a, **k: [])
+
+    rc = cli.main(
+        ["--config", str(config_path), "release", "--tool", "autobench", "--nodes", "03,04"]
+    )
+
+    assert rc == 0
+    assert phases_checked == ["verify", "publish", "deploy", "tag_github", "tag_bitbucket"]
+    runs = list((autobench_path / "edge-deploy" / "runs").iterdir())
+    assert not (runs[0] / "run.lock").is_file()
 
 
 def test_release_posture_failure_mid_chain_exits_zero(tmp_path, monkeypatch, capsys) -> None:
@@ -677,6 +765,61 @@ def test_abandon_flips_status_and_excludes_from_find_open(tmp_path, monkeypatch,
     assert RunLedger.find_open(runs_root) == []
 
 
+def test_abandon_refuses_when_run_locked(tmp_path, monkeypatch, capsys) -> None:
+    config_path = _write_operator_config_both(tmp_path)
+    autobench_path = _autobench_repo_root(tmp_path)
+    monkeypatch.chdir(autobench_path)
+    ledger = _create_open_run(autobench_path)
+    run_id = ledger.state["run_id"]
+    (ledger.run_dir / "run.lock").write_text(
+        json.dumps(
+            {
+                "pid": 4242,
+                "hostname": "edge-host",
+                "acquired_at": "2026-07-03T12:00:00+00:00",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    rc = cli.main(
+        ["--config", str(config_path), "abandon", "--run", run_id, "--reason", "superseded"]
+    )
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "RunLockError" in err
+    assert "is locked by PID 4242 on edge-host" in err
+    loaded = RunLedger.load(ledger.run_dir)
+    assert loaded.state["status"] == "open"
+
+
+def test_release_refuses_abandoned_run(tmp_path, monkeypatch, capsys) -> None:
+    config_path = _write_operator_config_both(tmp_path)
+    autobench_path = _autobench_repo_root(tmp_path)
+    ledger = _create_open_run(autobench_path)
+    run_id = ledger.state["run_id"]
+    ledger.abandon("superseded")
+    _patch_inspect_repository(monkeypatch)
+
+    rc = cli.main(
+        [
+            "--config",
+            str(config_path),
+            "release",
+            "--tool",
+            "autobench",
+            "--run",
+            run_id,
+        ]
+    )
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert f"release refused: run {run_id} is abandoned" in err
+
+
 def test_release_run_lock_held_returns_exit_2(tmp_path, monkeypatch, capsys) -> None:
     config_path = _write_operator_config_both(tmp_path)
     autobench_path = _autobench_repo_root(tmp_path)
@@ -897,3 +1040,24 @@ def test_dunder_main_requires_subcommand() -> None:
     )
 
     assert result.returncode == 2
+
+
+def test_phase_already_passed_treats_skipped_as_satisfied(tmp_path) -> None:
+    """A rollback run's skipped verify must not re-enter the chain: re-invoking
+    it is a no-op, but probing its posture first would wrongly demand GitHub
+    reachability during a Bitbucket/Edge rollback."""
+    from edge_deploy.ledger import RunLedger
+
+    ledger = RunLedger.create(
+        tmp_path / "runs",
+        tool="autobench",
+        source_sha="a" * 40,
+        nodes=["node03"],
+        operator="op@example.com",
+        kind="rollback",
+        rollback_tag="release-20260630T221900Z-5335a65",
+    )
+    ledger.set_phase("verify", "skipped", evidence={"reason": "rollback tag"})
+
+    assert cli._phase_already_passed(ledger, "verify", ["node03"])
+    assert not cli._phase_already_passed(ledger, "publish", ["node03"])

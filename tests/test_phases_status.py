@@ -170,3 +170,25 @@ def test_cmd_status_missing_run_exits_two(tmp_path: Path, monkeypatch, capsys) -
     assert main(["status", "--run", "run-missing"]) == 2
     err = capsys.readouterr().err
     assert f"no such run: run-missing under {runs_root}" in err
+
+
+def test_next_skips_skipped_verify_on_rollback_run(tmp_path: Path) -> None:
+    """A rollback run's skipped verify must not strand `next:` on verify forever."""
+    ledger = _create_ledger(tmp_path)
+    ledger.state["kind"] = "rollback"
+    ledger.state["rollback_tag"] = "release-20260630T221900Z-5335a65"
+    ledger._persist_state()
+    ledger.set_phase("verify", "skipped", evidence={"reason": "rollback tag"})
+    ledger.set_phase(
+        "publish",
+        "passed",
+        evidence={"snapshot_sha": SNAPSHOT_SHA, "source_commit": SOURCE_SHA},
+    )
+    run_id = ledger.state["run_id"]
+
+    output = format_run_status(ledger)
+
+    assert (
+        f"next: python -m edge_deploy deploy --run {run_id} --nodes node03,node04"
+        f"   [posture: bitbucket+edge]"
+    ) in output

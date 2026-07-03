@@ -156,6 +156,28 @@ def test_read_remote_text_survives_wrapped_base64() -> None:
     assert read_remote_text(driver, remote_path) == text
 
 
+def test_read_remote_json_ignores_stale_digest_markers_in_scrollback() -> None:
+    remote_path = "~/.edge-deploy/runs/run-1/steps/stale-marker.json"
+    payload = {"schema": "edge-deploy/step/1", "step": "stale", "exit_code": 0}
+    content = json.dumps(payload).encode("utf-8")
+    digest = hashlib.sha256(content).hexdigest()
+    wrapped = _wrap_base64(base64.b64encode(content).decode("ascii"))
+    stale_digest = "f" * 64
+    screen = (
+        f"__EDGE_RESULT_SHA_{stale_digest}__\n"
+        f"old scrollback noise\n"
+        f"\n__EDGE_RESULT_START__\n"
+        f"{wrapped}\n"
+        f"__EDGE_RESULT_SHA_{digest}__\n"
+        f"__EDGE_RESULT_END__\n"
+    )
+    driver = ScriptedDriver(screens=[screen])
+
+    result = read_remote_json(driver, remote_path)
+
+    assert result == payload
+
+
 def test_bootstrap_runner_target_path_embeds_version_and_digest() -> None:
     driver = ScriptedDriver()
     expected_suffix = runner_sha256()[:8]

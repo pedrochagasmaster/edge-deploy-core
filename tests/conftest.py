@@ -147,6 +147,8 @@ class FakeTmuxDriver:
         self._fetch_script = list(fetch_script) if fetch_script else [(0, "")]
         self.runner_step_results = dict(runner_step_results) if runner_step_results else {}
         self.runner_step_commands: list[tuple[str, str, str]] = []
+        # (step_name, decoded shell command) for every runner step invocation.
+        self.decoded_step_commands: list[tuple[str, str]] = []
         self.runner_install_bundle_args: list[str] = []
         self.sent_secrets: list[str] = []
         self.sent_keys: list[str] = []
@@ -208,6 +210,15 @@ class FakeTmuxDriver:
     def ran(self, needle: str) -> bool:
         """True if any captured command contains ``needle``."""
         return any(needle in command for command in self.commands)
+
+    def ran_step(self, needle: str) -> bool:
+        """True if any runner step's decoded shell command contains ``needle``.
+
+        Remote data-bearing commands travel base64-encoded inside
+        ``sh runner.sh <run_id> <step> <b64>`` invocations, so ``ran`` cannot
+        see them; this searches the decoded payloads instead.
+        """
+        return any(needle in command for _step, command in self.decoded_step_commands)
 
     # -- internals ---------------------------------------------------------------------
     def _next_head(self) -> str:
@@ -324,10 +335,15 @@ class FakeTmuxDriver:
         for needle, code in self._command_codes.items():
             if needle in command:
                 return self._sentinel(f"{needle} -> exit {code}", code)
-        runner_match = re.search(r"sh (\S*runner-\S+\.sh) (\S+) (\S+)(?: (\S+))?", command)
+        runner_match = re.search(r"sh (\S*runner-\S+\.sh) (\S+) (\S+) (\S+)(?: (\S+))?", command)
         if runner_match:
-            runner_path, run_id, step_name, bundle_arg = runner_match.groups()
+            runner_path, run_id, step_name, b64_command, bundle_arg = runner_match.groups()
             self.runner_step_commands.append((runner_path, run_id, step_name))
+            try:
+                decoded = base64.b64decode(b64_command).decode("utf-8", "replace")
+            except ValueError:
+                decoded = ""
+            self.decoded_step_commands.append((step_name, decoded))
             if step_name == "install" and bundle_arg is not None:
                 self.runner_install_bundle_args.append(bundle_arg)
             return self._sentinel("", 0)

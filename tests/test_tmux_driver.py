@@ -8,6 +8,7 @@ the shared ``__RC_<nonce>_<code>__`` exit-code protocol still parses.
 from __future__ import annotations
 
 import hashlib
+import shlex
 import subprocess
 from pathlib import Path
 from unittest.mock import call, patch
@@ -38,7 +39,7 @@ def test_enable_pane_log_invokes_pipe_pane(tmp_path: Path) -> None:
     assert result is True
     assert driver.pane_log_supported is True
     tmux.assert_called_once_with(
-        ["pipe-pane", "-t", "sess", "-o", f"cat >> {log_path}"],
+        ["pipe-pane", "-t", "sess", "-o", f"cat >> {shlex.quote(log_path.as_posix())}"],
         check=False,
     )
 
@@ -79,7 +80,7 @@ def test_start_session_enables_pane_log_when_configured(tmp_path: Path) -> None:
     ]
     assert len(pipe_pane_calls) == 1
     assert pipe_pane_calls[0] == call(
-        ["pipe-pane", "-t", "sess", "-o", f"cat >> {log_path}"],
+        ["pipe-pane", "-t", "sess", "-o", f"cat >> {shlex.quote(log_path.as_posix())}"],
         check=False,
     )
 
@@ -238,6 +239,30 @@ def test_upload_file_success_returns_local_digest(tmp_path: Path) -> None:
         command.startswith("sha256sum /remote/bundle.zip") and "cut -d' ' -f1" in command
         for command in commands
     )
+
+
+def test_upload_file_tilde_path_uses_home_expansion_for_precheck(tmp_path: Path) -> None:
+    source = tmp_path / "runner.sh"
+    source.write_bytes(b"#!/bin/sh\n")
+    local_digest = hashlib.sha256(b"#!/bin/sh\n").hexdigest()
+    driver = TmuxDriver("user@edge", "sess", "/repo")
+    remote_path = "~/.edge-deploy/runner-2-deadbeef.sh"
+    commands: list[str] = []
+
+    def fake_run_remote(command: str, **kwargs: object) -> tuple[str, int]:
+        commands.append(command)
+        if "test -f" in command and "sha256sum" in command:
+            return f"{local_digest}\n", 0
+        raise AssertionError(f"unexpected remote command during reuse: {command!r}")
+
+    with patch.object(driver, "run_remote", side_effect=fake_run_remote):
+        digest = driver.upload_file(source, remote_path)
+
+    assert digest == local_digest
+    assert len(commands) == 1
+    assert commands[0].startswith("test -f $HOME/")
+    assert shlex.quote(".edge-deploy/runner-2-deadbeef.sh") in commands[0]
+    assert "~" not in commands[0]
 
 
 def test_dispatch_dynamic_quits_from_dashboard_top() -> None:

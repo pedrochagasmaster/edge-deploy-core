@@ -11,7 +11,6 @@ publish-failed tools, snapshot-unavailable resumes (Risk #1), and pairs left unt
 
 from __future__ import annotations
 
-import inspect
 import json
 import subprocess
 from dataclasses import dataclass
@@ -322,14 +321,15 @@ def _driver_factory_with_pane_log(
 ) -> Callable[..., TmuxDriver]:
     if pane_log_dir is None:
         return driver_factory
-    accepts_pane = "pane_log_path" in inspect.signature(driver_factory).parameters
 
     def factory(node: object, profile: object, **kwargs: Any) -> TmuxDriver:
-        extra: dict[str, Any] = {}
-        if accepts_pane:
-            node_name = getattr(node, "name", "node")
-            extra["pane_log_path"] = pane_log_dir / f"pane-{node_name}.log"
-        return driver_factory(node, profile, **kwargs, **extra)
+        node_name = getattr(node, "name", "node")
+        return driver_factory(
+            node,
+            profile,
+            pane_log_path=pane_log_dir / f"pane-{node_name}.log",
+            **kwargs,
+        )
 
     return factory
 

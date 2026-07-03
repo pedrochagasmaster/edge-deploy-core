@@ -193,3 +193,79 @@ def test_verify_failure_records_failed_state(
     reloaded = RunLedger.load(ledger.run_dir)
     assert reloaded.phase_state("verify") == "failed"
     assert reloaded.state["phases"]["verify"]["evidence"]["commit"] == commit
+
+
+def test_verify_checkout_drift_rejects_mismatched_commit(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bound_commit = "d" * 40
+    checkout_commit = "e" * 40
+    repo_root = _write_tool_profile(tmp_path)
+    config_path = _write_operator_config(tmp_path, repo_root)
+    ledger = _create_ledger(tmp_path, source_sha=bound_commit)
+    run_id = ledger.state["run_id"]
+
+    monkeypatch.chdir(tmp_path / "autobench")
+    monkeypatch.setattr("edge_deploy.posture.socket.create_connection", _reachable_connect)
+    monkeypatch.setattr(
+        "edge_deploy.phases.verify.inspect_repository",
+        lambda *a, **k: SimpleNamespace(commit=checkout_commit),
+    )
+
+    exit_code = cli.main(["--config", config_path, "verify", "--run", run_id])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "checkout drift" in err
+    assert bound_commit[:7] in err
+    assert checkout_commit[:7] in err
+    reloaded = RunLedger.load(ledger.run_dir)
+    assert reloaded.phase_state("verify") == "failed"
+
+
+def test_verify_rollback_skips_ci_and_pytest(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    commit = "f" * 40
+    repo_root = _write_tool_profile(tmp_path)
+    config_path = _write_operator_config(tmp_path, repo_root)
+    repo_root_path = tmp_path / "autobench"
+    runs_root = repo_root_path / "edge-deploy" / "runs"
+    ledger = RunLedger.create(
+        runs_root,
+        tool="autobench",
+        source_sha=commit,
+        nodes=["node03"],
+        operator="operator@example.com",
+        kind="rollback",
+        rollback_tag="release-20260703T120000Z-fffffff",
+    )
+    run_id = ledger.state["run_id"]
+    subprocess_calls: list = []
+
+    def track_subprocess(command, **kwargs):
+        subprocess_calls.append(SimpleNamespace(args=command, kwargs=kwargs))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.chdir(repo_root_path)
+    monkeypatch.setattr("edge_deploy.posture.socket.create_connection", _reachable_connect)
+    monkeypatch.setattr(
+        "edge_deploy.phases.verify.inspect_repository",
+        lambda *a, **k: SimpleNamespace(commit=commit),
+    )
+    monkeypatch.setattr("edge_deploy.phases.verify.require_successful_github_ci", lambda state: None)
+    monkeypatch.setattr("edge_deploy.phases.verify.subprocess.run", track_subprocess)
+
+    exit_code = cli.main(["--config", config_path, "verify", "--run", run_id])
+
+    assert exit_code == 0
+    assert _pytest_calls(subprocess_calls) == []
+    reloaded = RunLedger.load(ledger.run_dir)
+    assert reloaded.phase_state("verify") == "skipped"
+    evidence = reloaded.state["phases"]["verify"]["evidence"]
+    assert evidence["rollback_tag"] == "release-20260703T120000Z-fffffff"
+    assert "skipped for rollback run" in capsys.readouterr().out
+    assert any(
+        event["event"] == "phase_skipped" and event["phase"] == "verify"
+        for event in _events(reloaded)
+    )

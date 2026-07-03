@@ -9,7 +9,7 @@ from pathlib import Path
 
 from edge_deploy.config import OperatorConfig
 from edge_deploy.ledger import RunLedger
-from edge_deploy.phases import PhaseSpec, enter_phase
+from edge_deploy.phases import PhaseSpec, enter_phase, load_run, run_repo_root
 from edge_deploy.posture import PHASE_ENDPOINTS
 from edge_deploy.release import ReleaseSelection, resolve_nodes, run_release
 
@@ -23,25 +23,8 @@ _ROLLOUT_TO_LEDGER = {
 }
 
 
-def _runs_root(repo_root: Path) -> Path:
-    return repo_root / "edge-deploy" / "runs"
-
-
 def _load_run(args: argparse.Namespace, operator: OperatorConfig) -> tuple[RunLedger, Path]:
-    for tool_path in operator.tools.values():
-        repo_root = Path(tool_path).resolve()
-        runs_root = _runs_root(repo_root)
-        run_dir = runs_root / args.run
-        if run_dir.is_dir() and (run_dir / "state.json").is_file():
-            return RunLedger.load(run_dir), repo_root
-
-    repo_root = Path.cwd().resolve()
-    runs_root = _runs_root(repo_root)
-    run_dir = runs_root / args.run
-    if not run_dir.is_dir() or not (run_dir / "state.json").is_file():
-        print(f"no such run: {args.run} under {runs_root}", file=sys.stderr)
-        raise SystemExit(2)
-    return RunLedger.load(run_dir), repo_root
+    return load_run(args, operator)
 
 
 def _deploy_next_command(run_id: str, nodes: str | None) -> str:
@@ -79,7 +62,7 @@ def run_deploy(args: argparse.Namespace, operator: OperatorConfig) -> int:
     ledger, repo_root = _load_run(args, operator)
     run_id = ledger.state["run_id"]
     tool = ledger.state["tool"]
-    repo_root = Path(operator.tool_path(tool)).resolve()
+    repo_root = run_repo_root(ledger, operator, repo_root)
     effective_operator = replace(operator, tools={tool: str(repo_root)})
     if args.nodes:
         requested_nodes = resolve_nodes(effective_operator, args.nodes)

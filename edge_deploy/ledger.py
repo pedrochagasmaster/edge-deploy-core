@@ -6,8 +6,9 @@ import hashlib
 import json
 import os
 import socket
+import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
@@ -44,12 +45,12 @@ def _file_sha256(path: Path) -> str:
 
 def _content_sha256(package_dir: Path) -> str:
     py_files = sorted(
-        (p for p in package_dir.iterdir() if p.is_file() and p.suffix == ".py"),
-        key=lambda p: p.name.replace("\\", "/"),
+        (p for p in package_dir.rglob("*.py") if p.is_file()),
+        key=lambda p: p.relative_to(package_dir).as_posix(),
     )
     parts: list[str] = []
     for path in py_files:
-        relpath = path.name.replace("\\", "/")
+        relpath = path.relative_to(package_dir).as_posix()
         parts.append(f"{relpath}\n{_file_sha256(path)}\n")
     return hashlib.sha256("".join(parts).encode("utf-8")).hexdigest()
 
@@ -70,7 +71,17 @@ def _empty_phase() -> dict:
 def _write_json_atomic(path: Path, payload: dict) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    # Windows refuses os.replace while a concurrent reader (status, another
+    # phase's load) holds the target open; retry briefly instead of crashing
+    # a release mid-phase.
+    for attempt in range(5):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 def _validate_state(state: dict) -> None:
@@ -82,6 +93,7 @@ def _validate_state(state: dict) -> None:
 class RunLedger:
     run_dir: Path
     state: dict
+    _lock_depth: int = field(default=0, repr=False)
 
     @classmethod
     def create(
@@ -233,30 +245,54 @@ class RunLedger:
         self._persist_state()
         self.record_event("run_completed")
 
+    def _raise_foreign_lock(self, payload: dict) -> None:
+        run_id = self.state["run_id"]
+        pid = payload["pid"]
+        hostname = payload["hostname"]
+        acquired_at = payload["acquired_at"]
+        raise RunLockError(
+            f"run {run_id} is locked by PID {pid} on {hostname} "
+            f"(acquired {acquired_at}); if that process is dead, "
+            f"re-run with --force-lock"
+        )
+
     def acquire_lock(self, *, force: bool = False) -> None:
+        if self._lock_depth > 0:
+            self._lock_depth += 1
+            return
+
         lock_path = self.run_dir / "run.lock"
         if lock_path.is_file():
             payload = json.loads(lock_path.read_text(encoding="utf-8"))
             if not force:
-                run_id = self.state["run_id"]
-                pid = payload["pid"]
-                hostname = payload["hostname"]
-                acquired_at = payload["acquired_at"]
-                raise RunLockError(
-                    f"run {run_id} is locked by PID {pid} on {hostname} "
-                    f"(acquired {acquired_at}); if that process is dead, "
-                    f"re-run with --force-lock"
-                )
+                self._raise_foreign_lock(payload)
             lock_path.unlink()
             self.record_event("lock_stolen")
+
         payload = {
             "pid": os.getpid(),
             "hostname": socket.gethostname(),
             "acquired_at": _utc_iso(),
         }
-        lock_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        encoded = (json.dumps(payload) + "\n").encode("utf-8")
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            existing = json.loads(lock_path.read_text(encoding="utf-8"))
+            self._raise_foreign_lock(existing)
+        else:
+            try:
+                os.write(fd, encoded)
+            finally:
+                os.close(fd)
+        self._lock_depth = 1
 
     def release_lock(self) -> None:
+        if self._lock_depth <= 0:
+            return
+        self._lock_depth -= 1
+        if self._lock_depth > 0:
+            return
         lock_path = self.run_dir / "run.lock"
         lock_path.unlink(missing_ok=True)
 

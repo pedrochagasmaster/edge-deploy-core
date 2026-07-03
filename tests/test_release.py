@@ -274,7 +274,7 @@ def test_release_delivers_dependency_change(fake_tmux, tmp_path, patched_drift, 
     assert report.rollouts[0]["dependency"]["source_sha"] == "src1234abcd"
     assert report.exit_code() == 0
     assert drivers["node03"].uploads
-    assert drivers["node03"].ran("./update.sh")
+    assert drivers["node03"].ran_step("./update.sh")
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +333,7 @@ def test_release_snapshot_skips_publish_and_reuses_sha(fake_tmux, tmp_path, monk
     assert report.selection["snapshot_override"] == SNAP
     assert report.summary()["counts"]["rolled_out"] == 2
     assert report.exit_code() == 0
-    assert drivers["node03"].ran(f"./update.sh {SNAP}")
+    assert drivers["node03"].ran_step(f"./update.sh {SNAP}")
 
 
 def test_release_tool_snapshots_resume_both_tools_without_publish(
@@ -365,8 +365,8 @@ def test_release_tool_snapshots_resume_both_tools_without_publish(
 
     assert not any(e[0] == "publish" for e in events)
     assert report.selection["snapshot_by_tool"] == {"autobench": autobench_snapshot, "robocop": robocop_snapshot}
-    assert drivers["node03"].ran(f"./update.sh {autobench_snapshot}")
-    assert drivers["node03"].ran(f"./update.sh {robocop_snapshot}")
+    assert drivers["node03"].ran_step(f"./update.sh {autobench_snapshot}")
+    assert drivers["node03"].ran_step(f"./update.sh {robocop_snapshot}")
     assert report.exit_code() == 0
 
 
@@ -527,7 +527,11 @@ def test_release_retries_transient_git_preflight_once(fake_tmux, tmp_path, patch
 
     assert report.exit_code() == 0
     assert rollout_calls == ["autobench", "autobench"]
-    fetch_commands = [command for command in drivers["node03"].commands if "git fetch --prune" in command]
+    fetch_commands = [
+        command
+        for _step, command in drivers["node03"].decoded_step_commands
+        if "git fetch --prune" in command
+    ]
     assert len(fetch_commands) == 3
 
 
