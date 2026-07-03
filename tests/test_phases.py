@@ -201,3 +201,38 @@ def test_registry_driven_subcommand_appears_in_help() -> None:
         assert "Dummy phase for registry test" in help_text
     finally:
         PHASE_REGISTRY.pop()
+
+
+# ---------------------------------------------------------------------------
+# run_repo_root: operator `tools` mapping is optional (docs/DESIGN.md calls it
+# backward-compatible only; the real operator config defines none)
+# ---------------------------------------------------------------------------
+
+
+def test_run_repo_root_falls_back_without_tools_mapping(tmp_path) -> None:
+    from pathlib import Path
+
+    from edge_deploy.config import OperatorConfig
+    from edge_deploy.phases import run_repo_root
+
+    ledger = _create_ledger(tmp_path)
+    operator = OperatorConfig(operator_email="op@example.com")  # no tools mapping
+    fallback = Path(tmp_path / "checkout")
+
+    assert run_repo_root(ledger, operator, fallback) == fallback
+
+
+def test_run_repo_root_prefers_tools_mapping(tmp_path) -> None:
+    from pathlib import Path
+
+    from edge_deploy.config import OperatorConfig
+    from edge_deploy.phases import run_repo_root
+
+    ledger = _create_ledger(tmp_path)
+    mapped = tmp_path / "mapped-checkout"
+    operator = OperatorConfig(
+        operator_email="op@example.com",
+        tools={"autobench": str(mapped)},
+    )
+
+    assert run_repo_root(ledger, operator, Path(tmp_path / "cwd")) == mapped.resolve()

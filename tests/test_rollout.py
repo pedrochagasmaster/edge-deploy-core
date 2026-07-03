@@ -382,7 +382,7 @@ def test_run_rollout_records_install_output_tail_on_failure(
     profile = load_profile(tool)
     driver = fake_tmux(head_commits=[PREVIOUS, TARGET], changed_paths=changed, install_code=1)
 
-    report = run_rollout(driver, profile, sample_node, target_commit=TARGET, install_mode="always")
+    report = run_rollout(driver, profile, sample_node, target_commit=TARGET, install_mode="always", run_id=RUN_ID)
 
     install_check = next(check for check in report.checks if check.name == "install")
     assert install_check.passed is False
@@ -398,7 +398,7 @@ def test_run_rollout_preflights_offline_install_before_running_install(
     profile = load_profile(tool)
     driver = fake_tmux(head_commits=[PREVIOUS, TARGET], changed_paths=changed, install_preflight_code=1)
 
-    report = run_rollout(driver, profile, sample_node, target_commit=TARGET, install_mode="always")
+    report = run_rollout(driver, profile, sample_node, target_commit=TARGET, install_mode="always", run_id=RUN_ID)
 
     assert report.status == "failed"
     preflight_check = next(check for check in report.checks if check.name == "install_preflight")

@@ -10,7 +10,7 @@ from pathlib import Path
 
 from edge_deploy.config import OperatorConfig, load_tool_profile
 from edge_deploy.ledger import RunLedger
-from edge_deploy.phases import PhaseSpec, enter_phase, load_run
+from edge_deploy.phases import PhaseSpec, enter_phase, load_run, run_repo_root
 from edge_deploy.posture import PHASE_ENDPOINTS
 from edge_deploy.repository import RepositoryError, inspect_repository, require_successful_github_ci
 
@@ -102,8 +102,7 @@ def ensure_verified(
 
 def _cmd_verify(args: argparse.Namespace, operator: OperatorConfig) -> int:
     ledger, repo_root = load_run(args, operator)
-    tool = ledger.state["tool"]
-    repo_root = Path(operator.tool_path(tool)).resolve()
+    repo_root = run_repo_root(ledger, operator, repo_root)
     profile = load_tool_profile(repo_root)
     next_command = f"python -m edge_deploy verify --run {args.run}"
     stack = enter_phase(

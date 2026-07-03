@@ -19,7 +19,6 @@ from pathlib import Path
 
 from edge_deploy import __version__, drift, preflight, rollout
 from edge_deploy.audit import AuditAttempt, AuditSyncError, append_audit_attempt
-from edge_deploy.auth import AuthBroker
 from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, OperatorConfig, load_tool_profile
 from edge_deploy.ledger import LedgerError, RunLedger
 from edge_deploy.mirror import MirrorError, mirror_release
@@ -30,7 +29,6 @@ from edge_deploy.phases.status import register_status
 from edge_deploy.phases.tag import _cmd_tag_bitbucket, _cmd_tag_github
 from edge_deploy.phases.verify import VERIFY_SPEC, ensure_verified
 from edge_deploy.posture import PHASE_ENDPOINTS, PostureError, SocketConnector, endpoints_for, probe
-from edge_deploy.progress import ReleaseProgressTracker
 from edge_deploy.publish import PublishError, publish_snapshot
 from edge_deploy.release import resolve_nodes
 from edge_deploy.reporting import OperationReport, redact, write_report
@@ -177,7 +175,10 @@ def _print_open_run_refusal(run: dict) -> None:
 def _phase_already_passed(ledger: RunLedger, phase: str, requested_nodes: list[str]) -> bool:
     if phase == "deploy":
         return all(ledger.phase_state("deploy", node=node) == "passed" for node in requested_nodes)
-    return ledger.phase_state(phase) == "passed"
+    # "skipped" is a satisfied terminal state (e.g. verify on a rollback run):
+    # re-invoking the phase would be a no-op, but probing its posture first
+    # would wrongly demand GitHub reachability during a Bitbucket/Edge rollback.
+    return ledger.phase_state(phase) in ("passed", "skipped")
 
 
 def _posture_blocks_phase(
@@ -242,7 +243,6 @@ def _run_verify_phase(
 def _invoke_release_phase(
     phase: str,
     args: argparse.Namespace,
-    operator: OperatorConfig,
     ledger: RunLedger,
     *,
     repo_root: Path,
@@ -281,19 +281,18 @@ def _invoke_release_phase(
             auth_wait_seconds=args.auth_wait_seconds,
             force_lock=args.force_lock,
         )
-        return run_deploy(deploy_args, operator)
+        return run_deploy(deploy_args, effective_operator)
     if phase == "tag_github":
         tag_args = argparse.Namespace(run=run_id, force_lock=args.force_lock)
-        return _cmd_tag_github(tag_args, operator)
+        return _cmd_tag_github(tag_args, effective_operator)
     if phase == "tag_bitbucket":
         tag_args = argparse.Namespace(run=run_id, force_lock=args.force_lock)
-        return _cmd_tag_bitbucket(tag_args, operator)
+        return _cmd_tag_bitbucket(tag_args, effective_operator)
     raise ValueError(f"unknown release phase: {phase}")
 
 
 def _chain_release_phases(
     args: argparse.Namespace,
-    operator: OperatorConfig,
     ledger: RunLedger,
     *,
     repo_root: Path,
@@ -313,7 +312,6 @@ def _chain_release_phases(
         code = _invoke_release_phase(
             phase,
             args,
-            operator,
             ledger,
             repo_root=repo_root,
             profile=profile,
@@ -386,7 +384,6 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
     with ledger.locked(force=args.force_lock):
         return _chain_release_phases(
             args,
-            operator,
             ledger,
             repo_root=repo_root,
             profile=profile,
@@ -534,7 +531,6 @@ def _cmd_rollback(args: argparse.Namespace, operator: OperatorConfig) -> int:
     with ledger.locked(force=args.force_lock):
         return _chain_release_phases(
             args,
-            operator,
             ledger,
             repo_root=repo_root,
             profile=profile,
@@ -542,39 +538,6 @@ def _cmd_rollback(args: argparse.Namespace, operator: OperatorConfig) -> int:
             node_names=node_names,
             repo_state=repo_state,
         )
-
-
-def _run_release_preflight(
-    operator: OperatorConfig,
-    profile,
-    repo_root: Path,
-    node_names: list[str],
-    ledger: RunLedger,
-    *,
-    auth_mode: str,
-    max_auth_attempts: int,
-    auth_wait_seconds: float,
-    repo_state=None,
-):
-    state = ensure_verified(
-        operator,
-        profile,
-        repo_root,
-        ledger,
-        reverify=False,
-        repo_state=repo_state,
-    )
-
-    for node_name in node_names:
-        node = operator.node(node_name)
-        driver = TmuxDriver.from_node_and_profile(node, profile, retries=2)
-        tracker = ReleaseProgressTracker(
-            ledger.run_dir,
-            notify_fn=lambda message: print(redact(f"[release] {message}")),
-        )
-        broker = AuthBroker(tracker, auth_mode, auth_wait_seconds, max_auth_attempts)
-        broker.ensure_authenticated(driver, node_name)
-    return state
 
 
 def _record_release_attempt(

@@ -9,7 +9,7 @@ from pathlib import Path
 
 from edge_deploy.config import OperatorConfig
 from edge_deploy.ledger import RunLedger
-from edge_deploy.phases import PhaseSpec, enter_phase, load_run
+from edge_deploy.phases import PhaseSpec, enter_phase, load_run, run_repo_root
 from edge_deploy.posture import PHASE_ENDPOINTS
 from edge_deploy.release import ReleaseSelection, resolve_nodes, run_release
 
@@ -62,7 +62,7 @@ def run_deploy(args: argparse.Namespace, operator: OperatorConfig) -> int:
     ledger, repo_root = _load_run(args, operator)
     run_id = ledger.state["run_id"]
     tool = ledger.state["tool"]
-    repo_root = Path(operator.tool_path(tool)).resolve()
+    repo_root = run_repo_root(ledger, operator, repo_root)
     effective_operator = replace(operator, tools={tool: str(repo_root)})
     if args.nodes:
         requested_nodes = resolve_nodes(effective_operator, args.nodes)

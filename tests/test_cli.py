@@ -1040,3 +1040,24 @@ def test_dunder_main_requires_subcommand() -> None:
     )
 
     assert result.returncode == 2
+
+
+def test_phase_already_passed_treats_skipped_as_satisfied(tmp_path) -> None:
+    """A rollback run's skipped verify must not re-enter the chain: re-invoking
+    it is a no-op, but probing its posture first would wrongly demand GitHub
+    reachability during a Bitbucket/Edge rollback."""
+    from edge_deploy.ledger import RunLedger
+
+    ledger = RunLedger.create(
+        tmp_path / "runs",
+        tool="autobench",
+        source_sha="a" * 40,
+        nodes=["node03"],
+        operator="op@example.com",
+        kind="rollback",
+        rollback_tag="release-20260630T221900Z-5335a65",
+    )
+    ledger.set_phase("verify", "skipped", evidence={"reason": "rollback tag"})
+
+    assert cli._phase_already_passed(ledger, "verify", ["node03"])
+    assert not cli._phase_already_passed(ledger, "publish", ["node03"])

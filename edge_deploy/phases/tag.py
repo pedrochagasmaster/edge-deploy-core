@@ -12,7 +12,7 @@ from pathlib import Path
 
 from edge_deploy.config import OperatorConfig, load_tool_profile
 from edge_deploy.ledger import RunLedger
-from edge_deploy.phases import PHASE_REGISTRY, PhaseSpec, enter_phase, load_run
+from edge_deploy.phases import PHASE_REGISTRY, PhaseSpec, enter_phase, load_run, run_repo_root
 from edge_deploy.posture import PHASE_ENDPOINTS
 
 TAG_GITHUB_SPEC = PhaseSpec(
@@ -50,9 +50,9 @@ def _all_deploy_nodes_passed(ledger: RunLedger) -> bool:
     return all(deploy[node]["state"] == "passed" for node in ledger.state["nodes"])
 
 
-def _load_ledger(args: argparse.Namespace, operator: OperatorConfig) -> RunLedger:
-    ledger, _repo_root = load_run(args, operator)
-    return ledger
+def _load_ledger(args: argparse.Namespace, operator: OperatorConfig) -> tuple[RunLedger, Path]:
+    ledger, repo_root = load_run(args, operator)
+    return ledger, run_repo_root(ledger, operator, repo_root)
 
 
 def _dereferenced_tag_sha(
@@ -87,9 +87,7 @@ def _release_overall(run_dir: Path) -> str:
 
 
 def _cmd_tag_github(args: argparse.Namespace, operator: OperatorConfig) -> int:
-    ledger = _load_ledger(args, operator)
-    tool = ledger.state["tool"]
-    repo_root = Path(operator.tool_path(tool)).resolve()
+    ledger, repo_root = _load_ledger(args, operator)
     run_id = ledger.state["run_id"]
     source_sha = ledger.state["source_sha"]
     next_command = f"python -m edge_deploy tag-github --run {run_id}"
@@ -135,9 +133,7 @@ def _cmd_tag_github(args: argparse.Namespace, operator: OperatorConfig) -> int:
 
 
 def _cmd_tag_bitbucket(args: argparse.Namespace, operator: OperatorConfig) -> int:
-    ledger = _load_ledger(args, operator)
-    tool = ledger.state["tool"]
-    repo_root = Path(operator.tool_path(tool)).resolve()
+    ledger, repo_root = _load_ledger(args, operator)
     profile = load_tool_profile(repo_root)
     run_id = ledger.state["run_id"]
     source_sha = ledger.state["source_sha"]

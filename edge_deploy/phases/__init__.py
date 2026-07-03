@@ -55,6 +55,20 @@ def load_run(args: argparse.Namespace, operator: OperatorConfig) -> tuple[RunLed
     return RunLedger.load(run_dir), repo_root
 
 
+def run_repo_root(ledger: RunLedger, operator: OperatorConfig, fallback: Path) -> Path:
+    """The tool checkout a run operates on.
+
+    The operator ``tools`` mapping is optional ("backward-compatible only" per
+    docs/DESIGN.md; the real config defines none), so fall back to the repo root
+    the run was found under (:func:`load_run`'s validated cwd fallback) instead
+    of raising ``KeyError`` from ``operator.tool_path``.
+    """
+    tool = ledger.state["tool"]
+    if tool in operator.tools:
+        return Path(operator.tools[tool]).resolve()
+    return fallback
+
+
 def enter_phase(
     spec: PhaseSpec,
     operator: OperatorConfig | None,

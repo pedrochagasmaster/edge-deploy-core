@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import socket
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -70,7 +71,17 @@ def _empty_phase() -> dict:
 def _write_json_atomic(path: Path, payload: dict) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    # Windows refuses os.replace while a concurrent reader (status, another
+    # phase's load) holds the target open; retry briefly instead of crashing
+    # a release mid-phase.
+    for attempt in range(5):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 def _validate_state(state: dict) -> None:
