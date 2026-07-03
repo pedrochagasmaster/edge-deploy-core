@@ -285,6 +285,54 @@ def test_upload_file_tilde_path_expands_home_in_every_remote_command(tmp_path: P
     assert decode_cmd.count(".expanduser()") == 2
 
 
+def test_upload_file_decode_resolves_concrete_interpreter(tmp_path: Path) -> None:
+    """Regression: bare ``python3`` is not on PATH on the Edge Nodes; the decode
+    step must resolve an interpreter and stay compatible with old platform
+    Pythons (no ``unlink(missing_ok=...)``, which needs 3.8+)."""
+    source = tmp_path / "runner.sh"
+    source.write_bytes(b"#!/bin/sh\n")
+    local_digest = hashlib.sha256(b"#!/bin/sh\n").hexdigest()
+    driver = TmuxDriver("user@edge", "sess", "/repo")
+    decode_cmds: list[str] = []
+
+    def fake_run_remote(command: str, **kwargs: object) -> tuple[str, int]:
+        if "test -f" in command and "sha256sum" in command:
+            return "MISSING\n", 0
+        if "base64.b64decode" in command:
+            decode_cmds.append(command)
+            return "", 0
+        if command.startswith("sha256sum "):
+            return f"{local_digest}\n", 0
+        return "", 0
+
+    with patch.object(driver, "run_remote", side_effect=fake_run_remote):
+        driver.upload_file(source, "/remote/runner.sh")
+
+    (decode_cmd,) = decode_cmds
+    assert not decode_cmd.startswith("python3")
+    assert decode_cmd.startswith('"$(command -v python3.11 || command -v python3.10')
+    assert "missing_ok" not in decode_cmd
+
+
+def test_upload_file_decode_failure_reports_exit_code_and_screen(tmp_path: Path) -> None:
+    source = tmp_path / "runner.sh"
+    source.write_bytes(b"#!/bin/sh\n")
+    driver = TmuxDriver("user@edge", "sess", "/repo")
+
+    def fake_run_remote(command: str, **kwargs: object) -> tuple[str, int]:
+        if "test -f" in command and "sha256sum" in command:
+            return "MISSING\n", 0
+        if "base64.b64decode" in command:
+            return "bash: python3.11: command not found\n", 127
+        return "", 0
+
+    with patch.object(driver, "run_remote", side_effect=fake_run_remote):
+        with pytest.raises(RuntimeError, match=r"(?s)exit 127.*command not found") as excinfo:
+            driver.upload_file(source, "/remote/runner.sh")
+
+    assert "could not decode /remote/runner.sh" in str(excinfo.value)
+
+
 def test_upload_file_splits_base64_payload_into_short_heredoc_lines(tmp_path: Path) -> None:
     """Regression: each heredoc line travels as one psmux send-keys argument, so no
     line may approach the Windows 32 KiB process command-line limit."""

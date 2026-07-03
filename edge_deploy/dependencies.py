@@ -250,7 +250,9 @@ def _stage_script(
         str(item["path"]): str(item["sha256"])
         for item in bundle.manifest["files"]  # type: ignore[index]
     }
-    evidence_path = f"$HOME/.edge-deploy/runs/{run_id}/steps/dependency-stage-evidence.json"
+    # Expanded by os.path.expanduser on the node, which only understands ``~``
+    # (not ``$HOME``).
+    evidence_path = f"~/.edge-deploy/runs/{run_id}/steps/dependency-stage-evidence.json"
     return f"""
 import hashlib, json, os, shutil, subprocess, sys, tempfile, zipfile
 from pathlib import Path

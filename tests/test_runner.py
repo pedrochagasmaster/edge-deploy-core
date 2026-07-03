@@ -191,6 +191,15 @@ def test_bootstrap_runner_target_path_embeds_version_and_digest() -> None:
     assert driver.upload_contents[0].startswith("#!/bin/sh")
 
 
+def test_runner_script_never_invokes_bare_python3() -> None:
+    """Regression: bare ``python3`` is not on PATH on the Edge Nodes; the runner
+    must resolve a concrete interpreter before its JSON-summary step."""
+    assert "\npython3" not in RUNNER_SCRIPT
+    assert 'edge_python="$(command -v python3.11 || command -v python3.10' in RUNNER_SCRIPT
+    assert '"$edge_python" <<PY' in RUNNER_SCRIPT
+    assert "/sys_apps_01/python/python310/bin/python3.10" in RUNNER_SCRIPT
+
+
 def test_runner_script_install_step_exports_bundle_env_when_bundle_dir_set() -> None:
     assert '[ "$step_name" = "install" ]' in RUNNER_SCRIPT
     assert '[ "$bundle_dir" != "-" ]' in RUNNER_SCRIPT

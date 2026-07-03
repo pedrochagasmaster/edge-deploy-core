@@ -32,6 +32,8 @@ import time
 import uuid
 from pathlib import Path
 
+from edge_deploy.remote_python import REMOTE_PYTHON_EXPR
+
 # Matches an ANSI escape sequence so screen text can be inspected as plain text.
 _ANSI_RE = r"\x1b\[[0-9;?]*[ -/]*[@-~]"
 
@@ -373,25 +375,34 @@ class TmuxDriver:
             ]
             body = "\n".join(chunk_lines)
             append_cmd = f"cat >> {shell_b64} <<'{marker}'\n{body}\n{marker}"
-            _screen, rc = self.run_remote(append_cmd, timeout=120.0)
+            screen, rc = self.run_remote(append_cmd, timeout=120.0)
             if rc:
-                raise RuntimeError(f"authenticated bundle transfer failed: could not write {remote_b64}")
+                raise RuntimeError(
+                    f"authenticated bundle transfer failed: could not write {remote_b64} "
+                    f"(exit {rc}); last screen:\n{self._screen_tail(screen)}"
+                )
 
+        # Bare ``python3`` is not on PATH on the Edge Nodes; resolve a concrete
+        # interpreter. ``unlink()`` without ``missing_ok`` keeps the script
+        # compatible with older platform interpreters (< 3.8).
         decode_script = (
-            "python3 - <<'PY'\n"
+            f"{REMOTE_PYTHON_EXPR} - <<'PY'\n"
             "import base64, pathlib\n"
             f"source = pathlib.Path({remote_b64!r}).expanduser()\n"
             f"target = pathlib.Path({remote_path!r}).expanduser()\n"
             "target.parent.mkdir(parents=True, exist_ok=True)\n"
             "target.write_bytes(base64.b64decode(source.read_text(encoding='ascii')))\n"
-            "source.unlink(missing_ok=True)\n"
+            "source.unlink()\n"
             "PY"
         )
-        _screen, rc = self.run_remote(decode_script, timeout=300.0)
+        screen, rc = self.run_remote(decode_script, timeout=300.0)
         if rc:
             cleanup_cmd = f"rm -f {shell_b64}"
             self.run_remote(cleanup_cmd, timeout=30.0, ensure_shell=False)
-            raise RuntimeError(f"authenticated bundle transfer failed: could not decode {remote_path}")
+            raise RuntimeError(
+                f"authenticated bundle transfer failed: could not decode {remote_path} "
+                f"(exit {rc}); last screen:\n{self._screen_tail(screen)}"
+            )
 
         verify_cmd = f"sha256sum {shell_path} | cut -d' ' -f1"
         screen, _rc = self.run_remote(verify_cmd, timeout=60.0)
@@ -621,6 +632,12 @@ class TmuxDriver:
         match = re.search(pattern, screen)
         exit_code = int(match.group(1)) if match else -1
         return screen, exit_code
+
+    def _screen_tail(self, screen: str, lines: int = 15) -> str:
+        """Last non-blank screen lines, for embedding in transfer error messages."""
+        plain = re.sub(_ANSI_RE, "", screen)
+        kept = [line for line in plain.splitlines() if line.strip()]
+        return "\n".join(kept[-lines:])
 
     def _last_nonempty_line(self, screen: str | None = None) -> str:
         text = screen if screen is not None else self.capture_screen()

@@ -14,6 +14,7 @@ import subprocess
 from pathlib import Path
 
 from edge_deploy.config import ToolProfile
+from edge_deploy.remote_python import REMOTE_PYTHON_EXPR
 from edge_deploy.reporting import OperationReport, ReportCheck, report_node_name
 from edge_deploy.tmux_driver import TmuxDriver
 
@@ -78,8 +79,7 @@ def _extract_payload(screen: str, start: str, end: str) -> str:
 
 def _remote_python(driver: TmuxDriver, script: str, *, timeout: float = 60.0) -> tuple[str, int]:
     encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
-    py = "$(command -v python3.11 || command -v python3.10 || command -v python3)"
-    command = f"printf %s {encoded} | base64 -d | {py} -"
+    command = f"printf %s {encoded} | base64 -d | {REMOTE_PYTHON_EXPR} -"
     return driver.run_remote(command, timeout=timeout)
 
 

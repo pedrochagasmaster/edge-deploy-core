@@ -24,6 +24,7 @@ from typing import Callable
 
 from edge_deploy.config import ToolProfile
 from edge_deploy.dependencies import BundleError, DependencyBundle, deliver_dependency_bundle
+from edge_deploy.remote_python import REMOTE_PYTHON_EXPR
 from edge_deploy.reporting import OperationReport, ReportCheck, report_node_name
 from edge_deploy.runner import bootstrap_runner, read_remote_json, read_remote_text, run_step
 from edge_deploy.tmux_driver import TmuxDriver
@@ -456,7 +457,9 @@ def _permission_evidence(
     runner_path: str,
     run_id: str,
 ) -> dict[str, object]:
-    evidence_path = f"$HOME/.edge-deploy/runs/{run_id}/steps/permission-check-data.json"
+    # Expanded by Python's Path.expanduser() on the node, which only understands
+    # ``~`` (not ``$HOME``).
+    evidence_path = f"~/.edge-deploy/runs/{run_id}/steps/permission-check-data.json"
     script = f"""
 import json
 import os
@@ -493,7 +496,7 @@ out.write_text(json.dumps(payload, sort_keys=True))
         runner_path,
         run_id,
         "permission-check",
-        f"python3 - <<'PY'\n{script}\nPY",
+        f"{REMOTE_PYTHON_EXPR} - <<'PY'\n{script}\nPY",
         timeout=120,
     )
     if int(result.get("exit_code", 1)) != 0:
