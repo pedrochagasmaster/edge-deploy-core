@@ -353,16 +353,26 @@ class TmuxDriver:
         remote_dir = posixpath.dirname(remote_path) or "."
         upload_id = uuid.uuid4().hex[:12]
         remote_b64 = f"{remote_path}.edge-deploy-{upload_id}.b64"
-        mkdir_cmd = f"mkdir -p {shlex.quote(remote_dir)} && rm -f {shlex.quote(remote_b64)}"
+        shell_b64 = _shell_remote_path(remote_b64)
+        mkdir_cmd = f"mkdir -p {_shell_remote_path(remote_dir)} && rm -f {shell_b64}"
         _screen, rc = self.run_remote(mkdir_cmd, timeout=60.0)
         if rc:
             raise RuntimeError(f"authenticated bundle transfer failed: could not prepare {remote_dir}")
 
         marker = f"__EDGE_DEPLOY_UPLOAD_{upload_id}__"
-        chunk_size = 32768
+        # Each heredoc line travels as one psmux ``send-keys`` argument; keep lines well
+        # under the Windows 32 KiB process command-line limit. ``base64.b64decode``
+        # discards the extra newlines when the remote side reassembles the payload.
+        line_size = 2048
+        lines_per_heredoc = 16
+        chunk_size = line_size * lines_per_heredoc
         for offset in range(0, len(encoded), chunk_size):
             chunk = encoded[offset : offset + chunk_size]
-            append_cmd = f"cat >> {shlex.quote(remote_b64)} <<'{marker}'\n{chunk}\n{marker}"
+            chunk_lines = [
+                chunk[i : i + line_size] for i in range(0, len(chunk), line_size)
+            ]
+            body = "\n".join(chunk_lines)
+            append_cmd = f"cat >> {shell_b64} <<'{marker}'\n{body}\n{marker}"
             _screen, rc = self.run_remote(append_cmd, timeout=120.0)
             if rc:
                 raise RuntimeError(f"authenticated bundle transfer failed: could not write {remote_b64}")
@@ -370,8 +380,8 @@ class TmuxDriver:
         decode_script = (
             "python3 - <<'PY'\n"
             "import base64, pathlib\n"
-            f"source = pathlib.Path({remote_b64!r})\n"
-            f"target = pathlib.Path({remote_path!r})\n"
+            f"source = pathlib.Path({remote_b64!r}).expanduser()\n"
+            f"target = pathlib.Path({remote_path!r}).expanduser()\n"
             "target.parent.mkdir(parents=True, exist_ok=True)\n"
             "target.write_bytes(base64.b64decode(source.read_text(encoding='ascii')))\n"
             "source.unlink(missing_ok=True)\n"
@@ -379,7 +389,7 @@ class TmuxDriver:
         )
         _screen, rc = self.run_remote(decode_script, timeout=300.0)
         if rc:
-            cleanup_cmd = f"rm -f {shlex.quote(remote_b64)}"
+            cleanup_cmd = f"rm -f {shell_b64}"
             self.run_remote(cleanup_cmd, timeout=30.0, ensure_shell=False)
             raise RuntimeError(f"authenticated bundle transfer failed: could not decode {remote_path}")
 
@@ -390,7 +400,7 @@ class TmuxDriver:
             screen = self.capture_screen(history_lines=4000)
             remote_digest = self._extract_hex_digest(screen)
         if remote_digest != local_digest:
-            cleanup_cmd = f"rm -f {shlex.quote(remote_path)}"
+            cleanup_cmd = f"rm -f {shell_path}"
             self.run_remote(cleanup_cmd, timeout=30.0, ensure_shell=False)
             raise RuntimeError(
                 f"authenticated bundle transfer failed: digest mismatch for {remote_path}"
@@ -585,11 +595,20 @@ class TmuxDriver:
         # The ``'`` split keeps literal markers out of the echoed command line: bash
         # concatenates them so only printed output contains the start/end sentinels.
         start_marker = f"__START_{nonce}__"
-        marker_cmd = (
-            f"printf '\\n__START''_{nonce}__\\n'; "
-            f"{command}; printf '\\n__RC''_{nonce}_%s__\\n' \"$?\""
-        )
-        self.send_keys(marker_cmd)
+        start_cmd = f"printf '\\n__START''_{nonce}__\\n'; "
+        rc_cmd = f"printf '\\n__RC''_{nonce}_%s__\\n' \"$?\""
+        if "\n" in command:
+            # psmux ``send-keys`` drops everything after the first embedded newline, so
+            # multi-line commands (heredocs) must go over line by line. The RC sentinel is
+            # sent as its own line: appending ``; printf`` to the last command line would
+            # corrupt a heredoc terminator, which must appear alone on its line.
+            for line in (start_cmd + command).split("\n"):
+                self.send_keys(line, literal=True)
+                self.send_key("Enter")
+            self.send_keys(rc_cmd, literal=True)
+            self.send_key("Enter")
+        else:
+            self.send_keys(f"{start_cmd}{command}; {rc_cmd}")
 
         pattern = rf"__RC_{nonce}_(\d+)__"
         self.wait_for(pattern, timeout=timeout, poll_interval=0.5)

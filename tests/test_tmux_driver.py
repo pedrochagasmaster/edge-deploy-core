@@ -241,6 +241,80 @@ def test_upload_file_success_returns_local_digest(tmp_path: Path) -> None:
     )
 
 
+def test_upload_file_tilde_path_expands_home_in_every_remote_command(tmp_path: Path) -> None:
+    """Regression: mkdir/append/decode/verify must never quote the tilde.
+
+    ``shlex.quote('~/...')`` yields ``'~/...'`` which the remote shell treats as a
+    literal ``./~`` directory, so the payload lands in the wrong place and the
+    ``$HOME``-based digest verify can never match.
+    """
+    source = tmp_path / "runner.sh"
+    source.write_bytes(b"#!/bin/sh\n")
+    local_digest = hashlib.sha256(b"#!/bin/sh\n").hexdigest()
+    driver = TmuxDriver("user@edge", "sess", "/repo")
+    remote_path = "~/.edge-deploy/runner-2-deadbeef.sh"
+    commands: list[str] = []
+
+    def fake_run_remote(command: str, **kwargs: object) -> tuple[str, int]:
+        commands.append(command)
+        if "test -f" in command and "sha256sum" in command:
+            return "MISSING\n", 0
+        if command.startswith("mkdir -p"):
+            return "", 0
+        if "cat >>" in command:
+            return "", 0
+        if "base64.b64decode" in command:
+            return "", 0
+        if command.startswith("sha256sum $HOME/") and "cut -d' ' -f1" in command:
+            return f"{local_digest}\n", 0
+        raise AssertionError(f"unexpected remote command: {command!r}")
+
+    with patch.object(driver, "run_remote", side_effect=fake_run_remote):
+        digest = driver.upload_file(source, remote_path)
+
+    assert digest == local_digest
+    for command in commands:
+        if "base64.b64decode" in command:
+            continue  # tilde inside the Python script is resolved via .expanduser()
+        assert "'~" not in command, f"quoted tilde would not expand: {command!r}"
+    mkdir_cmd = next(c for c in commands if c.startswith("mkdir -p"))
+    assert mkdir_cmd.startswith("mkdir -p $HOME/")
+    append_cmd = next(c for c in commands if "cat >>" in c)
+    assert "cat >> $HOME/" in append_cmd
+    decode_cmd = next(c for c in commands if "base64.b64decode" in c)
+    assert decode_cmd.count(".expanduser()") == 2
+
+
+def test_upload_file_splits_base64_payload_into_short_heredoc_lines(tmp_path: Path) -> None:
+    """Regression: each heredoc line travels as one psmux send-keys argument, so no
+    line may approach the Windows 32 KiB process command-line limit."""
+    source = tmp_path / "bundle.bin"
+    source.write_bytes(b"x" * 10_000)  # base64 length > 13k, forces multiple lines
+    driver = TmuxDriver("user@edge", "sess", "/repo")
+    append_cmds: list[str] = []
+
+    def fake_run_remote(command: str, **kwargs: object) -> tuple[str, int]:
+        if "test -f" in command and "sha256sum" in command:
+            return "MISSING\n", 0
+        if "cat >>" in command:
+            append_cmds.append(command)
+            return "", 0
+        if command.startswith("sha256sum "):
+            return f"{hashlib.sha256(b'x' * 10_000).hexdigest()}\n", 0
+        return "", 0
+
+    with patch.object(driver, "run_remote", side_effect=fake_run_remote):
+        driver.upload_file(source, "/remote/bundle.bin")
+
+    assert append_cmds
+    for command in append_cmds:
+        lines = command.split("\n")
+        # opener, payload lines, terminator
+        assert len(lines) >= 3
+        assert all(len(line) <= 2048 for line in lines[1:-1])
+        assert lines[-1].startswith("__EDGE_DEPLOY_UPLOAD_")
+
+
 def test_upload_file_tilde_path_uses_home_expansion_for_precheck(tmp_path: Path) -> None:
     source = tmp_path / "runner.sh"
     source.write_bytes(b"#!/bin/sh\n")
@@ -377,6 +451,81 @@ def test_run_remote_parses_nonzero_exit_code() -> None:
         _, code = driver.run_remote("false", ensure_shell=False)
 
     assert code == 7
+
+
+def test_run_remote_sends_multiline_command_line_by_line() -> None:
+    """Regression: psmux ``send-keys`` drops everything after the first embedded
+    newline, so heredocs must be sent one line at a time with the RC sentinel on
+    its own line (never appended to the heredoc terminator)."""
+    driver = TmuxDriver("user@edge", "session", "/repo")
+    sent: list[tuple[str, bool]] = []
+    captured: dict[str, str] = {}
+
+    def fake_send_keys(keys: str, *, literal: bool = False) -> None:
+        sent.append((keys, literal))
+
+    heredoc = "cat >> /tmp/x.b64 <<'__MARKER__'\nAAAA\nBBBB\n__MARKER__"
+
+    with (
+        patch.object(driver, "return_to_shell", return_value=True),
+        patch.object(driver, "send_keys", side_effect=fake_send_keys),
+        patch.object(driver, "send_key"),
+        patch.object(driver, "wait_for") as wait_for,
+        patch.object(driver, "capture_screen") as capture_screen,
+    ):
+
+        def fake_wait(pattern: str, **kwargs: object) -> str:
+            nonce = pattern.split("__RC_")[1].split("_(")[0]
+            captured["nonce"] = nonce
+            return f"done\n__RC_{nonce}_0__\n"
+
+        wait_for.side_effect = fake_wait
+        capture_screen.side_effect = lambda history_lines=0: f"done\n__RC_{captured['nonce']}_0__\n"
+        _, code = driver.run_remote(heredoc)
+
+    assert code == 0
+    # No send may contain an embedded newline.
+    assert all("\n" not in keys for keys, _ in sent)
+    # All multi-line sends are literal so tmux cannot reinterpret payload bytes.
+    assert all(literal for _, literal in sent)
+    # The heredoc terminator must be sent alone; the RC sentinel is the next send.
+    terminator_index = [keys for keys, _ in sent].index("__MARKER__")
+    assert sent[terminator_index + 1][0].startswith("printf '\\n__RC''_")
+    # Payload lines arrive in order between opener and terminator.
+    keys_only = [keys for keys, _ in sent]
+    assert keys_only.index("AAAA") < keys_only.index("BBBB") < terminator_index
+
+
+def test_run_remote_single_line_command_keeps_inline_sentinel() -> None:
+    driver = TmuxDriver("user@edge", "session", "/repo")
+    sent: list[tuple[str, bool]] = []
+    captured: dict[str, str] = {}
+
+    def fake_send_keys(keys: str, *, literal: bool = False) -> None:
+        sent.append((keys, literal))
+
+    with (
+        patch.object(driver, "return_to_shell", return_value=True),
+        patch.object(driver, "send_keys", side_effect=fake_send_keys),
+        patch.object(driver, "send_key"),
+        patch.object(driver, "wait_for") as wait_for,
+        patch.object(driver, "capture_screen") as capture_screen,
+    ):
+
+        def fake_wait(pattern: str, **kwargs: object) -> str:
+            nonce = pattern.split("__RC_")[1].split("_(")[0]
+            captured["nonce"] = nonce
+            return f"ok\n__RC_{nonce}_0__\n"
+
+        wait_for.side_effect = fake_wait
+        capture_screen.side_effect = lambda history_lines=0: f"ok\n__RC_{captured['nonce']}_0__\n"
+        _, code = driver.run_remote("echo hi")
+
+    assert code == 0
+    assert len(sent) == 1
+    keys, literal = sent[0]
+    assert literal is False
+    assert "echo hi" in keys and "__RC''_" in keys
 
 
 def test_run_remote_returns_only_latest_command_block_from_history() -> None:
