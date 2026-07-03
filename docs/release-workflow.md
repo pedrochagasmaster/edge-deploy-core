@@ -40,19 +40,43 @@ directory so the reviewed source SHA remains available.
 
 Run `edge_deploy release` in a dedicated tmux controller whenever
 `--auth-mode prompt` is selected. The authentication prompt belongs to the
-controller process, not to the per-node SSH panes.
+controller process, not to the per-node SSH panes. From the current tool
+checkout, with `edge_deploy` installed, start a unique controller whose pane
+shell is explicitly PowerShell:
 
 ```powershell
-tmux new-session -d -s edge-release-pr35 -c D:\Projects\autobench
-$releaseCommand = '$env:PYTHONPATH=''D:\Projects\edge-deploy-core''; $env:EDGE_DEPLOY_SSH_MULTIPLEX=''0''; $stamp=(Get-Date).ToUniversalTime().ToString(''yyyyMMddTHHmmssZ''); $env:EDGE_DEPLOY_PR35_REPORT="D:\Projects\autobench\edge-deploy\reports\release-$stamp-pr35-localcore"; py -m edge_deploy release --auth-mode prompt --report-dir $env:EDGE_DEPLOY_PR35_REPORT'
-tmux send-keys -t edge-release-pr35 -l $releaseCommand
-tmux send-keys -t edge-release-pr35 Enter
-tmux attach -t edge-release-pr35
+$stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
+$session = "edge-release-$stamp"
+$worktree = (Get-Location).Path
+tmux new-session -d -s $session -c $worktree powershell.exe
+if ($LASTEXITCODE -ne 0) { throw "Failed to create tmux session '$session'." }
+$releaseCommand = 'py -m edge_deploy release --auth-mode prompt'
+tmux send-keys -t $session -l $releaseCommand
+tmux send-keys -t $session Enter
+tmux attach -t $session
 ```
 
 Enter each fresh RSA PASSCODE only at `[nodeNN] Enter RSA PASSCODE:`. It is
 forwarded transiently to the per-node SSH pane and must never be copied into
 logs, reports, shell history, or config.
+
+### One-off PR #35 local-core recovery
+
+The following procedure preserves the PR #35 local-core environment and report
+naming. It is recovery guidance for that one release, not the generic workflow:
+
+```powershell
+$stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
+$session = "edge-release-pr35-$stamp"
+tmux new-session -d -s $session -c D:\Projects\autobench powershell.exe
+if ($LASTEXITCODE -ne 0) { throw "Failed to create tmux session '$session'." }
+$releaseCommand = '$env:PYTHONPATH=''D:\Projects\edge-deploy-core''; $env:EDGE_DEPLOY_SSH_MULTIPLEX=''0''; $stamp=(Get-Date).ToUniversalTime().ToString(''yyyyMMddTHHmmssZ''); $env:EDGE_DEPLOY_PR35_REPORT="D:\Projects\autobench\edge-deploy\reports\release-$stamp-pr35-localcore"; py -m edge_deploy release --auth-mode prompt --report-dir $env:EDGE_DEPLOY_PR35_REPORT'
+tmux send-keys -t $session -l $releaseCommand
+tmux send-keys -t $session Enter
+tmux attach -t $session
+```
+
+The same PASSCODE handling rule applies to this one-off recovery procedure.
 
 ## Tool release tag finalization
 
