@@ -21,7 +21,9 @@ of being hardcoded Dispatch constants.
 
 from __future__ import annotations
 
+import base64
 import os
+import posixpath
 import re
 import shlex
 import subprocess
@@ -345,7 +347,7 @@ class TmuxDriver:
     def upload_file(self, source: str | Path, remote_path: str) -> None:
         """Copy a file over the already-authenticated SSH master connection."""
         if not self.use_ssh_multiplex:
-            self._upload_file_via_interactive_scp(source, remote_path)
+            self._upload_file_via_pane(source, remote_path)
             return
         completed = subprocess.run(
             [
@@ -363,35 +365,48 @@ class TmuxDriver:
             detail = (completed.stderr or completed.stdout).strip()
             raise RuntimeError(f"authenticated bundle transfer failed: {detail}")
 
-    def _scp_options(self) -> list[str]:
-        options = shlex.split(self.ssh_options) if self.ssh_options else []
-        converted: list[str] = []
-        index = 0
-        while index < len(options):
-            item = options[index]
-            if item == "-p":
-                converted.append("-P")
-            elif item.startswith("-p") and len(item) > 2:
-                converted.append("-P" + item[2:])
-            else:
-                converted.append(item)
-            index += 1
-        return converted
+    def _upload_file_via_pane(self, source: str | Path, remote_path: str) -> None:
+        """Copy a file through the authenticated tmux pane when scp multiplexing is unavailable.
 
-    def _upload_file_via_interactive_scp(self, source: str | Path, remote_path: str) -> None:
-        """Copy a file with plain scp when ControlMaster is unavailable.
-
-        This inherits stdin/stdout/stderr from the operator terminal so OpenSSH can prompt
-        normally for RSA/passcodes.  It is only called after bundle delivery has confirmed
-        that the node does not already have a verified reusable stage.
+        This keeps dependency delivery inside the same authenticated SSH pane as rollout
+        commands. Large payload chunks are sent through :meth:`paste_text` via
+        :meth:`run_remote`, avoiding Windows/psmux command-line limits without opening a
+        second OpenSSH prompt outside the release auth seam.
         """
-        target = remote_path
-        if "$USER" in target and "@" in self.host:
-            target = target.replace("$USER", self.host.split("@", 1)[0])
-        command = ["scp", *self._scp_options(), str(Path(source)), f"{self.host}:{target}"]
-        completed = subprocess.run(command, check=False)
-        if completed.returncode:
-            raise RuntimeError(f"interactive scp bundle transfer failed with exit {completed.returncode}")
+        source_path = Path(source)
+        encoded = base64.b64encode(source_path.read_bytes()).decode("ascii")
+        remote_dir = posixpath.dirname(remote_path) or "."
+        upload_id = uuid.uuid4().hex[:12]
+        remote_b64 = f"{remote_path}.edge-deploy-{upload_id}.b64"
+        mkdir_cmd = f"mkdir -p {shlex.quote(remote_dir)} && rm -f {shlex.quote(remote_b64)}"
+        _screen, rc = self.run_remote(mkdir_cmd, timeout=60.0)
+        if rc:
+            raise RuntimeError(f"authenticated bundle transfer failed: could not prepare {remote_dir}")
+
+        marker = f"__EDGE_DEPLOY_UPLOAD_{upload_id}__"
+        chunk_size = 32768
+        for offset in range(0, len(encoded), chunk_size):
+            chunk = encoded[offset : offset + chunk_size]
+            append_cmd = f"cat >> {shlex.quote(remote_b64)} <<'{marker}'\n{chunk}\n{marker}"
+            _screen, rc = self.run_remote(append_cmd, timeout=120.0)
+            if rc:
+                raise RuntimeError(f"authenticated bundle transfer failed: could not write {remote_b64}")
+
+        decode_script = (
+            "python3 - <<'PY'\n"
+            "import base64, pathlib\n"
+            f"source = pathlib.Path({remote_b64!r})\n"
+            f"target = pathlib.Path({remote_path!r})\n"
+            "target.parent.mkdir(parents=True, exist_ok=True)\n"
+            "target.write_bytes(base64.b64decode(source.read_text(encoding='ascii')))\n"
+            "source.unlink(missing_ok=True)\n"
+            "PY"
+        )
+        _screen, rc = self.run_remote(decode_script, timeout=300.0)
+        if rc:
+            cleanup_cmd = f"rm -f {shlex.quote(remote_b64)}"
+            self.run_remote(cleanup_cmd, timeout=30.0, ensure_shell=False)
+            raise RuntimeError(f"authenticated bundle transfer failed: could not decode {remote_path}")
 
     # ------------------------------------------------------------------
     # Pane control (local tmux)

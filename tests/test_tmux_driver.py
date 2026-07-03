@@ -59,7 +59,7 @@ def test_authenticated_session_exposes_control_socket_for_scp(tmp_path: Path) ->
     assert "user@edge:/remote/bundle.zip" in argv
 
 
-def test_disabled_multiplex_session_uses_interactive_scp(tmp_path: Path) -> None:
+def test_disabled_multiplex_session_uploads_via_authenticated_pane(tmp_path: Path) -> None:
     source = tmp_path / "bundle.zip"
     source.write_bytes(b"bundle" * 4096)
     with patch.dict("edge_deploy.tmux_driver.os.environ", {"EDGE_DEPLOY_SSH_MULTIPLEX": "0"}):
@@ -69,17 +69,27 @@ def test_disabled_multiplex_session_uses_interactive_scp(tmp_path: Path) -> None
     assert "ControlMaster=yes" not in pane_command
     assert "ControlPath=" not in pane_command
 
-    with patch("edge_deploy.tmux_driver.subprocess.run") as run:
-        run.return_value.returncode = 0
+    commands: list[str] = []
+
+    def fake_run_remote(command: str, **kwargs: object) -> tuple[str, int]:
+        commands.append(command)
+        return "", 0
+
+    with (
+        patch.object(driver, "run_remote", side_effect=fake_run_remote),
+        patch("edge_deploy.tmux_driver.subprocess.run") as run,
+    ):
         driver.upload_file(source, "/ads_storage/$USER/.edge-deploy/bundle.zip")
 
-    assert run.call_args.args[0] == [
-        "scp",
-        "-P",
-        "2222",
-        str(source),
-        "user@edge:/ads_storage/user/.edge-deploy/bundle.zip",
-    ]
+    run.assert_not_called()
+    assert commands[0].startswith("mkdir -p ")
+    assert "/ads_storage/$USER/.edge-deploy" in commands[0]
+    assert any(
+        command.startswith("cat >> ")
+        and "/ads_storage/$USER/.edge-deploy/bundle.zip.edge-deploy-" in command
+        for command in commands
+    )
+    assert any("base64.b64decode" in command for command in commands)
 
 
 def test_dispatch_dynamic_quits_from_dashboard_top() -> None:
