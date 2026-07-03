@@ -8,11 +8,17 @@ install-decision derived from ``install_trigger_paths``, the non-blocking
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
+import os
+import re
 import subprocess
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from conftest import encode_text_result
 
 from edge_deploy.config import DependencyBundleConfig
 from edge_deploy.dependencies import create_dependency_bundle
@@ -26,6 +32,7 @@ from edge_deploy.rollout import (
     remote_changed_paths,
     run_rollout,
 )
+from edge_deploy.runner import read_remote_text
 
 PREVIOUS = "0" * 40
 TARGET = "d" * 40
@@ -57,6 +64,82 @@ SAFE_CHANGE = [
     pytest.param("autobench", ["benchmark.py"], id="autobench"),
     pytest.param("robocop", ["dispatch/app.py"], id="robocop"),
 ]
+
+RUN_ID = "test-run"
+
+
+class LocalRunnerGitDriver:
+    """Execute real git commands while emulating the on-node runner + D8 reads."""
+
+    def __init__(self, repo_root: Path, *, run_id: str = "edge-deploy") -> None:
+        self.repo_root = repo_root
+        self.run_id = run_id
+        self.steps_root = repo_root / ".edge-deploy" / "runs" / run_id / "steps"
+        self.steps_root.mkdir(parents=True, exist_ok=True)
+        self.commands: list[str] = []
+
+    def upload_file(self, source: Path | str, remote_path: str) -> str:
+        return hashlib.sha256(Path(source).read_bytes()).hexdigest()
+
+    def _bash_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env["HOME"] = str(self.repo_root)
+        return env
+
+    def _repo_posix(self) -> str:
+        return self.repo_root.as_posix()
+
+    def _run_bash(self, payload: str) -> tuple[str, int]:
+        result = subprocess.run(
+            ["bash", "-lc", payload],
+            cwd=self.repo_root,
+            capture_output=True,
+            text=True,
+            env=self._bash_env(),
+            check=False,
+        )
+        return result.stdout + result.stderr, result.returncode
+
+    def _expand_remote_path(self, remote_path: str) -> Path:
+        if remote_path.startswith("~/"):
+            return self.repo_root / remote_path[2:]
+        if remote_path.startswith("$HOME/"):
+            return self.repo_root / remote_path[len("$HOME/") :]
+        return Path(remote_path)
+
+    def run_remote(
+        self, command: str, *, timeout: float = 30.0, ensure_shell: bool = True
+    ) -> tuple[str, int]:
+        del timeout, ensure_shell
+        self.commands.append(command)
+        if "__EDGE_RESULT_START__" in command and "base64 -w0" in command:
+            path_match = re.search(r"base64 -w0 ([^;\s]+)", command)
+            remote_path = path_match.group(1) if path_match else ""
+            content = self._expand_remote_path(remote_path).read_text(encoding="utf-8")
+            return encode_text_result(content), 0
+        runner_match = re.search(r"sh (\S*runner-\S+\.sh) (\S+) (\S+) (\S+)", command)
+        if runner_match:
+            _runner_path, run_id, step_name, encoded = runner_match.groups()
+            inner = base64.b64decode(encoded).decode("utf-8")
+            screen, code = self._run_bash(inner)
+            out_file = self.steps_root / f"{step_name}.out"
+            out_file.write_text(screen, encoding="utf-8")
+            payload = {
+                "schema": "edge-deploy/step/1",
+                "step": step_name,
+                "exit_code": code,
+                "started_at": "2026-07-03T12:00:00Z",
+                "finished_at": "2026-07-03T12:00:01Z",
+                "stdout_tail": "\n".join(screen.splitlines()[-40:]),
+            }
+            (self.steps_root / f"{step_name}.json").write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
+            return "", 0
+        if " && " in command:
+            payload = command.split(" && ", 1)[1]
+            return self._run_bash(f"cd {self._repo_posix()} && {payload}")
+        return self._run_bash(command)
 
 
 def test_rollout_statuses_constant() -> None:
@@ -128,6 +211,16 @@ def test_build_install_command_includes_email_only_when_present(real_profile) ->
     assert "EDGE_DEPLOY_PYTHON_BIN=" in with_email
     assert with_email.endswith("./install.sh")
     assert "EDGE_DEPLOY_EMAIL=" not in without_email
+    assert "PIP_NO_INDEX" not in with_email
+    assert "PIP_FIND_LINKS" not in with_email
+    assert "EDGE_DEPLOY_BUNDLE_DIR" not in with_email
+
+
+def test_rollout_module_has_no_pip_env_injection() -> None:
+    rollout_source = Path(__file__).resolve().parents[1] / "edge_deploy" / "rollout.py"
+    text = rollout_source.read_text(encoding="utf-8")
+    assert "PIP_NO_INDEX" not in text
+    assert "PIP_FIND_LINKS" not in text
 
 
 def test_build_install_command_prefers_dswpython310_alias_then_python310(real_profile) -> None:
@@ -151,15 +244,17 @@ def test_run_rollout_success_contract(
     profile = load_profile(tool)
     driver = fake_tmux(head_commits=[PREVIOUS, TARGET], changed_paths=changed)
 
-    report = run_rollout(driver, profile, sample_node, target_commit=TARGET)
+    report = run_rollout(driver, profile, sample_node, target_commit=TARGET, run_id=RUN_ID)
 
     assert report.status == "rolled_out"
     assert report.install_decision == expect_install
     assert sorted(report.sensitive_changed) == sorted(expect_sensitive)
 
     # update.sh always runs on a non-refused rollout; install.sh only when triggered.
-    assert driver.ran(f"EDGE_DEPLOY_REMOTE=bitbucket EDGE_DEPLOY_BRANCH=main ./update.sh {TARGET}")
-    assert driver.ran("./install.sh") is (expect_install == "run")
+    assert any(step == "update" for _, _, step in driver.runner_step_commands)
+    assert any(step == "install" for _, _, step in driver.runner_step_commands) is (
+        expect_install == "run"
+    )
 
     payload = report.to_payload()
     assert payload["operation"] == "rollout"
@@ -188,11 +283,10 @@ def test_run_rollout_records_authenticated_pane_calls(load_profile, sample_node,
     profile = load_profile(tool)
     driver = fake_tmux(head_commits=[PREVIOUS, TARGET], changed_paths=changed)
 
-    run_rollout(driver, profile, sample_node, target_commit=TARGET)
+    run_rollout(driver, profile, sample_node, target_commit=TARGET, run_id=RUN_ID)
 
-    # HEAD is read before and after update; the diff is taken once.
-    assert sum("git rev-parse --verify HEAD" in c for c in driver.commands) == 2
-    assert sum("diff --name-only" in c for c in driver.commands) == 1
+    assert sum(step == "git-rev-parse" for _, _, step in driver.runner_step_commands) == 2
+    assert any(step == "git-diff" for _, _, step in driver.runner_step_commands)
 
 
 # ---------------------------------------------------------------------------
@@ -207,13 +301,13 @@ def test_run_rollout_refuses_dependency_change_without_running_update(
     profile = load_profile(tool)
     driver = fake_tmux(head_commits=[PREVIOUS], changed_paths=changed)
 
-    report = run_rollout(driver, profile, sample_node, target_commit=TARGET)
+    report = run_rollout(driver, profile, sample_node, target_commit=TARGET, run_id=RUN_ID)
 
     assert report.status == "refused"
     assert report.install_decision == "not_applicable"
     # A lower-level rollout without reviewed-source provenance remains fail-closed.
-    assert not driver.ran("./update.sh")
-    assert not driver.ran("./install.sh")
+    assert not any(step == "update" for _, _, step in driver.runner_step_commands)
+    assert not any(step == "install" for _, _, step in driver.runner_step_commands)
 
     payload = report.to_payload()
     assert payload["dependency_paths"] == expect_refused
@@ -247,13 +341,21 @@ def test_run_rollout_delivers_dependency_bundle_before_update(
         sample_node,
         target_commit=TARGET,
         dependency_bundle=bundle,
+        run_id=RUN_ID,
     )
 
     assert report.status == "rolled_out"
     names = [check.name for check in report.checks]
     assert names.index("dependency_delivery") < names.index("update")
     assert driver.uploads
-    assert driver.ran("EDGE_DEPLOY_BUNDLE_DIR=")
+    assert any(step == "install" for _, _, step in driver.runner_step_commands)
+    install_runner = next(
+        cmd
+        for cmd in driver.commands
+        if re.search(r"sh \S*runner-\S+\.sh \S+ install ", cmd)
+    )
+    assert "/ads_storage/test/.edge-deploy/bundles/" in install_runner
+    assert not install_runner.rstrip().endswith(" -")
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +368,7 @@ def test_run_rollout_failed_when_update_errors(load_profile, sample_node, fake_t
     profile = load_profile(tool)
     driver = fake_tmux(head_commits=[PREVIOUS, TARGET], changed_paths=changed, update_code=1)
 
-    report = run_rollout(driver, profile, sample_node, target_commit=TARGET)
+    report = run_rollout(driver, profile, sample_node, target_commit=TARGET, run_id=RUN_ID)
 
     assert report.status == "failed"
     update_check = next(check for check in report.checks if check.name == "update")
@@ -304,7 +406,7 @@ def test_run_rollout_preflights_offline_install_before_running_install(
     assert preflight_check.evidence is not None
     assert preflight_check.evidence["exit_code"] == 1
     assert "install preflight exit 1" in preflight_check.evidence["output_tail"]
-    assert not driver.ran("./install.sh")
+    assert not any(step == "install" for _, _, step in driver.runner_step_commands)
 
 
 @pytest.mark.parametrize("tool, changed", SAFE_CHANGE)
@@ -312,7 +414,7 @@ def test_run_rollout_failed_on_commit_mismatch(load_profile, sample_node, fake_t
     profile = load_profile(tool)
     driver = fake_tmux(head_commits=[PREVIOUS, MISMATCH], changed_paths=changed)
 
-    report = run_rollout(driver, profile, sample_node, target_commit=TARGET)
+    report = run_rollout(driver, profile, sample_node, target_commit=TARGET, run_id=RUN_ID)
 
     assert report.status == "failed"
     final_check = next(check for check in report.checks if check.name == "final_commit")
@@ -329,13 +431,12 @@ def test_remote_changed_paths_runs_verify_fetch_diff_separately(load_profile, sa
     profile = load_profile("autobench")
     driver = fake_tmux(changed_paths=["benchmark.py"])
 
-    paths = remote_changed_paths(driver, profile.repo_path, PREVIOUS, TARGET)
+    paths = remote_changed_paths(driver, profile.repo_path, PREVIOUS, TARGET, run_id=RUN_ID)
 
     assert paths == ["benchmark.py"]
-    assert driver.ran("git rev-parse --is-inside-work-tree")
-    assert driver.ran("git fetch --prune bitbucket main")
-    assert driver.ran(f"git --no-pager diff --name-only {PREVIOUS} {TARGET}")
-    assert not any(">/dev/null" in command for command in driver.commands)
+    assert any(step == "git-verify" for _, _, step in driver.runner_step_commands)
+    assert any(step == "git-fetch" for _, _, step in driver.runner_step_commands)
+    assert any(step == "git-diff" for _, _, step in driver.runner_step_commands)
 
 
 def test_remote_changed_paths_repairs_corrupt_tracking_ref(tmp_path: Path) -> None:
@@ -370,23 +471,16 @@ def test_remote_changed_paths_repairs_corrupt_tracking_ref(tmp_path: Path) -> No
     remote_ref.parent.mkdir(parents=True, exist_ok=True)
     remote_ref.write_text("", encoding="utf-8")
 
-    class LocalGitDriver:
-        def run_remote(
-            self, command: str, *, timeout: float = 30.0, ensure_shell: bool = True
-        ) -> tuple[str, int]:
-            payload = command.split(" && ", 1)[1]
-            result = subprocess.run(
-                ["bash", "-lc", payload],
-                cwd=node,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
-            return result.stdout + result.stderr, result.returncode
+    class LocalGitDriver(LocalRunnerGitDriver):
+        pass
 
     paths = remote_changed_paths(
-        LocalGitDriver(), str(node), previous, target, remote="origin", branch="main"
+        LocalGitDriver(node),
+        node.as_posix(),
+        previous,
+        target,
+        remote="origin",
+        branch="main",
     )
 
     assert paths == ["README.md"]
@@ -406,11 +500,11 @@ def test_remote_fetch_retries_once_on_transient_failure(load_profile, sample_nod
         ],
     )
 
-    paths = remote_changed_paths(driver, profile.repo_path, PREVIOUS, TARGET)
+    paths = remote_changed_paths(driver, profile.repo_path, PREVIOUS, TARGET, run_id=RUN_ID)
 
     assert paths == ["benchmark.py"]
-    fetch_commands = [command for command in driver.commands if "git fetch --prune" in command]
-    assert len(fetch_commands) == 2
+    fetch_steps = [step for _, _, step in driver.runner_step_commands if step == "git-fetch"]
+    assert len(fetch_steps) == 2
 
 
 def test_remote_fetch_repairs_corrupt_tracking_ref_once(load_profile, sample_node, fake_tmux) -> None:
@@ -427,12 +521,12 @@ def test_remote_fetch_repairs_corrupt_tracking_ref_once(load_profile, sample_nod
         ],
     )
 
-    paths = remote_changed_paths(driver, profile.repo_path, PREVIOUS, TARGET)
+    paths = remote_changed_paths(driver, profile.repo_path, PREVIOUS, TARGET, run_id=RUN_ID)
 
     assert paths == ["README.md"]
     assert driver.ran("git update-ref -d refs/remotes/bitbucket/main")
-    fetch_commands = [command for command in driver.commands if "git fetch --prune" in command]
-    assert len(fetch_commands) == 2
+    fetch_steps = [step for _, _, step in driver.runner_step_commands if step == "git-fetch"]
+    assert len(fetch_steps) == 2
 
 
 def test_run_rollout_reports_successful_tracking_ref_repair(
@@ -452,7 +546,7 @@ def test_run_rollout_reports_successful_tracking_ref_repair(
         ],
     )
 
-    report = run_rollout(driver, profile, sample_node, target_commit=TARGET)
+    report = run_rollout(driver, profile, sample_node, target_commit=TARGET, run_id=RUN_ID)
 
     preflight = next(check for check in report.checks if check.name == "remote_git_preflight")
     assert preflight.passed is True
@@ -483,10 +577,10 @@ def test_run_rollout_preflight_failure_preserves_evidence(load_profile, sample_n
         fetch_script=[(128, "fatal: not a git repository: '/bad/path'")],
     )
 
-    report = run_rollout(driver, profile, sample_node, target_commit=TARGET)
+    report = run_rollout(driver, profile, sample_node, target_commit=TARGET, run_id=RUN_ID)
 
     assert report.status == "failed"
-    assert not driver.ran("./update.sh")
+    assert not any(step == "update" for _, _, step in driver.runner_step_commands)
     check = next(check for check in report.checks if check.name == "remote_git_preflight")
     evidence = check.evidence or {}
     assert evidence["step"] == "fetch"
@@ -496,3 +590,57 @@ def test_run_rollout_preflight_failure_preserves_evidence(load_profile, sample_n
     assert evidence["transient"] is False
     assert evidence["attempts"] == 1
     assert evidence["suggested_action"]
+
+
+# ---------------------------------------------------------------------------
+# Runner file protocol (PR-16)
+# ---------------------------------------------------------------------------
+
+
+def test_read_remote_text_survives_wrapped_changed_paths(fake_tmux) -> None:
+    driver = fake_tmux(changed_paths=["benchmark.py", "pyproject.toml"])
+    driver.runner_step_results["git-diff"] = {
+        "schema": "edge-deploy/step/1",
+        "step": "git-diff",
+        "exit_code": 0,
+        "started_at": "2026-07-03T12:00:00Z",
+        "finished_at": "2026-07-03T12:00:01Z",
+        "stdout_tail": "",
+    }
+
+    text = read_remote_text(driver, f"~/.edge-deploy/runs/{RUN_ID}/steps/git-diff-data.txt")
+
+    assert text.splitlines() == ["benchmark.py", "pyproject.toml"]
+
+
+def test_run_rollout_happy_path_uses_runner_steps(load_profile, sample_node, fake_tmux) -> None:
+    profile = load_profile("autobench")
+    driver = fake_tmux(head_commits=[PREVIOUS, TARGET], changed_paths=["benchmark.py"])
+
+    report = run_rollout(driver, profile, sample_node, target_commit=TARGET, run_id=RUN_ID)
+
+    assert report.status == "rolled_out"
+    step_names = [step for _, _, step in driver.runner_step_commands]
+    assert "git-verify" in step_names
+    assert "git-fetch" in step_names
+    assert "git-diff" in step_names
+    assert "update" in step_names
+    assert "permission-check" in step_names
+    assert driver.uploads
+
+
+def test_run_rollout_exit_code_only_commands_still_use_run_remote(
+    load_profile, sample_node, fake_tmux
+) -> None:
+    profile = replace(load_profile("autobench"), dependency_bundle=DependencyBundleConfig())
+    driver = fake_tmux(
+        head_commits=[PREVIOUS, TARGET],
+        changed_paths=["benchmark.py"],
+        install_code=0,
+    )
+
+    run_rollout(driver, profile, sample_node, target_commit=TARGET, install_mode="always", run_id=RUN_ID)
+
+    assert driver.ran("test -f /ads_storage/$USER/.edge-deploy/bundles/autobench/current/manifest.json")
+    assert any(step == "install" for _, _, step in driver.runner_step_commands)
+    assert not any("ln -sfn" in command for command in driver.commands)

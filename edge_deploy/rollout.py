@@ -18,15 +18,14 @@ Rollout ``status`` is one of ``rolled_out | failed | skipped | refused``.
 from __future__ import annotations
 
 import fnmatch
-import json
 import re
 from dataclasses import dataclass
 from typing import Callable
 
 from edge_deploy.config import ToolProfile
 from edge_deploy.dependencies import BundleError, DependencyBundle, deliver_dependency_bundle
-from edge_deploy.drift import _extract_payload, _remote_python
 from edge_deploy.reporting import OperationReport, ReportCheck, report_node_name
+from edge_deploy.runner import bootstrap_runner, read_remote_json, read_remote_text, run_step
 from edge_deploy.tmux_driver import TmuxDriver
 
 # The status values a single Rollout can report.
@@ -152,15 +151,13 @@ def _install_python_expr() -> str:
 
 
 def build_install_command(
-    profile: ToolProfile, *, operator_email: str = "", bundle_dir: str = ""
+    profile: ToolProfile, *, operator_email: str = ""
 ) -> str:
     """``install.sh`` with the standardized python-bin/email env (ADR-0004)."""
     py = _install_python_expr()
     parts: list[str] = []
     if operator_email:
         parts.append(f"EDGE_DEPLOY_EMAIL={operator_email}")
-    if bundle_dir:
-        parts.append(f"EDGE_DEPLOY_BUNDLE_DIR={bundle_dir}")
     parts.append(f"EDGE_DEPLOY_PYTHON_BIN={py}")
     parts.append("./install.sh")
     return " ".join(parts)
@@ -193,8 +190,28 @@ def build_install_preflight_command(
     return " ".join(parts)
 
 
-def _remote_git_output(driver: TmuxDriver, repo_path: str, command: str, *, timeout: float = 60.0) -> tuple[str, int]:
-    return driver.run_remote(f"cd {repo_path} && {command}", timeout=timeout)
+def _step_data_path(run_id: str, step_name: str) -> str:
+    return f"~/.edge-deploy/runs/{run_id}/steps/{step_name}-data.txt"
+
+
+def _run_repo_step(
+    driver: TmuxDriver,
+    runner_path: str,
+    run_id: str,
+    step_name: str,
+    repo_path: str,
+    command: str,
+    *,
+    timeout: float,
+) -> dict:
+    return run_step(
+        driver,
+        runner_path,
+        run_id,
+        step_name,
+        f"cd {repo_path} && {command}",
+        timeout=timeout,
+    )
 
 
 def _is_transient_git_error(output: str) -> bool:
@@ -242,20 +259,25 @@ def _remote_git_preflight(
     previous: str,
     target: str,
     *,
+    runner_path: str,
+    run_id: str,
     remote: str = "bitbucket",
     branch: str = "main",
 ) -> RemoteGitPreflightResult:
-    """Verify repo, fetch target branch, and diff SHAs as separate remote steps."""
+    """Verify repo, fetch target branch, and diff SHAs as separate runner steps."""
     verify_command = "git rev-parse --is-inside-work-tree"
-    screen, code = _remote_git_output(driver, repo_path, verify_command, timeout=30)
-    if code != 0 or "true" not in _remote_payload_lines(screen):
-        output_tail = _output_tail(screen)
+    verify_result = _run_repo_step(
+        driver, runner_path, run_id, "git-verify", repo_path, verify_command, timeout=30
+    )
+    verify_code = int(verify_result.get("exit_code", 1))
+    verify_tail = str(verify_result.get("stdout_tail", ""))
+    if verify_code != 0 or "true" not in verify_tail:
         raise RemoteGitPreflightError(
             RemoteGitPreflightFailure(
                 step="verify",
                 command=verify_command,
-                exit_code=code,
-                output_tail=output_tail,
+                exit_code=verify_code,
+                output_tail=verify_tail,
                 transient=False,
                 attempts=1,
                 suggested_action=_suggested_action_for_step("verify", transient=False),
@@ -265,35 +287,39 @@ def _remote_git_preflight(
     remote_ref = f"refs/remotes/{remote}/{branch}"
     fetch_command = f"git fetch --prune {remote} {branch}"
     attempts = 0
-    last_screen = ""
+    last_tail = ""
     last_code = 0
     repair_attempted = False
     repair_succeeded = False
     while attempts < 2:
         attempts += 1
-        last_screen, last_code = _remote_git_output(driver, repo_path, fetch_command, timeout=90)
+        fetch_result = _run_repo_step(
+            driver, runner_path, run_id, "git-fetch", repo_path, fetch_command, timeout=90
+        )
+        last_code = int(fetch_result.get("exit_code", 1))
+        last_tail = str(fetch_result.get("stdout_tail", ""))
         if last_code == 0:
             break
-        if attempts == 1 and _is_repairable_tracking_ref_error(last_screen, remote_ref):
+        if attempts == 1 and _is_repairable_tracking_ref_error(last_tail, remote_ref):
             repair_attempted = True
             repair_command = _repair_tracking_ref_command(remote_ref)
-            _repair_screen, repair_code = _remote_git_output(
-                driver, repo_path, repair_command, timeout=30
+            _repair_screen, repair_code = driver.run_remote(
+                f"cd {repo_path} && {repair_command}", timeout=30
             )
             repair_succeeded = repair_code == 0
             if repair_code == 0:
                 continue
-        if attempts == 1 and _is_transient_git_error(last_screen):
+        if attempts == 1 and _is_transient_git_error(last_tail):
             continue
         break
     if last_code != 0:
-        transient = _is_transient_git_error(last_screen)
+        transient = _is_transient_git_error(last_tail)
         raise RemoteGitPreflightError(
             RemoteGitPreflightFailure(
                 step="fetch",
                 command=fetch_command,
                 exit_code=last_code,
-                output_tail=_output_tail(last_screen),
+                output_tail=last_tail,
                 transient=transient,
                 attempts=attempts,
                 suggested_action=_suggested_action_for_step("fetch", transient=transient),
@@ -302,23 +328,30 @@ def _remote_git_preflight(
             )
         )
 
-    diff_command = f"git --no-pager diff --name-only {previous} {target}"
-    screen, code = _remote_git_output(driver, repo_path, diff_command, timeout=60)
-    if code != 0:
-        transient = _is_transient_git_error(screen)
+    diff_data_path = f"$HOME/.edge-deploy/runs/{run_id}/steps/git-diff-data.txt"
+    diff_command = f"git --no-pager diff --name-only {previous} {target} > {diff_data_path} 2>&1"
+    diff_result = _run_repo_step(
+        driver, runner_path, run_id, "git-diff", repo_path, diff_command, timeout=60
+    )
+    diff_code = int(diff_result.get("exit_code", 1))
+    if diff_code != 0:
+        diff_tail = str(diff_result.get("stdout_tail", ""))
+        transient = _is_transient_git_error(diff_tail)
         raise RemoteGitPreflightError(
             RemoteGitPreflightFailure(
                 step="diff",
                 command=diff_command,
-                exit_code=code,
-                output_tail=_output_tail(screen),
+                exit_code=diff_code,
+                output_tail=diff_tail,
                 transient=transient,
                 attempts=1,
                 suggested_action=_suggested_action_for_step("diff", transient=transient),
             )
         )
+    diff_text = read_remote_text(driver, _step_data_path(run_id, "git-diff"))
+    changed_paths = [line.strip() for line in diff_text.splitlines() if line.strip()]
     return RemoteGitPreflightResult(
-        changed_paths=_remote_payload_lines(screen),
+        changed_paths=changed_paths,
         fetch_attempts=attempts,
         repair_attempted=repair_attempted,
         repair_succeeded=repair_succeeded,
@@ -364,33 +397,29 @@ def _preflight_failure_report(
     )
 
 
-def _remote_payload_lines(screen: str) -> list[str]:
-    """Return command payload lines, excluding echoed prompts and run_remote sentinels."""
-    lines: list[str] = []
-    for raw in screen.splitlines():
-        line = raw.strip()
-        if not line or "__RC_" in line or "__START_" in line:
-            continue
-        if re.search(r"[\$#]\s*$", line):
-            continue
-        if re.search(r"[\$#]\s*cd\s+", line):
-            continue
-        if "git fetch --prune" in line or "git diff --name-only" in line or "printf " in line:
-            continue
-        lines.append(line)
-    return lines
-
-
-def _output_tail(screen: str, *, limit: int = 20) -> str:
-    lines = _remote_payload_lines(screen)
+def _output_tail(text: str, *, limit: int = 20) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
     return "\n".join(lines[-limit:])
 
 
-def _remote_rev_parse(driver: TmuxDriver, repo_path: str, ref: str) -> str:
-    screen, code = _remote_git_output(driver, repo_path, f"git rev-parse --verify {ref}", timeout=30)
+def _remote_rev_parse(
+    driver: TmuxDriver,
+    repo_path: str,
+    ref: str,
+    *,
+    runner_path: str,
+    run_id: str,
+) -> str:
+    data_path = f"$HOME/.edge-deploy/runs/{run_id}/steps/git-rev-parse-data.txt"
+    command = f"git rev-parse --verify {ref} > {data_path} 2>&1"
+    result = _run_repo_step(
+        driver, runner_path, run_id, "git-rev-parse", repo_path, command, timeout=30
+    )
+    code = int(result.get("exit_code", 1))
     if code != 0:
         raise RuntimeError(f"Remote git rev-parse failed ({code}) for {ref!r}")
-    for line in reversed(_remote_payload_lines(screen)):
+    text = read_remote_text(driver, _step_data_path(run_id, "git-rev-parse"))
+    for line in reversed([ln.strip() for ln in text.splitlines() if ln.strip()]):
         if re.fullmatch(r"[0-9a-f]{40}", line):
             return line
     raise RuntimeError(f"Could not parse git rev-parse output for {ref!r}")
@@ -404,14 +433,30 @@ def remote_changed_paths(
     *,
     remote: str = "bitbucket",
     branch: str = "main",
+    run_id: str = "edge-deploy",
 ) -> list[str]:
     """Changed paths between the node's current HEAD and the target Snapshot."""
+    runner_path = bootstrap_runner(driver, run_id)
     return _remote_git_preflight(
-        driver, repo_path, previous, target, remote=remote, branch=branch
+        driver,
+        repo_path,
+        previous,
+        target,
+        runner_path=runner_path,
+        run_id=run_id,
+        remote=remote,
+        branch=branch,
     ).changed_paths
 
 
-def _permission_evidence(driver: TmuxDriver, profile: ToolProfile) -> dict[str, object]:
+def _permission_evidence(
+    driver: TmuxDriver,
+    profile: ToolProfile,
+    *,
+    runner_path: str,
+    run_id: str,
+) -> dict[str, object]:
+    evidence_path = f"$HOME/.edge-deploy/runs/{run_id}/steps/permission-check-data.json"
     script = f"""
 import json
 import os
@@ -439,17 +484,25 @@ payload = {{
     "runtime_files_checked": checked,
     "unreadable_runtime_files": sorted(unreadable),
 }}
-print("PERMISSION_PAYLOAD_START")
-print(json.dumps(payload, sort_keys=True))
-print("PERMISSION_PAYLOAD_END")
+out = Path({evidence_path!r}).expanduser()
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_text(json.dumps(payload, sort_keys=True))
 """
-    screen, code = _remote_python(driver, script, timeout=120)
-    if code != 0:
-        raise RuntimeError(f"Permission verification failed with exit code {code}")
-    payload = "".join(
-        _extract_payload(screen, "PERMISSION_PAYLOAD_START", "PERMISSION_PAYLOAD_END").splitlines()
+    result = run_step(
+        driver,
+        runner_path,
+        run_id,
+        "permission-check",
+        f"python3 - <<'PY'\n{script}\nPY",
+        timeout=120,
     )
-    return json.loads(payload)
+    if int(result.get("exit_code", 1)) != 0:
+        raise RuntimeError(
+            f"Permission verification failed with exit code {result.get('exit_code')}"
+        )
+    remote_json = f"~/.edge-deploy/runs/{run_id}/steps/permission-check-data.json"
+    payload = read_remote_json(driver, remote_json)
+    return payload
 
 
 def run_rollout(
@@ -458,6 +511,7 @@ def run_rollout(
     node: "object",
     *,
     target_commit: str,
+    run_id: str,
     install_mode: str = "auto",
     operator_email: str = "",
     remote: str = "bitbucket",
@@ -473,10 +527,21 @@ def run_rollout(
     node_name = report_node_name(node)
     host = getattr(node, "host", "")
 
-    previous_commit = _remote_rev_parse(driver, repo_path, "HEAD")
+    runner_path = bootstrap_runner(driver, run_id)
+
+    previous_commit = _remote_rev_parse(
+        driver, repo_path, "HEAD", runner_path=runner_path, run_id=run_id
+    )
     try:
         preflight = _remote_git_preflight(
-            driver, repo_path, previous_commit, target_commit, remote=remote, branch=branch
+            driver,
+            repo_path,
+            previous_commit,
+            target_commit,
+            runner_path=runner_path,
+            run_id=run_id,
+            remote=remote,
+            branch=branch,
         )
     except RemoteGitPreflightError as exc:
         return _preflight_failure_report(
@@ -543,7 +608,9 @@ def run_rollout(
                 extra={"changed_paths": changed_paths, "dependency_paths": refused},
             )
         try:
-            delivered = deliver_dependency_bundle(driver, profile, dependency_bundle)
+            delivered = deliver_dependency_bundle(
+                driver, profile, dependency_bundle, run_id=run_id
+            )
         except BundleError as exc:
             check = ReportCheck("dependency_delivery", False, str(exc))
             return OperationReport(
@@ -600,7 +667,9 @@ def run_rollout(
         else:
             try:
                 dependency_bundle = dependency_bundle or dependency_bundle_factory()
-                delivered = deliver_dependency_bundle(driver, profile, dependency_bundle)
+                delivered = deliver_dependency_bundle(
+                    driver, profile, dependency_bundle, run_id=run_id
+                )
             except BundleError as exc:
                 return OperationReport(
                     operation="rollout",
@@ -634,12 +703,20 @@ def run_rollout(
             )
         )
 
-    _update_screen, update_code = driver.run_remote(
-        build_update_command(profile, target_commit, remote=remote), timeout=180
+    update_result = run_step(
+        driver,
+        runner_path,
+        run_id,
+        "update",
+        f"cd {repo_path} && {build_update_command(profile, target_commit, remote=remote)}",
+        timeout=180,
     )
+    update_code = int(update_result.get("exit_code", 1))
     checks.append(ReportCheck("update", update_code == 0, f"update.sh exit {update_code}"))
 
-    final_commit = _remote_rev_parse(driver, repo_path, "HEAD")
+    final_commit = _remote_rev_parse(
+        driver, repo_path, "HEAD", runner_path=runner_path, run_id=run_id
+    )
     checks.append(
         ReportCheck(
             "final_commit",
@@ -650,31 +727,44 @@ def run_rollout(
     )
 
     if install.action == "run":
-        preflight_screen, preflight_code = driver.run_remote(
+        preflight_result = run_step(
+            driver,
+            runner_path,
+            run_id,
+            "install-preflight",
             f"cd {repo_path} && "
             f"{build_install_preflight_command(profile, operator_email=operator_email, bundle_dir=bundle_dir)}",
             timeout=240,
         )
+        preflight_code = int(preflight_result.get("exit_code", 1))
+        preflight_tail = str(preflight_result.get("stdout_tail", ""))
         checks.append(
             ReportCheck(
                 "install_preflight",
                 preflight_code == 0,
                 f"offline install dry-run exit {preflight_code}",
-                {"exit_code": preflight_code, "output_tail": _output_tail(preflight_screen)},
+                {"exit_code": preflight_code, "output_tail": preflight_tail},
             )
         )
         if preflight_code == 0:
-            install_screen, install_code = driver.run_remote(
+            install_result = run_step(
+                driver,
+                runner_path,
+                run_id,
+                "install",
                 f"cd {repo_path} && "
-                f"{build_install_command(profile, operator_email=operator_email, bundle_dir=bundle_dir)}",
+                f"{build_install_command(profile, operator_email=operator_email)}",
                 timeout=240,
+                bundle_dir=bundle_dir or None,
             )
+            install_code = int(install_result.get("exit_code", 1))
+            install_tail = str(install_result.get("stdout_tail", ""))
             checks.append(
                 ReportCheck(
                     "install",
                     install_code == 0,
                     install.reason,
-                    {"exit_code": install_code, "output_tail": _output_tail(install_screen)},
+                    {"exit_code": install_code, "output_tail": install_tail},
                 )
             )
             if install_code == 0 and bundle_dir and dependency_evidence is not None:
@@ -694,7 +784,7 @@ def run_rollout(
     else:
         checks.append(ReportCheck("install", True, install.reason))
 
-    permissions = _permission_evidence(driver, profile)
+    permissions = _permission_evidence(driver, profile, runner_path=runner_path, run_id=run_id)
     permissions_ok = (
         bool(permissions["root_traversable"])
         and bool(permissions["update_executable"])

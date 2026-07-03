@@ -649,6 +649,7 @@ def _cmd_rollout(args: argparse.Namespace, operator: OperatorConfig) -> int:
         profile,
         node,
         target_commit=args.commit,
+        run_id="edge-deploy",
         install_mode=args.install,
         operator_email=operator.operator_email,
     )

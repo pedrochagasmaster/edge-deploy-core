@@ -402,7 +402,7 @@ def test_rollout_command_rolls_out_with_fake_pane(tmp_path, fake_tmux, monkeypat
     )
 
     assert rc == 0
-    assert fake.ran("./update.sh")
+    assert any(step == "update" for _, _, step in fake.runner_step_commands)
 
 
 def test_rollout_command_refused_returns_1(tmp_path, fake_tmux, monkeypatch) -> None:
@@ -415,7 +415,7 @@ def test_rollout_command_refused_returns_1(tmp_path, fake_tmux, monkeypatch) -> 
     )
 
     assert rc == 1
-    assert not fake.ran("./update.sh")
+    assert not any(step == "update" for _, _, step in fake.runner_step_commands)
 
 
 # ---------------------------------------------------------------------------

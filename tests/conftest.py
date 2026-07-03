@@ -51,6 +51,34 @@ def _decode_remote_python(command: str) -> str:
         return ""
 
 
+def encode_text_result(text: str) -> str:
+    """Build a D8 pane screen for a plain-text remote file read."""
+    content = text.encode("utf-8")
+    digest = hashlib.sha256(content).hexdigest()
+    b64 = base64.b64encode(content).decode("ascii")
+    wrapped = "\n".join(b64[index : index + 80] for index in range(0, len(b64), 80))
+    return (
+        f"\n__EDGE_RESULT_START__\n"
+        f"{wrapped}\n"
+        f"__EDGE_RESULT_SHA_{digest}__\n"
+        f"__EDGE_RESULT_END__\n"
+    )
+
+
+def encode_step_result(payload: dict) -> str:
+    """Build a D8 pane screen with realistically wrapped base64."""
+    content = json.dumps(payload, sort_keys=True).encode("utf-8")
+    digest = hashlib.sha256(content).hexdigest()
+    b64 = base64.b64encode(content).decode("ascii")
+    wrapped = "\n".join(b64[index : index + 80] for index in range(0, len(b64), 80))
+    return (
+        f"\n__EDGE_RESULT_START__\n"
+        f"{wrapped}\n"
+        f"__EDGE_RESULT_SHA_{digest}__\n"
+        f"__EDGE_RESULT_END__\n"
+    )
+
+
 class FakeTmuxDriver:
     """Record-and-replay double for ``TmuxDriver`` used by the rollout/drift tests.
 
@@ -79,6 +107,8 @@ class FakeTmuxDriver:
       a test can model "no ticket, then acquired".
     * ``command_codes`` — optional ``{substring: exit_code}`` overrides so smoke commands
       can be made to fail by content.
+    * ``runner_step_results`` — optional ``{step_name: payload}`` for runner step JSON
+      and ``dependency-stage-evidence`` evidence reads via the D8 protocol.
 
     Captured secret/key traffic is exposed via ``sent_secrets`` (``submit_secret``) and
     ``sent_keys`` (``send_keys`` / ``send_key`` / ``send_text``); the RSA passcode and the
@@ -99,6 +129,7 @@ class FakeTmuxDriver:
         klist_code: int | list[int] = 0,
         command_codes: dict[str, int] | None = None,
         fetch_script: list[tuple[int, str]] | None = None,
+        runner_step_results: dict[str, dict] | None = None,
     ) -> None:
         self.commands: list[str] = []
         self.call_log: list[dict[str, Any]] = []
@@ -114,6 +145,9 @@ class FakeTmuxDriver:
         self._klist_codes = [klist_code] if isinstance(klist_code, int) else list(klist_code) or [0]
         self._command_codes = dict(command_codes) if command_codes else {}
         self._fetch_script = list(fetch_script) if fetch_script else [(0, "")]
+        self.runner_step_results = dict(runner_step_results) if runner_step_results else {}
+        self.runner_step_commands: list[tuple[str, str, str]] = []
+        self.runner_install_bundle_args: list[str] = []
         self.sent_secrets: list[str] = []
         self.sent_keys: list[str] = []
         self.uploads: list[tuple[Path, str]] = []
@@ -184,6 +218,94 @@ class FakeTmuxDriver:
             self._head_commits.pop(0)
         return value
 
+    def _next_fetch(self) -> tuple[int, str]:
+        if len(self._fetch_script) > 1:
+            return self._fetch_script.pop(0)
+        return self._fetch_script[0]
+
+    def _step_base(self, step_name: str) -> dict[str, Any]:
+        return {
+            "schema": "edge-deploy/step/1",
+            "step": step_name,
+            "started_at": "2026-07-03T12:00:00Z",
+            "finished_at": "2026-07-03T12:00:01Z",
+        }
+
+    def _synthesize_step_result(self, step_name: str) -> dict[str, Any]:
+        base = self._step_base(step_name)
+        if step_name == "git-verify":
+            return {**base, "exit_code": 0, "stdout_tail": "true"}
+        if step_name == "git-fetch":
+            code, body = self._next_fetch()
+            return {**base, "exit_code": code, "stdout_tail": body}
+        if step_name == "git-diff":
+            return {**base, "exit_code": 0, "stdout_tail": ""}
+        if step_name == "git-rev-parse":
+            return {**base, "exit_code": 0, "stdout_tail": ""}
+        if step_name == "update":
+            return {
+                **base,
+                "exit_code": self.update_code,
+                "stdout_tail": f"update.sh exit {self.update_code}",
+            }
+        if step_name == "install-preflight":
+            return {
+                **base,
+                "exit_code": self.install_preflight_code,
+                "stdout_tail": f"install preflight exit {self.install_preflight_code}",
+            }
+        if step_name == "install":
+            return {
+                **base,
+                "exit_code": self.install_code,
+                "stdout_tail": f"install.sh exit {self.install_code}",
+            }
+        if step_name == "permission-check":
+            return {**base, "exit_code": 0, "stdout_tail": ""}
+        return {**base, "exit_code": 0, "stdout_tail": ""}
+
+    def _text_for_remote_path(self, remote_path: str) -> str | None:
+        if remote_path.endswith("git-diff-data.txt"):
+            return "\n".join(self._changed_paths)
+        if remote_path.endswith("git-rev-parse-data.txt"):
+            return self._next_head() or ("f" * 40)
+        return None
+
+    def _json_for_remote_path(self, remote_path: str) -> dict[str, Any] | None:
+        if remote_path.endswith("permission-check-data.json"):
+            return dict(self._permissions)
+        for step_name, step_payload in self.runner_step_results.items():
+            if remote_path.endswith(f"{step_name}.json"):
+                return step_payload
+        for step_name in (
+            "git-verify",
+            "git-fetch",
+            "git-diff",
+            "git-rev-parse",
+            "update",
+            "install-preflight",
+            "install",
+            "permission-check",
+            "dependency-stage",
+        ):
+            if remote_path.endswith(f"{step_name}.json"):
+                return self.runner_step_results.get(step_name) or self._synthesize_step_result(step_name)
+        if remote_path.endswith("dependency-stage-evidence.json"):
+            payload = self.runner_step_results.get("dependency-stage-evidence")
+            if payload is None:
+                digest_match = re.search(
+                    r"stage-([0-9a-f]+)\.py",
+                    " ".join(path for _, path in self.uploads),
+                )
+                digest = digest_match.group(1) if digest_match else "unknown"
+                payload = {
+                    "remote_dir": f"/ads_storage/test/.edge-deploy/bundles/tool/{digest}",
+                    "reused": False,
+                    "bundle_digest": digest,
+                }
+            return payload
+        return None
+
     def _next_klist(self) -> int:
         value = self._klist_codes[0]
         if len(self._klist_codes) > 1:
@@ -202,25 +324,26 @@ class FakeTmuxDriver:
         for needle, code in self._command_codes.items():
             if needle in command:
                 return self._sentinel(f"{needle} -> exit {code}", code)
+        runner_match = re.search(r"sh (\S*runner-\S+\.sh) (\S+) (\S+)(?: (\S+))?", command)
+        if runner_match:
+            runner_path, run_id, step_name, bundle_arg = runner_match.groups()
+            self.runner_step_commands.append((runner_path, run_id, step_name))
+            if step_name == "install" and bundle_arg is not None:
+                self.runner_install_bundle_args.append(bundle_arg)
+            return self._sentinel("", 0)
+        if "__EDGE_RESULT_START__" in command and "base64 -w0" in command:
+            path_match = re.search(r"base64 -w0 ([^;\s]+)", command)
+            remote_path = path_match.group(1) if path_match else ""
+            text_payload = self._text_for_remote_path(remote_path)
+            if text_payload is not None:
+                return self._sentinel(encode_text_result(text_payload), 0)
+            json_payload = self._json_for_remote_path(remote_path)
+            if json_payload is not None:
+                return self._sentinel(encode_step_result(json_payload), 0)
         if "klist -s" in command:
             return self._sentinel("", self._next_klist())
         if "base64 -d" in command:
             script = _decode_remote_python(command)
-            if "DEPENDENCY_STAGE_START" in script:
-                digest_match = re.search(r"expected_digest = '([0-9a-f]+)'", script)
-                digest = digest_match.group(1) if digest_match else "unknown"
-                body = (
-                    "DEPENDENCY_STAGE_START\n"
-                    + json.dumps(
-                        {
-                            "remote_dir": f"/ads_storage/test/.edge-deploy/bundles/tool/{digest}",
-                            "reused": False,
-                            "bundle_digest": digest,
-                        }
-                    )
-                    + "\nDEPENDENCY_STAGE_END"
-                )
-                return self._sentinel(body, 0)
             if "PERMISSION_PAYLOAD_START" in script:
                 body = (
                     "PERMISSION_PAYLOAD_START\n"
