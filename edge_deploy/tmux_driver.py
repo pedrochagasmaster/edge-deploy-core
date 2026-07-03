@@ -48,6 +48,16 @@ DASHBOARD_TOP_RE = r"running first|n New Job\b"
 
 # Auth/prompt detection shared across strategies.
 _AUTH_RE = r"PASSCODE:|[Pp]assword:|PIN:"
+
+
+def _shell_remote_path(remote_path: str) -> str:
+    """Return a shell path expression safe for unquoted ``$HOME`` tilde expansion."""
+    if remote_path.startswith("~/"):
+        remainder = remote_path[2:]
+        if remainder:
+            return f"$HOME/{shlex.quote(remainder)}"
+        return "$HOME"
+    return shlex.quote(remote_path)
 _PROMPT_RE = r"[\$#]\s*$"
 
 
@@ -202,8 +212,9 @@ class TmuxDriver:
 
     def enable_pane_log(self, log_path: Path) -> bool:
         """Mirror pane output to a local log file via ``tmux pipe-pane``."""
+        quoted_path = shlex.quote(log_path.as_posix())
         result = self._tmux(
-            ["pipe-pane", "-t", self.session, "-o", f"cat >> {log_path}"],
+            ["pipe-pane", "-t", self.session, "-o", f"cat >> {quoted_path}"],
             check=False,
         )
         self.pane_log_supported = result.returncode == 0
@@ -329,9 +340,10 @@ class TmuxDriver:
         """Copy a file through the authenticated tmux pane."""
         source_path = Path(source)
         local_digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        shell_path = _shell_remote_path(remote_path)
         precheck_cmd = (
-            f"test -f {shlex.quote(remote_path)} && "
-            f"sha256sum {shlex.quote(remote_path)} | cut -d' ' -f1 || echo MISSING"
+            f"test -f {shell_path} && "
+            f"sha256sum {shell_path} | cut -d' ' -f1 || echo MISSING"
         )
         screen, _rc = self.run_remote(precheck_cmd, timeout=60.0)
         if self._last_nonempty_line(screen) == local_digest:
@@ -371,7 +383,7 @@ class TmuxDriver:
             self.run_remote(cleanup_cmd, timeout=30.0, ensure_shell=False)
             raise RuntimeError(f"authenticated bundle transfer failed: could not decode {remote_path}")
 
-        verify_cmd = f"sha256sum {shlex.quote(remote_path)} | cut -d' ' -f1"
+        verify_cmd = f"sha256sum {shell_path} | cut -d' ' -f1"
         screen, _rc = self.run_remote(verify_cmd, timeout=60.0)
         remote_digest = self._extract_hex_digest(screen)
         if remote_digest is None:

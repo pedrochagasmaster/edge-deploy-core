@@ -64,6 +64,7 @@ exit 0
 
 _RESULT_START = "__EDGE_RESULT_START__"
 _RESULT_SHA_PREFIX = "__EDGE_RESULT_SHA_"
+_RESULT_END = "__EDGE_RESULT_END__"
 _READ_REMOTE_TIMEOUT = 60.0
 
 
@@ -102,12 +103,15 @@ def _read_remote_bytes(driver: TmuxDriver, remote_path: str) -> bytes:
         raise RunnerProtocolError(f"missing {_RESULT_START!r} in remote read for {remote_path}")
 
     after_start = screen[start_index + len(_RESULT_START) :]
-    sha_index = after_start.find(_RESULT_SHA_PREFIX)
+    end_index = after_start.find(_RESULT_END)
+    result_span = after_start[:end_index] if end_index != -1 else after_start
+
+    sha_index = result_span.find(_RESULT_SHA_PREFIX)
     if sha_index == -1:
         raise RunnerProtocolError(f"missing {_RESULT_SHA_PREFIX!r} in remote read for {remote_path}")
 
-    b64 = re.sub(r"\s", "", after_start[:sha_index])
-    sha_match = re.search(rf"{re.escape(_RESULT_SHA_PREFIX)}([0-9a-f]{{64}})__", screen)
+    b64 = re.sub(r"\s", "", result_span[:sha_index])
+    sha_match = re.search(rf"{re.escape(_RESULT_SHA_PREFIX)}([0-9a-f]{{64}})__", result_span)
     if sha_match is None:
         raise RunnerProtocolError(f"missing digest marker in remote read for {remote_path}")
 
