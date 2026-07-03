@@ -579,6 +579,7 @@ class TmuxDriver:
         # Discard any stray/partial input left on the line so the command we are about to
         # send cannot be concatenated onto leftover characters.
         self.send_key("C-u")
+        self.send_key("Enter")
 
         nonce = uuid.uuid4().hex[:12]
         # The ``'`` split keeps literal markers out of the echoed command line: bash
