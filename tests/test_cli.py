@@ -265,7 +265,7 @@ def test_parser_release_defaults() -> None:
 
     assert args.tool is None
     assert args.nodes is None
-    assert args.auth_mode == "auto"
+    assert args.auth_mode == "prompt"
     assert args.smoke == "standard"
     assert args.fail_fast is False
     assert args.no_local_check is False
@@ -283,8 +283,8 @@ def test_parser_parses_heartbeat_and_stall_threshold() -> None:
     assert args.stall_threshold == 120.0
 
 
-def test_parser_accepts_auto_prompt_and_pane_auth_modes() -> None:
-    for mode in ("auto", "prompt", "pane"):
+def test_parser_accepts_prompt_and_pane_auth_modes() -> None:
+    for mode in ("prompt", "pane"):
         args = cli.build_parser().parse_args(["release", "--tool", "autobench", "--auth-mode", mode])
         assert args.auth_mode == mode
 
