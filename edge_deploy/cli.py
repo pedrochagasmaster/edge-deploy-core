@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from edge_deploy import __version__, drift, preflight, rollout
-from edge_deploy.audit import AuditAttempt, AuditSyncError, append_audit_attempt, check_audit_remote
+from edge_deploy.audit import AuditAttempt, AuditSyncError, append_audit_attempt
 from edge_deploy.auth import authenticate_node, authenticate_node_via_pane
 from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, OperatorConfig, load_tool_profile
 from edge_deploy.ledger import LedgerError, RunLedger
@@ -460,8 +460,6 @@ def _cmd_rollback(args: argparse.Namespace, operator: OperatorConfig) -> int:
             auth_mode=args.auth_mode,
             max_auth_attempts=args.max_auth_attempts,
             auth_wait_seconds=args.auth_wait_seconds,
-            release_sha=target,
-            allow_unresolved=True,
         )
         report = run_release(
             effective_operator,
@@ -505,8 +503,6 @@ def _run_release_preflight(
     auth_mode: str,
     max_auth_attempts: int,
     auth_wait_seconds: float,
-    release_sha: str | None = None,
-    allow_unresolved: bool = False,
     repo_state=None,
 ):
     state = ensure_verified(
@@ -516,14 +512,6 @@ def _run_release_preflight(
         ledger,
         reverify=False,
         repo_state=repo_state,
-    )
-    if not operator.audit_repo:
-        raise AuditSyncError("operator config must define audit_repo")
-    check_audit_remote(
-        Path(operator.audit_repo),
-        tool=profile.tool,
-        source_sha=release_sha or state.commit,
-        allow_unresolved=allow_unresolved,
     )
 
     for node_name in node_names:

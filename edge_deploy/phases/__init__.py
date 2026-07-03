@@ -69,3 +69,5 @@ def enter_phase(
 from edge_deploy.phases.verify import VERIFY_SPEC, register_verify  # noqa: E402
 
 PHASE_REGISTRY.append((VERIFY_SPEC, register_verify))
+
+from . import publish as _publish  # noqa: E402, F401
