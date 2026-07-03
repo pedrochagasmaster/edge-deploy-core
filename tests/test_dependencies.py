@@ -9,6 +9,7 @@ import pytest
 from edge_deploy.config import DependencyBundleConfig, ToolProfile
 from edge_deploy.dependencies import (
     BundleError,
+    _parse_stage_evidence,
     create_dependency_bundle,
     deliver_dependency_bundle,
     target_filtered_dependency_bytes,
@@ -67,6 +68,41 @@ def test_target_filter_drops_python311_constraint_for_cp310_bundle() -> None:
 
     assert "scipy==1.16.3" not in filtered
     assert "scipy==1.15.3" in filtered
+
+
+def test_parse_stage_evidence_tolerates_tmux_wrapped_json_string() -> None:
+    screen = (
+        "noise\n"
+        "DEPENDENCY_STAGE_START\n"
+        '{"remote_dir": "/ads_storage/test/.edge-deploy/bundles/demo/f56af0dd44289019b7ac7e5\n'
+        '648d2ccb8078e7e7103af34e289b90b696974e362", "reused": false, '
+        '"bundle_digest": "f56af0dd44289019b7ac7e5648d2ccb8078e7e7103af34e289b90b696974e362"}\n'
+        "DEPENDENCY_STAGE_END\n"
+    )
+
+    evidence = _parse_stage_evidence(screen)
+
+    assert evidence == {
+        "remote_dir": (
+            "/ads_storage/test/.edge-deploy/bundles/demo/"
+            "f56af0dd44289019b7ac7e5648d2ccb8078e7e7103af34e289b90b696974e362"
+        ),
+        "reused": False,
+        "bundle_digest": "f56af0dd44289019b7ac7e5648d2ccb8078e7e7103af34e289b90b696974e362",
+    }
+
+
+def test_parse_stage_evidence_missing_markers_returns_none() -> None:
+    assert _parse_stage_evidence('{"remote_dir": "/tmp"}') is None
+
+
+def test_parse_stage_evidence_invalid_json_still_raises() -> None:
+    with pytest.raises(json.JSONDecodeError):
+        _parse_stage_evidence(
+            "DEPENDENCY_STAGE_START\n"
+            '{"remote_dir": "/tmp", nope}\n'
+            "DEPENDENCY_STAGE_END\n"
+        )
 
 
 def test_dependency_bundle_archives_original_dependency_markers(tmp_path: Path) -> None:

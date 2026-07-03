@@ -46,6 +46,23 @@ def test_copy_redacted_masks_secrets(tmp_path):
     assert "12345678" not in text
 
 
+def test_copy_redacted_skips_generated_bundles_and_binary_files(tmp_path):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    (source / "release.json").write_text("ok", encoding="utf-8")
+    (source / "bundle.zip").write_bytes(b"\xaa\xbb")
+    bundle_dir = source / "bundles" / "autobench" / "digest" / "wheels"
+    bundle_dir.mkdir(parents=True)
+    (bundle_dir / "demo-1.0-py3-none-any.whl").write_bytes(b"wheel")
+
+    _copy_redacted(source, target)
+
+    assert (target / "release.json").read_text(encoding="utf-8") == "ok"
+    assert not (target / "bundle.zip").exists()
+    assert not (target / "bundles").exists()
+
+
 def test_copy_redacted_refuses_existing_attempt(tmp_path):
     source = tmp_path / "source"
     target = tmp_path / "target"

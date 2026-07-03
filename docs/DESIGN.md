@@ -25,12 +25,15 @@ and the local core checkout used for private audit writes.
 7. Fast-forward the exact source SHA to Bitbucket `main`.
 8. Deploy and verify each Edge Node.
 9. Append the redacted report bundle to Bitbucket-only `release-log`.
-10. After complete success, create the same immutable release tag on GitHub and
-    Bitbucket.
+10. After complete success, create the immutable release tag locally and write a
+    report-side tag-push handoff. The operator then switches firewall/network
+    posture and pushes the GitHub and Bitbucket tags as separate phases.
 
 No preflight failure mutates a remote. Publish never rewrites commits or
-force-pushes. A partial Deploy is an unresolved release for that SHA; another
-SHA is blocked until retry or explicit Rollback resolves it.
+force-pushes. Tag push failure does not change the rollout result; it leaves a
+manual finalization handoff because this environment cannot reach GitHub and
+Bitbucket/Edge simultaneously. A partial Deploy is an unresolved release for
+that SHA; another SHA is blocked until retry or explicit Rollback resolves it.
 
 ## Boundaries
 

@@ -130,6 +130,15 @@ def test_build_install_command_includes_email_only_when_present(real_profile) ->
     assert "EDGE_DEPLOY_EMAIL=" not in without_email
 
 
+def test_build_install_command_exposes_bundle_to_legacy_pip_installers(real_profile) -> None:
+    command = build_install_command(real_profile, bundle_dir="/ads_storage/user/.edge-deploy/bundles/tool/digest")
+
+    assert "EDGE_DEPLOY_BUNDLE_DIR=/ads_storage/user/.edge-deploy/bundles/tool/digest" in command
+    assert "PIP_NO_INDEX=1" in command
+    assert "PIP_FIND_LINKS=/ads_storage/user/.edge-deploy/bundles/tool/digest/wheels" in command
+    assert command.endswith("./install.sh")
+
+
 def test_build_install_command_prefers_dswpython310_alias_then_python310(real_profile) -> None:
     command = build_install_command(real_profile, operator_email="op@example.com")
 

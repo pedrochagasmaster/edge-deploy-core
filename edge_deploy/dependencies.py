@@ -393,7 +393,8 @@ def _parse_stage_evidence(screen: str) -> dict[str, object] | None:
     match = re.search(r"DEPENDENCY_STAGE_START\s*(\{.*?\})\s*DEPENDENCY_STAGE_END", screen, re.DOTALL)
     if not match:
         return None
-    return json.loads(match.group(1))
+    payload = "".join(match.group(1).splitlines())
+    return json.loads(payload)
 
 
 def deliver_dependency_bundle(

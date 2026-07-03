@@ -6,6 +6,11 @@ pushing operator. Every GitHub pull-request merge commit is committed by
 can never succeed for merged work. The v1.1.0 release exposed this as a permanent
 architectural conflict, not a transient failure.
 
+The operator workstation also cannot assume simultaneous access to GitHub and
+Bitbucket/Edge. Release commands run in the Bitbucket/Edge posture so they can
+publish snapshots, deploy nodes, smoke test, and write the private audit log.
+GitHub tag pushes are a separate network phase.
+
 The cross-remote release contract is therefore **tree equivalence**: GitHub remains
 the review source of truth; Bitbucket receives content proven identical by tree SHA.
 Commit SHAs may differ between remotes and that is expected, recorded, and verified.
@@ -18,6 +23,9 @@ Commit SHAs may differ between remotes and that is expected, recorded, and verif
 - Tool publishes already create operator-authored deploy-snapshot commits; release
   tags now follow the same rule: the GitHub tag points at the reviewed source commit
   and the Bitbucket tag points at the commit actually deployed there.
+- Tool release commands create the local annotated tag and write a report-side
+  tag-push handoff instead of pushing remote tags inline. Operators push GitHub
+  and Bitbucket tags after switching to the matching network posture.
 - Rollback verifies cross-remote tags by tree SHA and rolls nodes to the
   Bitbucket-side commit, which is the only one nodes can fetch.
 
@@ -37,3 +45,5 @@ Commit SHAs may differ between remotes and that is expected, recorded, and verif
   reviewed GitHub commit.
 - Tag targets differ across remotes by design; tooling must compare trees, never
   assume SHA equality.
+- A blocked remote tag push is a finalization issue, not a failed node rollout.
+  Operators must not rerun a completed rollout just to retry tag publication.

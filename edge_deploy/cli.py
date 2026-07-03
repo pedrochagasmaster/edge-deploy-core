@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 from dataclasses import replace
@@ -190,6 +189,7 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
     snapshot_by_tool: dict[str, str] = {}
     if args.resume:
         snapshot_by_tool.update(_load_resume_snapshots(report_dir, tools))
+    release_sha = snapshot_by_tool.get(profile.tool) if args.resume else None
     selection = ReleaseSelection(
         tools=tools,
         nodes=resolve_nodes(effective_operator, args.nodes),
@@ -207,6 +207,7 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
         auth_mode=args.auth_mode,
         max_auth_attempts=args.max_auth_attempts,
         auth_wait_seconds=args.auth_wait_seconds,
+        release_sha=release_sha,
     )
     report = run_release(
         effective_operator,
@@ -228,11 +229,19 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
         report.summary()["overall"],
     )
     if report.exit_code() == 0:
-        _tag_successful_release(
+        tag = _tag_successful_release(
             repo_root,
             state.commit,
             deployment_commit=_deployment_commit_for_tool(report, profile.tool, snapshot_by_tool),
         )
+        tag_handoff = _write_tag_push_handoff(
+            report_dir,
+            tag=tag,
+            source_commit=state.commit,
+            deployment_commit=_deployment_commit_for_tool(report, profile.tool, snapshot_by_tool),
+        )
+        print(redact(f"[release] local release tag created: {tag}"))
+        print(redact(f"[release] push tag manually after firewall switch: {tag_handoff}"))
     _print_release_summary(report, consolidated_path)
     return report.exit_code()
 
@@ -483,25 +492,80 @@ def _record_release_attempt(
 
 
 def _tag_successful_release(repo_root: Path, commit: str, deployment_commit: str | None = None) -> str:
-    """Tag one successful release on both remotes with tree-equivalent targets (ADR-0007).
+    """Create the local annotated source release tag.
 
-    GitHub gets the reviewed source commit. Bitbucket gets the commit that was actually
-    deployed there (the operator-authored snapshot when Bitbucket's own-commits hook
-    rejected the GitHub-authored source); both tags share one name and one tree.
+    Remote tag pushes are an explicit operator step because the release environment can
+    reach either GitHub or Bitbucket/Edge, but not both at the same time. The GitHub tag
+    targets this reviewed source commit. Bitbucket must receive the same tag name at the
+    deployment commit when that differs from the source commit (ADR-0007).
     """
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     tag = f"release-{stamp}-{commit[:7]}"
     subprocess.run(["git", "tag", "-a", tag, commit, "-m", f"Successful release {tag}"], cwd=repo_root, check=True)
-    subprocess.run(["git", "push", "origin", f"refs/tags/{tag}"], cwd=repo_root, check=True)
-    command = ["git"]
-    token = os.environ.get("BB_TOKEN")
-    if token:
-        command.extend(["-c", f"http.extraHeader=Authorization: Bearer {token}"])
+    return tag
+
+
+def _tag_push_handoff_lines(tag: str, source_commit: str, deployment_commit: str | None = None) -> list[str]:
+    deployed = deployment_commit or source_commit
+    lines = [
+        "# Edge Deploy release tag handoff",
+        "# Phase 1: switch firewall/network posture to GitHub access.",
+        f"git push origin refs/tags/{tag}",
+        f"git ls-remote --tags origin refs/tags/{tag}",
+        "",
+        "# Phase 2: switch firewall/network posture to Bitbucket/Edge access.",
+    ]
+    if deployed == source_commit:
+        lines.extend(
+            [
+                f"git push bitbucket refs/tags/{tag}",
+                f"git ls-remote --tags bitbucket refs/tags/{tag}",
+            ]
+        )
+    else:
+        temp_tag = f"edge-deploy-mirror/{tag}"
+        message = f"Successful release {tag} (source {source_commit}) [edge-deploy]"
+        lines.extend(
+            [
+                f'git tag -a -f {temp_tag} {deployed} -m "{message}"',
+                f"git push bitbucket refs/tags/{temp_tag}:refs/tags/{tag}",
+                f"git tag -d {temp_tag}",
+                f"git ls-remote --tags bitbucket refs/tags/{tag}",
+            ]
+        )
+    return lines
+
+
+def _write_tag_push_handoff(
+    report_dir: Path,
+    *,
+    tag: str,
+    source_commit: str,
+    deployment_commit: str | None = None,
+) -> Path:
+    path = report_dir / f"push-{tag}.ps1"
+    path.write_text(
+        "\n".join(_tag_push_handoff_lines(tag, source_commit, deployment_commit)) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _push_release_tag_to_bitbucket(
+    repo_root: Path,
+    tag: str,
+    commit: str,
+    deployment_commit: str | None = None,
+) -> None:
+    """Push a previously created release tag to Bitbucket.
+
+    Used by tests and future explicit finalization commands; release rollout does not
+    call this because Bitbucket and GitHub tag pushes require different firewall modes.
+    """
     deployed = deployment_commit or commit
     if deployed == commit:
-        command.extend(["push", "bitbucket", f"refs/tags/{tag}"])
-        subprocess.run(command, cwd=repo_root, check=True)
-        return tag
+        subprocess.run(["git", "push", "bitbucket", f"refs/tags/{tag}"], cwd=repo_root, check=True)
+        return
     temp_tag = f"edge-deploy-mirror/{tag}"
     subprocess.run(
         ["git", "tag", "-a", "-f", temp_tag, deployed,
@@ -510,11 +574,9 @@ def _tag_successful_release(repo_root: Path, commit: str, deployment_commit: str
         check=True,
     )
     try:
-        command.extend(["push", "bitbucket", f"refs/tags/{temp_tag}:refs/tags/{tag}"])
-        subprocess.run(command, cwd=repo_root, check=True)
+        subprocess.run(["git", "push", "bitbucket", f"refs/tags/{temp_tag}:refs/tags/{tag}"], cwd=repo_root, check=True)
     finally:
         subprocess.run(["git", "tag", "-d", temp_tag], cwd=repo_root, check=True)
-    return tag
 
 
 def _cmd_publish(args: argparse.Namespace, operator: OperatorConfig) -> int:

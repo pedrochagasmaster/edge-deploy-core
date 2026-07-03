@@ -161,6 +161,8 @@ def build_install_command(
         parts.append(f"EDGE_DEPLOY_EMAIL={operator_email}")
     if bundle_dir:
         parts.append(f"EDGE_DEPLOY_BUNDLE_DIR={bundle_dir}")
+        parts.append("PIP_NO_INDEX=1")
+        parts.append(f"PIP_FIND_LINKS={bundle_dir}/wheels")
     parts.append(f"EDGE_DEPLOY_PYTHON_BIN={py}")
     parts.append("./install.sh")
     return " ".join(parts)

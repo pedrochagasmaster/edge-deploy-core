@@ -438,7 +438,12 @@ def test_release_command_resume_loads_publish_snapshots(tmp_path, monkeypatch) -
         )
 
     monkeypatch.setattr(cli, "run_release", fake_run_release)
-    monkeypatch.setattr(cli, "_run_release_preflight", lambda *a, **k: SimpleNamespace(commit="a" * 40))
+
+    def fake_preflight(*args, **kwargs):
+        captured["preflight_kwargs"] = kwargs
+        return SimpleNamespace(commit="c" * 40)
+
+    monkeypatch.setattr(cli, "_run_release_preflight", fake_preflight)
     monkeypatch.setattr(cli, "_record_release_attempt", lambda *a, **k: "audit")
     monkeypatch.setattr(cli, "_tag_successful_release", lambda *a, **k: "tag")
 
@@ -447,6 +452,7 @@ def test_release_command_resume_loads_publish_snapshots(tmp_path, monkeypatch) -
     assert rc == 0
     assert captured["report_dir"] == resume_dir
     assert captured["selection"].snapshot_by_tool == {"autobench": "a" * 40}
+    assert captured["preflight_kwargs"]["release_sha"] == "a" * 40
     assert (resume_dir / "release.json").exists()
 
 
@@ -558,21 +564,53 @@ def _fake_git_subprocess(commands: list, stdout_by_ref: dict | None = None):
     return fake_run
 
 
-def test_tag_successful_release_tags_deployment_commit_on_bitbucket(tmp_path, monkeypatch) -> None:
+def test_tag_successful_release_creates_local_source_tag_only(tmp_path, monkeypatch) -> None:
     commands: list = []
     monkeypatch.setattr(cli.subprocess, "run", _fake_git_subprocess(commands))
-    monkeypatch.delenv("BB_TOKEN", raising=False)
     source = "a" * 40
     deployed = "d" * 40
 
     tag = cli._tag_successful_release(tmp_path, source, deployment_commit=deployed)
 
     assert tag.startswith("release-") and tag.endswith(source[:7])
-    temp_tag = f"edge-deploy-mirror/{tag}"
     tag_creations = [cmd for cmd in commands if cmd[:2] == ["git", "tag"] and "-d" not in cmd]
     assert ["git", "tag", "-a", tag, source, "-m", f"Successful release {tag}"] in tag_creations
+    assert not any(cmd[:2] == ["git", "push"] for cmd in commands)
+
+
+def test_tag_push_handoff_records_split_firewall_commands(tmp_path) -> None:
+    tag = "release-20260702T223038Z-aaaaaaa"
+    source = "a" * 40
+    deployed = "d" * 40
+
+    path = cli._write_tag_push_handoff(
+        tmp_path,
+        tag=tag,
+        source_commit=source,
+        deployment_commit=deployed,
+    )
+
+    text = path.read_text(encoding="utf-8")
+    temp_tag = f"edge-deploy-mirror/{tag}"
+    assert "switch firewall/network posture to GitHub access" in text
+    assert f"git push origin refs/tags/{tag}" in text
+    assert "switch firewall/network posture to Bitbucket/Edge access" in text
+    assert f"git push bitbucket refs/tags/{temp_tag}:refs/tags/{tag}" in text
+    assert f"git tag -d {temp_tag}" in text
+
+
+def test_push_release_tag_to_bitbucket_tags_deployment_commit(tmp_path, monkeypatch) -> None:
+    commands: list = []
+    monkeypatch.setattr(cli.subprocess, "run", _fake_git_subprocess(commands))
+    tag = "release-20260702T223038Z-aaaaaaa"
+    source = "a" * 40
+    deployed = "d" * 40
+
+    cli._push_release_tag_to_bitbucket(tmp_path, tag, source, deployment_commit=deployed)
+
+    temp_tag = f"edge-deploy-mirror/{tag}"
+    tag_creations = [cmd for cmd in commands if cmd[:2] == ["git", "tag"] and "-d" not in cmd]
     assert any(cmd[4] == temp_tag and cmd[5] == deployed for cmd in tag_creations if "-f" in cmd)
-    assert ["git", "push", "origin", f"refs/tags/{tag}"] in commands
     assert ["git", "push", "bitbucket", f"refs/tags/{temp_tag}:refs/tags/{tag}"] in commands
     assert ["git", "tag", "-d", temp_tag] in commands  # temp tag cleaned up
 
@@ -580,10 +618,10 @@ def test_tag_successful_release_tags_deployment_commit_on_bitbucket(tmp_path, mo
 def test_tag_successful_release_pushes_same_tag_when_exact(tmp_path, monkeypatch) -> None:
     commands: list = []
     monkeypatch.setattr(cli.subprocess, "run", _fake_git_subprocess(commands))
-    monkeypatch.delenv("BB_TOKEN", raising=False)
+    tag = "release-20260702T223038Z-aaaaaaa"
     source = "a" * 40
 
-    tag = cli._tag_successful_release(tmp_path, source, deployment_commit=source)
+    cli._push_release_tag_to_bitbucket(tmp_path, tag, source, deployment_commit=source)
 
     assert ["git", "push", "bitbucket", f"refs/tags/{tag}"] in commands
     assert not any("edge-deploy-mirror/" in part for cmd in commands for part in cmd)

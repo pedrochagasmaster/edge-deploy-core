@@ -52,8 +52,11 @@ python -m edge_deploy rollback --tag release-<UTC>-<short-sha>
 
 The release command validates repository state, remotes, post-merge GitHub CI,
 local tests, audit availability, and interactive authentication before remote
-mutation. Successful tool releases receive an immutable
-`release-<UTC>-<short-sha>` tag on GitHub and Bitbucket.
+mutation. Successful tool releases create an immutable local
+`release-<UTC>-<short-sha>` tag and write a `push-release-*.ps1` handoff in the
+report directory. Operators push that tag to GitHub and Bitbucket as separate
+network phases, because this environment can reach either GitHub or
+Bitbucket/Edge, but not both at the same time.
 
 Redacted release bundles are appended to the Bitbucket-only `release-log`
 branch of this repository. See [docs/release-workflow.md](docs/release-workflow.md)

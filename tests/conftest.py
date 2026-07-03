@@ -245,6 +245,23 @@ class FakeTmuxDriver:
             return self._sentinel("\n".join(self._changed_paths), 0)
         if "git rev-parse --verify" in command:
             return self._sentinel(self._head_commits[-1] if self._head_commits else "f" * 40, 0)
+        if command.endswith(".stage.py") and "rm -f" not in command:
+            if "EDGE_DEPLOY_REUSE_ONLY=1" in command:
+                return self._sentinel("dependency stage missing", 1)
+            digest_match = re.search(r"/([0-9a-f]+)\.stage\.py$", command)
+            digest = digest_match.group(1) if digest_match else "unknown"
+            body = (
+                "DEPENDENCY_STAGE_START\n"
+                + json.dumps(
+                    {
+                        "remote_dir": f"/ads_storage/test/.edge-deploy/bundles/tool/{digest}",
+                        "reused": False,
+                        "bundle_digest": digest,
+                    }
+                )
+                + "\nDEPENDENCY_STAGE_END"
+            )
+            return self._sentinel(body, 0)
         if "./update.sh" in command:
             return self._sentinel(f"update.sh exit {self.update_code}", self.update_code)
         if "pip" in command and "--dry-run" in command:

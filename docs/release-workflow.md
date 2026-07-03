@@ -12,7 +12,8 @@ Only a Release Operator publishes `edge-deploy-core`.
    ```
 
 4. Create the next immutable semantic-version tag from that exact commit.
-5. Push the commit and tag to `origin`, then mirror them to Bitbucket:
+5. Push the commit and tag to `origin`, then switch firewall/network posture and
+   mirror them to Bitbucket:
 
    ```powershell
    git push origin main "refs/tags/vX.Y.Z"
@@ -34,3 +35,27 @@ Dependency bundles are generated under the release report directory and are neve
 committed. Per-node reports record build, transfer, verification, installation, and
 resume provenance. A failed dependency phase is resumed from the original report
 directory so the reviewed source SHA remains available.
+
+## Tool release tag finalization
+
+The `edge_deploy release` and rollback resume paths run while the operator can
+reach Edge Nodes and Bitbucket. On this machine that network posture cannot also
+push GitHub tags. A passed release therefore creates the annotated release tag
+locally and writes `push-release-*.ps1` in the report directory instead of
+pushing remote tags inline.
+
+Finalize tool tags in two explicit phases:
+
+```powershell
+# Phase 1: switch to GitHub access.
+git push origin refs/tags/release-<UTC>-<short-sha>
+git ls-remote --tags origin refs/tags/release-<UTC>-<short-sha>
+
+# Phase 2: switch to Bitbucket/Edge access.
+# Use the exact Bitbucket command from push-release-*.ps1. Rollback/mirror
+# releases may require a temporary edge-deploy-mirror/* tag because the
+# Bitbucket tag targets the deployed snapshot commit, not the GitHub source
+# commit.
+```
+
+Do not rerun a completed rollout just to retry a blocked GitHub tag push.
