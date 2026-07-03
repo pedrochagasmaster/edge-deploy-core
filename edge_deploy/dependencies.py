@@ -370,7 +370,10 @@ def deliver_dependency_bundle(
         raise BundleError(f"could not create remote bundle staging directory: {screen.strip()}")
     _archive_digest = driver.upload_file(bundle.archive_path, remote_archive)  # type: ignore[attr-defined]
     script = _stage_script(bundle, config, remote_archive=remote_archive, run_id=run_id)
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as handle:
+    # newline="\n" prevents Windows CRLF translation; the script runs on Linux.
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".py", delete=False, encoding="utf-8", newline="\n"
+    ) as handle:
         handle.write(script)
         script_tmp = handle.name
     try:

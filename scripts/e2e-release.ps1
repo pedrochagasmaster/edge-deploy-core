@@ -166,12 +166,12 @@ function Assert-EngineVersion {
     $engineVersion = (& py -c 'import edge_deploy; print(edge_deploy.__version__)').Trim()
     Assert-CommandPassed 'Inspect loaded edge-deploy-core version'
 
-    if ($engineVersion -ne '1.2.7') {
+    if ($engineVersion -ne '1.2.8') {
         throw @"
-Expected edge-deploy-core version 1.2.7; loaded $engineVersion.
+Expected edge-deploy-core version 1.2.8; loaded $engineVersion.
 
 Install the tagged release engine (not editable):
-  py -m pip install "git+https://github.com/pedrochagasmaster/edge-deploy-core.git@v1.2.7"
+  py -m pip install "git+https://github.com/pedrochagasmaster/edge-deploy-core.git@v1.2.8"
 "@
     }
 }
@@ -243,7 +243,7 @@ p.write_bytes(content.rstrip() + b'\n\n' + marker + b'\n')
 
 function Update-ReleaseEnginePin {
     $pinOld = 'edge-deploy-core @ git+https://github.com/pedrochagasmaster/edge-deploy-core.git@v1.1.0'
-    $pinNew = 'edge-deploy-core @ git+https://github.com/pedrochagasmaster/edge-deploy-core.git@v1.2.7'
+    $pinNew = 'edge-deploy-core @ git+https://github.com/pedrochagasmaster/edge-deploy-core.git@v1.2.8'
     $pyprojectPath = Join-Path $ToolPath 'pyproject.toml'
     $content = Get-Content $pyprojectPath -Raw
 
@@ -272,10 +272,10 @@ Cosmetic Python comment only. No runtime or dependency behavior changes.
 ## Validation
 - powershell -NoProfile -File tools/dev/local_check.ps1
 - Effective non-comment requirements compared before and after
-- Bumps edge-deploy-core release extra pin from v1.1.0 to v1.2.7
+- Bumps edge-deploy-core release extra pin from v1.1.0 to v1.2.8
 
 ## Release risk
-Comment-only requirements.txt change plus release-engine pin bump to v1.2.7.
+Comment-only requirements.txt change plus release-engine pin bump to v1.2.8.
 Dependency resolution is intentionally unchanged, but the dependency delivery
 path will run.
 "@

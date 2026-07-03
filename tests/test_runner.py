@@ -191,6 +191,43 @@ def test_bootstrap_runner_target_path_embeds_version_and_digest() -> None:
     assert driver.upload_contents[0].startswith("#!/bin/sh")
 
 
+def test_bootstrap_runner_uploads_lf_only_script() -> None:
+    """Regression: Windows text-mode tempfile wrote the runner with CRLF, which
+    kills `set -eu` on the node before any step result is written (and the
+    digest verify hashes the same CRLF bytes on both sides, so it can't catch
+    it)."""
+    driver = ScriptedDriver()
+
+    class ByteCapturingDriver(ScriptedDriver):
+        def upload_file(self, source: str | Path, remote_path: str) -> str:
+            self.raw_bytes = Path(source).read_bytes()
+            return super().upload_file(source, remote_path)
+
+    driver = ByteCapturingDriver()
+    bootstrap_runner(driver, "run-x")
+
+    assert b"\r" not in driver.raw_bytes
+    assert driver.raw_bytes.decode("utf-8") == RUNNER_SCRIPT
+
+
+def test_run_step_raises_when_runner_invocation_fails() -> None:
+    """Regression: the runner's exit code was discarded, so a broken runner
+    surfaced two calls later as a confusing 'missing digest marker' error."""
+
+    class FailingDriver(ScriptedDriver):
+        def run_remote(self, command: str, **kwargs: Any) -> tuple[str, int]:
+            self.commands.append(command)
+            return "sh: syntax error near unexpected token\n", 2
+
+    driver = FailingDriver()
+    with pytest.raises(RunnerProtocolError, match=r"(?s)exited 2.*syntax error") as excinfo:
+        run_step(driver, "~/.edge-deploy/runner-2-abc.sh", "run-x", "probe", "echo hi", timeout=30)
+
+    # Only the runner invocation ran; no JSON read was attempted.
+    assert len(driver.commands) == 1
+    assert "runner invocation for step 'probe'" in str(excinfo.value)
+
+
 def test_runner_script_never_invokes_bare_python3() -> None:
     """Regression: bare ``python3`` is not on PATH on the Edge Nodes; the runner
     must resolve a concrete interpreter before its JSON-summary step."""

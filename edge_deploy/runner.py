@@ -82,7 +82,13 @@ def runner_sha256() -> str:
 def bootstrap_runner(driver: TmuxDriver, run_id: str) -> str:
     digest = runner_sha256()
     remote_path = f"~/.edge-deploy/runner-{RUNNER_VERSION}-{digest[:8]}.sh"
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False, encoding="utf-8") as handle:
+    # newline="\n" is load-bearing: Windows text mode would write CRLF, and a
+    # CRLF shell script dies on the node at `set -eu\r` before writing any step
+    # results (the upload digest verify cannot catch it — both sides hash the
+    # same CRLF bytes).
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".sh", delete=False, encoding="utf-8", newline="\n"
+    ) as handle:
         handle.write(RUNNER_SCRIPT)
         tmp_path = handle.name
     try:
@@ -164,7 +170,17 @@ def run_step(
         remote_command = f"sh {runner_path} {run_id} {step_name} {encoded} {bundle_arg}"
     else:
         remote_command = f"sh {runner_path} {run_id} {step_name} {encoded}"
-    driver.run_remote(remote_command, timeout=timeout)
+    screen, exit_code = driver.run_remote(remote_command, timeout=timeout)
+    if exit_code != 0:
+        # The runner traps step-command failures into the JSON result and exits 0,
+        # so a nonzero exit means the runner itself broke; fail fast with the
+        # screen instead of a confusing protocol error at the JSON read.
+        tail = "\n".join(
+            line for line in screen.strip().splitlines() if line.strip()
+        )[-2000:]
+        raise RunnerProtocolError(
+            f"runner invocation for step {step_name!r} exited {exit_code}; screen:\n{tail}"
+        )
 
     json_path = f"~/.edge-deploy/runs/{run_id}/steps/{step_name}.json"
     result = read_remote_json(driver, json_path)
