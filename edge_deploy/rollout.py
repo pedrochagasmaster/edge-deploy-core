@@ -151,15 +151,13 @@ def _install_python_expr() -> str:
 
 
 def build_install_command(
-    profile: ToolProfile, *, operator_email: str = "", bundle_dir: str = ""
+    profile: ToolProfile, *, operator_email: str = ""
 ) -> str:
     """``install.sh`` with the standardized python-bin/email env (ADR-0004)."""
     py = _install_python_expr()
     parts: list[str] = []
     if operator_email:
         parts.append(f"EDGE_DEPLOY_EMAIL={operator_email}")
-    if bundle_dir:
-        parts.append(f"EDGE_DEPLOY_BUNDLE_DIR={bundle_dir}")
     parts.append(f"EDGE_DEPLOY_PYTHON_BIN={py}")
     parts.append("./install.sh")
     return " ".join(parts)
@@ -755,8 +753,9 @@ def run_rollout(
                 run_id,
                 "install",
                 f"cd {repo_path} && "
-                f"{build_install_command(profile, operator_email=operator_email, bundle_dir=bundle_dir)}",
+                f"{build_install_command(profile, operator_email=operator_email)}",
                 timeout=240,
+                bundle_dir=bundle_dir or None,
             )
             install_code = int(install_result.get("exit_code", 1))
             install_tail = str(install_result.get("stdout_tail", ""))

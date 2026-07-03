@@ -211,6 +211,16 @@ def test_build_install_command_includes_email_only_when_present(real_profile) ->
     assert "EDGE_DEPLOY_PYTHON_BIN=" in with_email
     assert with_email.endswith("./install.sh")
     assert "EDGE_DEPLOY_EMAIL=" not in without_email
+    assert "PIP_NO_INDEX" not in with_email
+    assert "PIP_FIND_LINKS" not in with_email
+    assert "EDGE_DEPLOY_BUNDLE_DIR" not in with_email
+
+
+def test_rollout_module_has_no_pip_env_injection() -> None:
+    rollout_source = Path(__file__).resolve().parents[1] / "edge_deploy" / "rollout.py"
+    text = rollout_source.read_text(encoding="utf-8")
+    assert "PIP_NO_INDEX" not in text
+    assert "PIP_FIND_LINKS" not in text
 
 
 def test_build_install_command_prefers_dswpython310_alias_then_python310(real_profile) -> None:
@@ -339,6 +349,13 @@ def test_run_rollout_delivers_dependency_bundle_before_update(
     assert names.index("dependency_delivery") < names.index("update")
     assert driver.uploads
     assert any(step == "install" for _, _, step in driver.runner_step_commands)
+    install_runner = next(
+        cmd
+        for cmd in driver.commands
+        if re.search(r"sh \S*runner-\S+\.sh \S+ install ", cmd)
+    )
+    assert "/ads_storage/test/.edge-deploy/bundles/" in install_runner
+    assert not install_runner.rstrip().endswith(" -")
 
 
 # ---------------------------------------------------------------------------
