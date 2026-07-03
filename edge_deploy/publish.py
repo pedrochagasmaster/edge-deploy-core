@@ -274,6 +274,25 @@ def publish_snapshot(
     auth_header = f"http.extraHeader=Authorization: Bearer {token}"
     git(["-c", auth_header, "fetch", remote, branch])
     previous_remote_commit = git(["rev-parse", "--verify", f"{remote}/{branch}"]).strip()
+    source_tree = git(["rev-parse", "--verify", f"{source_commit}^{{tree}}"]).strip()
+    remote_tree = git(["rev-parse", "--verify", f"{remote}/{branch}^{{tree}}"]).strip()
+    if source_tree == remote_tree:
+        return PublishResult(
+            tool=profile.tool,
+            status="published",
+            snapshot=previous_remote_commit,
+            source_commit=source_commit,
+            source_short=source_short,
+            branch=branch,
+            previous_remote_commit=previous_remote_commit,
+            message=(
+                f"Reuse existing tree-equivalent snapshot {previous_remote_commit} "
+                f"for reviewed source {source_short}"
+            ),
+            gate=gate,
+            local_check_output_tail=local_check_output_tail,
+        )
+
     remote_is_source_ancestor = True
     try:
         git(["merge-base", "--is-ancestor", previous_remote_commit, source_commit])

@@ -37,6 +37,8 @@ class FakeGit:
         merge_base_fails: bool = False,
         previous_subject: str = "Deploy snapshot: autobench cafe123 on main (2026-06-29 23:00 UTC) [edge-deploy]",
         snapshot_commit: str = "d" * 40,
+        source_tree: str = "1" * 40,
+        previous_tree: str = "0" * 40,
     ) -> None:
         self.calls: list[list[str]] = []
         self.status = status
@@ -49,6 +51,8 @@ class FakeGit:
         self.merge_base_fails = merge_base_fails
         self.previous_subject = previous_subject
         self.snapshot_commit = snapshot_commit
+        self.source_tree = source_tree
+        self.previous_tree = previous_tree
 
     def __call__(self, args) -> str:
         args = list(args)
@@ -61,6 +65,10 @@ class FakeGit:
             return self.short + "\n"
         if args[:2] == ["rev-parse", "--verify"]:
             ref = args[2]
+            if ref == f"{self.source_commit}^{{tree}}":
+                return self.source_tree + "\n"
+            if ref == "bitbucket/main^{tree}":
+                return self.previous_tree + "\n"
             return (self.previous if "/" in ref else self.source_commit) + "\n"
         if args[:3] == ["log", "-1", "--format=%s"]:
             return self.previous_subject + "\n"
@@ -115,6 +123,32 @@ def test_publish_preserves_exact_source_sha() -> None:
     assert result.previous_remote_commit == "0f0f0f0f0f0f"
     assert ["merge-base", "--is-ancestor", "0f0f0f0f0f0f", "a" * 40] in git.calls
     assert not any(call[0] in {"checkout", "reset", "commit", "commit-tree"} for call in git.calls)
+
+
+def test_publish_reuses_tree_equivalent_remote_snapshot_without_push() -> None:
+    source = "aa6d9a5f0fa5481ad75b938022b6a78b50b14a38"
+    snapshot = "dd6907b77a94fcd85e97792b572caca3634c7a18"
+    tree = "7" * 40
+    git = FakeGit(
+        source_commit=source,
+        short=source[:7],
+        previous=snapshot,
+        source_tree=tree,
+        previous_tree=tree,
+    )
+
+    result = publish_snapshot(AUTOBENCH, repo_root="/x", git_runner=git, run_local_check=False)
+
+    assert result.status == "published"
+    assert result.source_commit == source
+    assert result.snapshot == snapshot
+    assert result.previous_remote_commit == snapshot
+    assert result.message == (
+        f"Reuse existing tree-equivalent snapshot {snapshot} for reviewed source {source[:7]}"
+    )
+    assert not any("push" in call for call in git.calls)
+    assert not any(call[0] == "commit-tree" for call in git.calls)
+    assert not any(call[:2] == ["merge-base", "--is-ancestor"] for call in git.calls)
 
 
 def test_publish_pushes_with_bearer_header_and_exact_refspec() -> None:
