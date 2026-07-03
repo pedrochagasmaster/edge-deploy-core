@@ -11,6 +11,7 @@ round-trips.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -137,8 +138,9 @@ class FakeTmuxDriver:
     def stop_session(self) -> None:
         return None
 
-    def upload_file(self, source: Path, remote_path: str) -> None:
+    def upload_file(self, source: Path, remote_path: str) -> str:
         self.uploads.append((Path(source), remote_path))
+        return hashlib.sha256(Path(source).read_bytes()).hexdigest()
 
     def run_remote(self, command: str, *, timeout: float = 30.0, ensure_shell: bool = True) -> tuple[str, int]:
         self.commands.append(command)

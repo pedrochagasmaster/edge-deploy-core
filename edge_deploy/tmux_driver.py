@@ -22,6 +22,7 @@ of being hardcoded Dispatch constants.
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import posixpath
 import re
@@ -307,9 +308,18 @@ class TmuxDriver:
             check=False,
         )
 
-    def upload_file(self, source: str | Path, remote_path: str) -> None:
+    def upload_file(self, source: str | Path, remote_path: str) -> str:
         """Copy a file through the authenticated tmux pane."""
         source_path = Path(source)
+        local_digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        precheck_cmd = (
+            f"test -f {shlex.quote(remote_path)} && "
+            f"sha256sum {shlex.quote(remote_path)} | cut -d' ' -f1 || echo MISSING"
+        )
+        screen, _rc = self.run_remote(precheck_cmd, timeout=60.0)
+        if self._last_nonempty_line(screen) == local_digest:
+            return local_digest
+
         encoded = base64.b64encode(source_path.read_bytes()).decode("ascii")
         remote_dir = posixpath.dirname(remote_path) or "."
         upload_id = uuid.uuid4().hex[:12]
@@ -343,6 +353,20 @@ class TmuxDriver:
             cleanup_cmd = f"rm -f {shlex.quote(remote_b64)}"
             self.run_remote(cleanup_cmd, timeout=30.0, ensure_shell=False)
             raise RuntimeError(f"authenticated bundle transfer failed: could not decode {remote_path}")
+
+        verify_cmd = f"sha256sum {shlex.quote(remote_path)} | cut -d' ' -f1"
+        screen, _rc = self.run_remote(verify_cmd, timeout=60.0)
+        remote_digest = self._extract_hex_digest(screen)
+        if remote_digest is None:
+            screen = self.capture_screen(history_lines=4000)
+            remote_digest = self._extract_hex_digest(screen)
+        if remote_digest != local_digest:
+            cleanup_cmd = f"rm -f {shlex.quote(remote_path)}"
+            self.run_remote(cleanup_cmd, timeout=30.0, ensure_shell=False)
+            raise RuntimeError(
+                f"authenticated bundle transfer failed: digest mismatch for {remote_path}"
+            )
+        return local_digest
 
     # ------------------------------------------------------------------
     # Pane control (local tmux)
@@ -554,6 +578,13 @@ class TmuxDriver:
         text = re.sub(_ANSI_RE, "", text)
         lines = [line for line in text.splitlines() if line.strip()]
         return lines[-1] if lines else ""
+
+    def _extract_hex_digest(self, screen: str) -> str | None:
+        last_line = self._last_nonempty_line(screen)
+        if not last_line:
+            return None
+        match = re.search(r"\b[0-9a-f]{64}\b", last_line)
+        return match.group(0) if match else None
 
     def type_command_confirmed(
         self,
