@@ -57,7 +57,7 @@ RSA prompting is unchanged: deploy forwards existing auth flags to
   verify without GitHub reachability.
 - E2E driver scripts can wrap `release --guided` for hands-off orchestration
   aside from posture switches and RSA prompts.
-- Version 1.2.0 ships these behaviors; the loaded `__version__` proves the
+- Version 1.2.1 ships these behaviors; the loaded `__version__` proves the
   implementation on the controller.
 
 ## Amends / supersedes

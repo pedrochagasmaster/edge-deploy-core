@@ -138,8 +138,12 @@ function Show-FailureGuidance {
 }
 
 function Assert-NoOpenRuns {
-    $statusOutput = (& py -m edge_deploy status 2>&1 | Out-String).TrimEnd()
-    Assert-CommandPassed 'Inspect open release runs'
+    # cmd /c merges stderr without tripping PowerShell 5.1's NativeCommandError
+    # under ErrorActionPreference = Stop.
+    $statusOutput = (cmd /c 'py -m edge_deploy status 2>&1' | Out-String).TrimEnd()
+    if ($LASTEXITCODE -ne 0) {
+        throw "Inspect open release runs failed with exit code ${LASTEXITCODE}:`n$statusOutput"
+    }
 
     if ($statusOutput -match '(?m)^no open runs under ') {
         return
@@ -162,12 +166,12 @@ function Assert-EngineVersion {
     $engineVersion = (& py -c 'import edge_deploy; print(edge_deploy.__version__)').Trim()
     Assert-CommandPassed 'Inspect loaded edge-deploy-core version'
 
-    if ($engineVersion -ne '1.2.0') {
+    if ($engineVersion -ne '1.2.1') {
         throw @"
-Expected edge-deploy-core version 1.2.0; loaded $engineVersion.
+Expected edge-deploy-core version 1.2.1; loaded $engineVersion.
 
 Install the tagged release engine (not editable):
-  py -m pip install "git+https://github.com/pedrochagasmaster/edge-deploy-core.git@v1.2.0"
+  py -m pip install "git+https://github.com/pedrochagasmaster/edge-deploy-core.git@v1.2.1"
 "@
     }
 }
@@ -229,7 +233,7 @@ p.write_bytes(content.rstrip() + b'\n\n' + marker + b'\n')
 
 function Update-ReleaseEnginePin {
     $pinOld = 'edge-deploy-core @ git+https://github.com/pedrochagasmaster/edge-deploy-core.git@v1.1.0'
-    $pinNew = 'edge-deploy-core @ git+https://github.com/pedrochagasmaster/edge-deploy-core.git@v1.2.0'
+    $pinNew = 'edge-deploy-core @ git+https://github.com/pedrochagasmaster/edge-deploy-core.git@v1.2.1'
     $pyprojectPath = Join-Path $ToolPath 'pyproject.toml'
     $content = Get-Content $pyprojectPath -Raw
 
@@ -258,10 +262,10 @@ Cosmetic Python comment only. No runtime or dependency behavior changes.
 ## Validation
 - powershell -NoProfile -File tools/dev/local_check.ps1
 - Effective non-comment requirements compared before and after
-- Bumps edge-deploy-core release extra pin from v1.1.0 to v1.2.0
+- Bumps edge-deploy-core release extra pin from v1.1.0 to v1.2.1
 
 ## Release risk
-Comment-only requirements.txt change plus release-engine pin bump to v1.2.0.
+Comment-only requirements.txt change plus release-engine pin bump to v1.2.1.
 Dependency resolution is intentionally unchanged, but the dependency delivery
 path will run.
 "@
