@@ -67,7 +67,7 @@ class FakeGit:
             ref = args[2]
             if ref == f"{self.source_commit}^{{tree}}":
                 return self.source_tree + "\n"
-            if ref == "bitbucket/main^{tree}":
+            if ref == f"{self.previous}^{{tree}}":
                 return self.previous_tree + "\n"
             return (self.previous if "/" in ref else self.source_commit) + "\n"
         if args[:3] == ["log", "-1", "--format=%s"]:
@@ -146,6 +146,17 @@ def test_publish_reuses_tree_equivalent_remote_snapshot_without_push() -> None:
     assert result.message == (
         f"Reuse existing tree-equivalent snapshot {snapshot} for reviewed source {source[:7]}"
     )
+    fetch_call = [
+        "-c",
+        f"http.extraHeader=Authorization: Bearer {TOKEN}",
+        "fetch",
+        "bitbucket",
+        "main",
+    ]
+    source_tree_call = ["rev-parse", "--verify", f"{source}^{{tree}}"]
+    previous_tree_call = ["rev-parse", "--verify", f"{snapshot}^{{tree}}"]
+    assert git.calls.index(fetch_call) < git.calls.index(source_tree_call)
+    assert git.calls.index(fetch_call) < git.calls.index(previous_tree_call)
     assert not any("push" in call for call in git.calls)
     assert not any(call[0] == "commit-tree" for call in git.calls)
     assert not any(call[:2] == ["merge-base", "--is-ancestor"] for call in git.calls)

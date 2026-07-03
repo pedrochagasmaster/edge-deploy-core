@@ -15,8 +15,9 @@ Gate (Plan §1.1):
   ``local_check`` unless ``run_local_check=False``.
 
 Secret hygiene (ADR-0002): the ``BB_TOKEN`` is passed to git via ``-c http.extraHeader``
-only on the push; it is never stored in :class:`PublishResult` or any report, and the
-shared :func:`~edge_deploy.reporting.redact` masks ``token=`` for defence in depth.
+only on authenticated fetch and push operations; it is never stored in
+:class:`PublishResult` or any report, and the shared
+:func:`~edge_deploy.reporting.redact` masks ``token=`` for defence in depth.
 """
 
 from __future__ import annotations
@@ -275,7 +276,7 @@ def publish_snapshot(
     git(["-c", auth_header, "fetch", remote, branch])
     previous_remote_commit = git(["rev-parse", "--verify", f"{remote}/{branch}"]).strip()
     source_tree = git(["rev-parse", "--verify", f"{source_commit}^{{tree}}"]).strip()
-    remote_tree = git(["rev-parse", "--verify", f"{remote}/{branch}^{{tree}}"]).strip()
+    remote_tree = git(["rev-parse", "--verify", f"{previous_remote_commit}^{{tree}}"]).strip()
     if source_tree == remote_tree:
         return PublishResult(
             tool=profile.tool,
