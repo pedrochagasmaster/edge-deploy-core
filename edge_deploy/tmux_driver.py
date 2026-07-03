@@ -109,6 +109,7 @@ class TmuxDriver:
         retries: int = 0,
         retry_backoff: float = 3.0,
         ssh_connect_timeout: int = 15,
+        pane_log_path: Path | None = None,
     ) -> None:
         self.host = host
         self.session = session
@@ -121,6 +122,8 @@ class TmuxDriver:
         self.ssh_connect_timeout = ssh_connect_timeout
         self.retries = retries
         self.retry_backoff = retry_backoff
+        self.pane_log_path = pane_log_path
+        self.pane_log_supported: bool | None = None
 
     @classmethod
     def from_node_and_profile(
@@ -195,6 +198,15 @@ class TmuxDriver:
         result = self._tmux(["has-session", "-t", self.session], check=False)
         return result.returncode == 0
 
+    def enable_pane_log(self, log_path: Path) -> bool:
+        """Mirror pane output to a local log file via ``tmux pipe-pane``."""
+        result = self._tmux(
+            ["pipe-pane", "-t", self.session, "-o", f"cat >> {log_path}"],
+            check=False,
+        )
+        self.pane_log_supported = result.returncode == 0
+        return self.pane_log_supported
+
     def start_session(self, *, connect_timeout: float | None = None, passcode: str | None = None) -> bool:
         """Create a local tmux session whose pane SSHes into the Edge Node.
 
@@ -229,6 +241,9 @@ class TmuxDriver:
         )
         time.sleep(0.2)
         self.send_keys(self._build_pane_command())
+
+        if self.pane_log_path is not None:
+            self.enable_pane_log(self.pane_log_path)
 
         combined = rf"(?:{_PROMPT_RE})|(?:{_AUTH_RE})"
 
