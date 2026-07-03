@@ -21,6 +21,7 @@ from edge_deploy import __version__, drift, preflight, rollout
 from edge_deploy.audit import AuditAttempt, AuditSyncError, append_audit_attempt, check_audit_remote
 from edge_deploy.auth import authenticate_node, authenticate_node_via_pane
 from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, OperatorConfig, load_tool_profile
+from edge_deploy.ledger import LedgerError, RunLedger
 from edge_deploy.mirror import MirrorError, mirror_release
 from edge_deploy.publish import PublishError, publish_snapshot
 from edge_deploy.release import ReleaseSelection, resolve_nodes, run_release
@@ -48,11 +49,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     release_parser.add_argument("--tool", choices=TOOL_CHOICES, help=argparse.SUPPRESS)
     release_parser.add_argument("--nodes", default=None, help="Comma list (e.g. 03,04); default: all configured nodes")
-    release_parser.add_argument(
-        "--resume",
-        default=None,
-        help="Resume an incomplete attempt from its existing report directory",
-    )
+    release_parser.add_argument("--run", default=None, help="Resume an existing run by run id")
+    release_parser.add_argument("--force-lock", action="store_true")
     release_parser.add_argument("--smoke", choices=("standard", "deep"), default="standard")
     release_parser.add_argument("--fail-fast", action="store_true", help="Stop on the first non-success (ADR-0003)")
     release_parser.add_argument("--report-dir", default=None, help="Default: ./edge-deploy/reports/release-<UTC>/")
@@ -68,6 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rollback_parser.add_argument("--tag", required=True)
     rollback_parser.add_argument("--nodes", default=None)
+    rollback_parser.add_argument("--force-lock", action="store_true")
     rollback_parser.add_argument("--smoke", choices=("standard", "deep"), default="standard")
     rollback_parser.add_argument("--report-dir", default=None)
     rollback_parser.add_argument("--max-auth-attempts", type=int, default=3)
@@ -110,6 +109,11 @@ def build_parser() -> argparse.ArgumentParser:
     preflight_parser.add_argument("--tool", default=None, help="Optional: include the tool repo_path in the report")
     preflight_parser.add_argument("--timeout", type=float, default=None, help="TCP connect timeout (seconds)")
     preflight_parser.add_argument("--json-report")
+
+    abandon_parser = subparsers.add_parser("abandon", help="Abandon an open run")
+    abandon_parser.add_argument("--run", required=True)
+    abandon_parser.add_argument("--reason", required=True)
+
     return parser
 
 
@@ -141,21 +145,52 @@ def _emit(report: OperationReport, json_report: str | None) -> None:
         print(f"JSON report: {report_path}")
 
 
+def _runs_root(repo_root: Path) -> Path:
+    return repo_root / "edge-deploy" / "runs"
+
+
 def _default_report_dir() -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return Path("edge-deploy") / "reports" / f"release-{stamp}"
 
 
-def _load_resume_snapshots(report_dir: Path, tools: list[str]) -> dict[str, str]:
-    snapshots: dict[str, str] = {}
-    for tool in tools:
-        path = report_dir / f"publish-{tool}.json"
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        snapshot = payload.get("deployment_commit") or payload.get("snapshot")
-        if payload.get("status") != "published" or not snapshot:
-            raise ValueError(f"Cannot resume {tool}: {path} is not a successful publish report")
-        snapshots[tool] = str(snapshot)
-    return snapshots
+def _print_open_run_refusal(run: dict) -> None:
+    run_id = run["run_id"]
+    tool = run["tool"]
+    sha7 = run["source_sha"][:7]
+    created_at = run["created_at"]
+    print(
+        f"release refused: unresolved run {run_id} for {tool} "
+        f"(source {sha7}, created {created_at}) exists."
+    )
+    print("Choose one:")
+    print(f"  1. continue it:   python -m edge_deploy release --run {run_id}")
+    print(f'  2. abandon it:    python -m edge_deploy abandon --run {run_id} --reason "<why>"')
+
+
+def _snapshot_by_tool_from_ledger(ledger: RunLedger, tool: str) -> dict[str, str]:
+    evidence = ledger.state["phases"]["publish"]["evidence"]
+    snapshot_sha = evidence.get("snapshot_sha")
+    if snapshot_sha:
+        return {tool: str(snapshot_sha)}
+    return {}
+
+
+def _mirror_publish_evidence(ledger: RunLedger, report, source_commit: str) -> None:
+    for item in report.publishes:
+        if item.get("status") != "published":
+            continue
+        snapshot = item.get("snapshot")
+        if not snapshot:
+            continue
+        ledger.set_phase(
+            "publish",
+            "passed",
+            evidence={
+                "snapshot_sha": str(snapshot),
+                "source_commit": str(item.get("source_commit") or source_commit),
+            },
+        )
 
 
 def _print_release_summary(report, consolidated_path: Path) -> None:
@@ -181,60 +216,92 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
         raise ValueError(f"--tool {args.tool!r} does not match checkout profile {profile.tool!r}")
     tools = [profile.tool]
     effective_operator = replace(operator, tools={profile.tool: str(repo_root)})
-    if args.resume:
-        report_dir = Path(args.resume)
-    elif args.report_dir:
-        report_dir = Path(args.report_dir)
+    node_names = resolve_nodes(effective_operator, args.nodes)
+    runs_root = _runs_root(repo_root)
+    repo_state = None
+    if args.run:
+        run_dir = runs_root / args.run
+        if not run_dir.is_dir() or not (run_dir / "state.json").is_file():
+            print(f"no such run: {args.run} under {runs_root}", file=sys.stderr)
+            return 2
+        ledger = RunLedger.load(run_dir)
     else:
-        report_dir = _default_report_dir()
-    snapshot_by_tool: dict[str, str] = {}
-    if args.resume:
-        snapshot_by_tool.update(_load_resume_snapshots(report_dir, tools))
+        open_runs = RunLedger.find_open(runs_root)
+        if open_runs:
+            for open_ledger in open_runs:
+                _print_open_run_refusal(open_ledger.state)
+            return 2
+        repo_state = inspect_repository(
+            repo_root,
+            tool=profile.tool,
+            expected_origin=profile.github_url,
+            expected_bitbucket=profile.bitbucket_url,
+        )
+        ledger = RunLedger.create(
+            runs_root,
+            tool=profile.tool,
+            source_sha=repo_state.commit,
+            nodes=node_names,
+            operator=operator.operator_email,
+        )
+    report_dir = ledger.run_dir
+    snapshot_by_tool = _snapshot_by_tool_from_ledger(ledger, profile.tool)
     selection = ReleaseSelection(
         tools=tools,
-        nodes=resolve_nodes(effective_operator, args.nodes),
+        nodes=node_names,
         snapshot=None,
         snapshot_by_tool=snapshot_by_tool,
         smoke=args.smoke,
         fail_fast=args.fail_fast,
         run_local_check=not args.no_local_check,
     )
-    state = _run_release_preflight(
-        effective_operator,
-        profile,
-        repo_root,
-        selection.nodes,
-        auth_mode=args.auth_mode,
-        max_auth_attempts=args.max_auth_attempts,
-        auth_wait_seconds=args.auth_wait_seconds,
-    )
-    report = run_release(
-        effective_operator,
-        selection,
-        report_dir=report_dir,
-        max_auth_attempts=args.max_auth_attempts,
-        auth_mode="pane",
-        auth_wait_seconds=args.auth_wait_seconds,
-        heartbeat_interval_s=args.heartbeat_interval,
-        stall_threshold_s=args.stall_threshold,
-        progress_fn=lambda message: print(redact(f"[release] {message}")),
-    )
-    consolidated_path = write_release_report(report_dir / "release.json", report)
-    _record_release_attempt(
-        effective_operator,
-        profile.tool,
-        state.commit,
-        report_dir,
-        report.summary()["overall"],
-    )
-    if report.exit_code() == 0:
-        _tag_successful_release(
+    with ledger.locked(force=args.force_lock):
+        if repo_state is None:
+            repo_state = inspect_repository(
+                repo_root,
+                tool=profile.tool,
+                expected_origin=profile.github_url,
+                expected_bitbucket=profile.bitbucket_url,
+            )
+        state = _run_release_preflight(
+            effective_operator,
+            profile,
             repo_root,
-            state.commit,
-            deployment_commit=_deployment_commit_for_tool(report, profile.tool, snapshot_by_tool),
+            node_names,
+            auth_mode=args.auth_mode,
+            max_auth_attempts=args.max_auth_attempts,
+            auth_wait_seconds=args.auth_wait_seconds,
+            repo_state=repo_state,
         )
-    _print_release_summary(report, consolidated_path)
-    return report.exit_code()
+        report = run_release(
+            effective_operator,
+            selection,
+            report_dir=report_dir,
+            max_auth_attempts=args.max_auth_attempts,
+            auth_mode="pane",
+            auth_wait_seconds=args.auth_wait_seconds,
+            heartbeat_interval_s=args.heartbeat_interval,
+            stall_threshold_s=args.stall_threshold,
+            progress_fn=lambda message: print(redact(f"[release] {message}")),
+        )
+        _mirror_publish_evidence(ledger, report, state.commit)
+        consolidated_path = write_release_report(report_dir / "release.json", report)
+        _record_release_attempt(
+            effective_operator,
+            profile.tool,
+            state.commit,
+            report_dir,
+            report.summary()["overall"],
+        )
+        if report.exit_code() == 0:
+            _tag_successful_release(
+                repo_root,
+                state.commit,
+                deployment_commit=_deployment_commit_for_tool(report, profile.tool, snapshot_by_tool),
+            )
+            ledger.complete()
+        _print_release_summary(report, consolidated_path)
+        return report.exit_code()
 
 
 def _deployment_commit_for_tool(report, tool: str, snapshot_by_tool: dict[str, str]) -> str | None:
@@ -281,6 +348,10 @@ def _tree_sha(repo_root: Path, commitish: str) -> str:
 
 
 def _resolve_release_tag(repo_root: Path, tag: str) -> str:
+    return _resolve_release_tag_pair(repo_root, tag)[1]
+
+
+def _resolve_release_tag_pair(repo_root: Path, tag: str) -> tuple[str, str]:
     """Resolve a release tag to the Bitbucket-side commit the nodes can fetch.
 
     GitHub and Bitbucket tags may legitimately point at different commits (ADR-0007:
@@ -313,54 +384,107 @@ def _resolve_release_tag(repo_root: Path, tag: str) -> str:
                 )
         finally:
             subprocess.run(["git", "update-ref", "-d", temp_ref], cwd=repo_root, check=True)
-    return bitbucket_sha
+    return origin_sha, bitbucket_sha
+
+
+def _write_rollback_publish_provenance(
+    report_dir: Path,
+    *,
+    tool: str,
+    source_sha: str,
+    snapshot_sha: str,
+    tag: str,
+) -> None:
+    """Seed resume-style publish provenance for an immutable rollback tag."""
+    report_dir.mkdir(parents=True, exist_ok=True)
+    (report_dir / f"publish-{tool}.json").write_text(
+        json.dumps(
+            {
+                "tool": tool,
+                "status": "published",
+                "deployment_commit": snapshot_sha,
+                "source_commit": source_sha,
+                "source_short": source_sha[:7],
+                "branch": "rollback",
+                "message": f"Rollback to {tag}",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def _cmd_rollback(args: argparse.Namespace, operator: OperatorConfig) -> int:
     repo_root = Path.cwd().resolve()
     profile = load_tool_profile(repo_root)
     effective_operator = replace(operator, tools={profile.tool: str(repo_root)})
-    target = _resolve_release_tag(repo_root, args.tag)
+    source, target = _resolve_release_tag_pair(repo_root, args.tag)
     node_names = resolve_nodes(effective_operator, args.nodes)
-    _run_release_preflight(
-        effective_operator,
-        profile,
-        repo_root,
-        node_names,
-        auth_mode=args.auth_mode,
-        max_auth_attempts=args.max_auth_attempts,
-        auth_wait_seconds=args.auth_wait_seconds,
-        release_sha=target,
-        allow_unresolved=True,
+    runs_root = _runs_root(repo_root)
+    ledger = RunLedger.create(
+        runs_root,
+        tool=profile.tool,
+        source_sha=source,
+        nodes=node_names,
+        operator=operator.operator_email,
+        kind="rollback",
+        rollback_tag=args.tag,
     )
-    report_dir = Path(args.report_dir) if args.report_dir else _default_report_dir()
-    report = run_release(
-        effective_operator,
-        ReleaseSelection(
-            tools=[profile.tool],
-            nodes=node_names,
-            snapshot=target,
-            smoke=args.smoke,
-        ),
-        report_dir=report_dir,
-        max_auth_attempts=args.max_auth_attempts,
-        auth_mode="pane",
-        auth_wait_seconds=args.auth_wait_seconds,
-        heartbeat_interval_s=args.heartbeat_interval,
-        stall_threshold_s=args.stall_threshold,
-        progress_fn=lambda message: print(redact(f"[rollback] {message}")),
-    )
-    consolidated_path = write_release_report(report_dir / "release.json", report)
-    _record_release_attempt(
-        effective_operator,
-        profile.tool,
-        target,
-        report_dir,
-        report.summary()["overall"],
-        linked_attempt=args.tag,
-    )
-    _print_release_summary(report, consolidated_path)
-    return report.exit_code()
+    report_dir = ledger.run_dir
+    with ledger.locked(force=args.force_lock):
+        _write_rollback_publish_provenance(
+            report_dir,
+            tool=profile.tool,
+            source_sha=source,
+            snapshot_sha=target,
+            tag=args.tag,
+        )
+        ledger.set_phase(
+            "publish",
+            "passed",
+            evidence={"snapshot_sha": target, "source_commit": source},
+        )
+        _run_release_preflight(
+            effective_operator,
+            profile,
+            repo_root,
+            node_names,
+            auth_mode=args.auth_mode,
+            max_auth_attempts=args.max_auth_attempts,
+            auth_wait_seconds=args.auth_wait_seconds,
+            release_sha=target,
+            allow_unresolved=True,
+        )
+        report = run_release(
+            effective_operator,
+            ReleaseSelection(
+                tools=[profile.tool],
+                nodes=node_names,
+                snapshot=target,
+                snapshot_by_tool={profile.tool: target},
+                smoke=args.smoke,
+            ),
+            report_dir=report_dir,
+            max_auth_attempts=args.max_auth_attempts,
+            auth_mode="pane",
+            auth_wait_seconds=args.auth_wait_seconds,
+            heartbeat_interval_s=args.heartbeat_interval,
+            stall_threshold_s=args.stall_threshold,
+            progress_fn=lambda message: print(redact(f"[rollback] {message}")),
+        )
+        consolidated_path = write_release_report(report_dir / "release.json", report)
+        _record_release_attempt(
+            effective_operator,
+            profile.tool,
+            target,
+            report_dir,
+            report.summary()["overall"],
+            linked_attempt=args.tag,
+        )
+        if report.exit_code() == 0:
+            ledger.complete()
+        _print_release_summary(report, consolidated_path)
+        return report.exit_code()
 
 
 def _run_release_preflight(
@@ -374,10 +498,11 @@ def _run_release_preflight(
     auth_wait_seconds: float,
     release_sha: str | None = None,
     allow_unresolved: bool = False,
+    repo_state=None,
 ):
     if not profile.github_url:
         raise RepositoryError("edge_deploy.yaml must define github_url")
-    state = inspect_repository(
+    state = repo_state or inspect_repository(
         repo_root,
         tool=profile.tool,
         expected_origin=profile.github_url,
@@ -471,6 +596,19 @@ def _tag_successful_release(repo_root: Path, commit: str, deployment_commit: str
     finally:
         subprocess.run(["git", "tag", "-d", temp_tag], cwd=repo_root, check=True)
     return tag
+
+
+def _cmd_abandon(args: argparse.Namespace, operator: OperatorConfig) -> int:
+    repo_root = Path.cwd().resolve()
+    runs_root = _runs_root(repo_root)
+    run_dir = runs_root / args.run
+    if not run_dir.is_dir() or not (run_dir / "state.json").is_file():
+        print(f"no such run: {args.run} under {runs_root}", file=sys.stderr)
+        return 2
+    ledger = RunLedger.load(run_dir)
+    ledger.abandon(args.reason)
+    print(f"abandoned {args.run}")
+    return 0
 
 
 def _cmd_publish(args: argparse.Namespace, operator: OperatorConfig) -> int:
@@ -576,6 +714,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_release(args, operator)
         if args.command == "rollback":
             return _cmd_rollback(args, operator)
+        if args.command == "abandon":
+            return _cmd_abandon(args, operator)
         if args.command == "publish":
             return _cmd_publish(args, operator)
         if args.command == "rollout":
@@ -591,6 +731,7 @@ def main(argv: list[str] | None = None) -> int:
         AuditSyncError,
         AuthenticationError,
         SessionGoneError,
+        LedgerError,
         KeyError,
         ValueError,
         subprocess.CalledProcessError,

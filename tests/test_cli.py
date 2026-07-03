@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from edge_deploy import cli
+from edge_deploy.ledger import RunLedger
 from edge_deploy.mirror import MirrorError, MirrorResult
 from edge_deploy.publish import PublishError, PublishResult
 from edge_deploy.reporting import ReleaseReport
@@ -79,6 +80,35 @@ def _write_operator_config(tmp_path: Path) -> Path:
     return config_path
 
 
+def _patch_inspect_repository(monkeypatch, commit: str = "a" * 40) -> None:
+    monkeypatch.setattr(
+        cli,
+        "inspect_repository",
+        lambda *a, **k: SimpleNamespace(commit=commit),
+    )
+
+
+def _autobench_repo_root(tmp_path: Path) -> Path:
+    return _write_tool_profile(tmp_path, "autobench")
+
+
+def _create_open_run(repo_root: Path, *, run_id: str | None = None) -> RunLedger:
+    runs_root = repo_root / "edge-deploy" / "runs"
+    ledger = RunLedger.create(
+        runs_root,
+        tool="autobench",
+        source_sha="f" * 40,
+        nodes=["node03", "node04"],
+        operator="operator@example.com",
+    )
+    if run_id is not None:
+        desired = runs_root / run_id
+        if ledger.run_dir != desired:
+            ledger.run_dir.rename(desired)
+            ledger = RunLedger.load(desired)
+    return ledger
+
+
 def _write_tool_profile(tmp_path: Path, tool: str) -> Path:
     repo = tmp_path / tool
     repo.mkdir(exist_ok=True)
@@ -137,6 +167,7 @@ def test_parser_help_lists_all_subcommands(capsys) -> None:
     assert exc.value.code == 0
     help_text = capsys.readouterr().out
     assert "release" in help_text
+    assert "abandon" in help_text
     assert "publish" in help_text
     assert "rollout" in help_text
     assert "drift" in help_text
@@ -326,6 +357,7 @@ def test_rollout_command_refused_returns_1(tmp_path, fake_tmux, monkeypatch) -> 
 def test_release_command_dispatches_and_writes_consolidated_report(tmp_path, monkeypatch, capsys) -> None:
     config_path = _write_operator_config_both(tmp_path)
     captured: dict = {}
+    _patch_inspect_repository(monkeypatch)
 
     def fake_run_release(operator, selection, *, report_dir, max_auth_attempts, **kwargs) -> ReleaseReport:
         captured["selection"] = selection
@@ -335,7 +367,7 @@ def test_release_command_dispatches_and_writes_consolidated_report(tmp_path, mon
         captured["progress_fn"] = kwargs["progress_fn"]
         return ReleaseReport(
             selection={"tools": selection.tools},
-            publishes=[{"tool": "autobench", "status": "published", "snapshot": "abc"}],
+            publishes=[{"tool": "autobench", "status": "published", "snapshot": "abc", "source_commit": "a" * 40}],
             rollouts=[{"tool": "autobench", "node": "node03", "status": "rolled_out", "state_left": ""}],
         )
 
@@ -343,11 +375,11 @@ def test_release_command_dispatches_and_writes_consolidated_report(tmp_path, mon
     monkeypatch.setattr(cli, "_run_release_preflight", lambda *a, **k: SimpleNamespace(commit="a" * 40))
     monkeypatch.setattr(cli, "_record_release_attempt", lambda *a, **k: "audit")
     monkeypatch.setattr(cli, "_tag_successful_release", lambda *a, **k: "tag")
-    report_dir = tmp_path / "rep"
+    _autobench_repo_root(tmp_path)
 
     rc = cli.main(
         ["--config", str(config_path), "release", "--tool", "autobench", "--nodes", "03,04",
-         "--smoke", "deep", "--report-dir", str(report_dir), "--max-auth-attempts", "5"]
+         "--smoke", "deep", "--max-auth-attempts", "5"]
     )
 
     assert rc == 0
@@ -360,19 +392,24 @@ def test_release_command_dispatches_and_writes_consolidated_report(tmp_path, mon
     assert captured["auth_mode"] == "pane"
     assert callable(captured["progress_fn"])
     assert captured["max_auth_attempts"] == 5
-    assert (report_dir / "release.json").exists()
+    assert captured["report_dir"].parent.name == "runs"
+    assert (captured["report_dir"] / "release.json").exists()
+    loaded = RunLedger.load(captured["report_dir"])
+    assert loaded.state["status"] == "complete"
+    assert loaded.state["phases"]["publish"]["evidence"]["snapshot_sha"] == "abc"
     assert "Release: passed" in capsys.readouterr().out
 
 
 def test_release_command_forwards_no_local_check(tmp_path, monkeypatch) -> None:
     config_path = _write_operator_config_both(tmp_path)
     captured: dict = {}
+    _patch_inspect_repository(monkeypatch)
 
     def fake_run_release(operator, selection, *, report_dir, max_auth_attempts, **kwargs) -> ReleaseReport:
         captured["selection"] = selection
         return ReleaseReport(
             selection={"tools": selection.tools},
-            publishes=[{"tool": "autobench", "status": "published", "snapshot": "abc"}],
+            publishes=[{"tool": "autobench", "status": "published", "snapshot": "abc", "source_commit": "a" * 40}],
             rollouts=[{"tool": "autobench", "node": "node03", "status": "rolled_out", "state_left": ""}],
         )
 
@@ -380,6 +417,7 @@ def test_release_command_forwards_no_local_check(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(cli, "_run_release_preflight", lambda *a, **k: SimpleNamespace(commit="a" * 40))
     monkeypatch.setattr(cli, "_record_release_attempt", lambda *a, **k: "audit")
     monkeypatch.setattr(cli, "_tag_successful_release", lambda *a, **k: "tag")
+    _autobench_repo_root(tmp_path)
 
     rc = cli.main(
         [
@@ -388,8 +426,6 @@ def test_release_command_forwards_no_local_check(tmp_path, monkeypatch) -> None:
             "release",
             "--tool",
             "autobench",
-            "--report-dir",
-            str(tmp_path / "rep"),
             "--no-local-check",
         ]
     )
@@ -400,6 +436,7 @@ def test_release_command_forwards_no_local_check(tmp_path, monkeypatch) -> None:
 
 def test_release_command_nonzero_exit_on_failure(tmp_path, monkeypatch) -> None:
     config_path = _write_operator_config_both(tmp_path)
+    _patch_inspect_repository(monkeypatch)
 
     def fake_run_release(operator, selection, *, report_dir, max_auth_attempts, **kwargs) -> ReleaseReport:
         return ReleaseReport(
@@ -410,23 +447,50 @@ def test_release_command_nonzero_exit_on_failure(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(cli, "run_release", fake_run_release)
     monkeypatch.setattr(cli, "_run_release_preflight", lambda *a, **k: SimpleNamespace(commit="a" * 40))
     monkeypatch.setattr(cli, "_record_release_attempt", lambda *a, **k: "audit")
+    autobench_path = _autobench_repo_root(tmp_path)
 
     rc = cli.main(
-        ["--config", str(config_path), "release", "--tool", "autobench", "--report-dir", str(tmp_path / "rep")]
+        ["--config", str(config_path), "release", "--tool", "autobench"]
     )
 
     assert rc == 1
+    runs = list((autobench_path / "edge-deploy" / "runs").iterdir())
+    assert len(runs) == 1
+    loaded = RunLedger.load(runs[0])
+    assert loaded.state["status"] == "open"
 
 
-def test_release_command_resume_loads_publish_snapshots(tmp_path, monkeypatch) -> None:
+def test_release_refuses_when_open_run_exists(tmp_path, monkeypatch, capsys) -> None:
     config_path = _write_operator_config_both(tmp_path)
-    resume_dir = tmp_path / "resume"
-    resume_dir.mkdir()
-    (resume_dir / "publish-autobench.json").write_text(
-        json.dumps({"tool": "autobench", "status": "published", "deployment_commit": "a" * 40}) + "\n",
-        encoding="utf-8",
+    autobench_path = _autobench_repo_root(tmp_path)
+    ledger = _create_open_run(autobench_path)
+    run = ledger.state
+
+    rc = cli.main(["--config", str(config_path), "release", "--tool", "autobench"])
+
+    assert rc == 2
+    out = capsys.readouterr().out
+    expected = (
+        f"release refused: unresolved run {run['run_id']} for {run['tool']} "
+        f"(source {run['source_sha'][:7]}, created {run['created_at']}) exists.\n"
+        "Choose one:\n"
+        f"  1. continue it:   python -m edge_deploy release --run {run['run_id']}\n"
+        f'  2. abandon it:    python -m edge_deploy abandon --run {run["run_id"]} --reason "<why>"\n'
+    )
+    assert out == expected
+
+
+def test_release_run_resumes_same_directory(tmp_path, monkeypatch) -> None:
+    config_path = _write_operator_config_both(tmp_path)
+    autobench_path = _autobench_repo_root(tmp_path)
+    ledger = _create_open_run(autobench_path)
+    ledger.set_phase(
+        "publish",
+        "passed",
+        evidence={"snapshot_sha": "d" * 40, "source_commit": "a" * 40},
     )
     captured: dict = {}
+    _patch_inspect_repository(monkeypatch)
 
     def fake_run_release(operator, selection, *, report_dir, max_auth_attempts, **kwargs) -> ReleaseReport:
         captured["selection"] = selection
@@ -442,12 +506,77 @@ def test_release_command_resume_loads_publish_snapshots(tmp_path, monkeypatch) -
     monkeypatch.setattr(cli, "_record_release_attempt", lambda *a, **k: "audit")
     monkeypatch.setattr(cli, "_tag_successful_release", lambda *a, **k: "tag")
 
-    rc = cli.main(["--config", str(config_path), "release", "--tool", "autobench", "--resume", str(resume_dir)])
+    rc = cli.main(
+        [
+            "--config",
+            str(config_path),
+            "release",
+            "--tool",
+            "autobench",
+            "--run",
+            ledger.state["run_id"],
+        ]
+    )
 
     assert rc == 0
-    assert captured["report_dir"] == resume_dir
-    assert captured["selection"].snapshot_by_tool == {"autobench": "a" * 40}
-    assert (resume_dir / "release.json").exists()
+    assert captured["report_dir"] == ledger.run_dir
+    assert captured["selection"].snapshot_by_tool == {"autobench": "d" * 40}
+    assert (ledger.run_dir / "release.json").exists()
+
+
+def test_abandon_flips_status_and_excludes_from_find_open(tmp_path, monkeypatch, capsys) -> None:
+    config_path = _write_operator_config_both(tmp_path)
+    autobench_path = _autobench_repo_root(tmp_path)
+    monkeypatch.chdir(autobench_path)
+    ledger = _create_open_run(autobench_path)
+    run_id = ledger.state["run_id"]
+    runs_root = autobench_path / "edge-deploy" / "runs"
+
+    rc = cli.main(
+        ["--config", str(config_path), "abandon", "--run", run_id, "--reason", "superseded"]
+    )
+
+    assert rc == 0
+    assert capsys.readouterr().out == f"abandoned {run_id}\n"
+    loaded = RunLedger.load(ledger.run_dir)
+    assert loaded.state["status"] == "abandoned"
+    assert loaded.state["abandon_reason"] == "superseded"
+    assert RunLedger.find_open(runs_root) == []
+
+
+def test_release_run_lock_held_returns_exit_2(tmp_path, monkeypatch, capsys) -> None:
+    config_path = _write_operator_config_both(tmp_path)
+    autobench_path = _autobench_repo_root(tmp_path)
+    ledger = _create_open_run(autobench_path)
+    (ledger.run_dir / "run.lock").write_text(
+        json.dumps(
+            {
+                "pid": 4242,
+                "hostname": "edge-host",
+                "acquired_at": "2026-07-03T12:00:00+00:00",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _patch_inspect_repository(monkeypatch)
+
+    rc = cli.main(
+        [
+            "--config",
+            str(config_path),
+            "release",
+            "--tool",
+            "autobench",
+            "--run",
+            ledger.state["run_id"],
+        ]
+    )
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "RunLockError" in err
+    assert "is locked by PID 4242 on edge-host" in err
 
 
 # ---------------------------------------------------------------------------
