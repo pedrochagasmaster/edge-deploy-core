@@ -373,8 +373,6 @@ def test_release_command_dispatches_and_writes_consolidated_report(tmp_path, mon
 
     monkeypatch.setattr(cli, "run_release", fake_run_release)
     monkeypatch.setattr(cli, "_run_release_preflight", lambda *a, **k: SimpleNamespace(commit="a" * 40))
-    monkeypatch.setattr(cli, "_record_release_attempt", lambda *a, **k: "audit")
-    monkeypatch.setattr(cli, "_tag_successful_release", lambda *a, **k: "tag")
     _autobench_repo_root(tmp_path)
 
     rc = cli.main(
@@ -395,7 +393,7 @@ def test_release_command_dispatches_and_writes_consolidated_report(tmp_path, mon
     assert captured["report_dir"].parent.name == "runs"
     assert (captured["report_dir"] / "release.json").exists()
     loaded = RunLedger.load(captured["report_dir"])
-    assert loaded.state["status"] == "complete"
+    assert loaded.state["status"] == "open"
     assert loaded.state["phases"]["publish"]["evidence"]["snapshot_sha"] == "abc"
     assert "Release: passed" in capsys.readouterr().out
 
@@ -415,8 +413,6 @@ def test_release_command_forwards_no_local_check(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(cli, "run_release", fake_run_release)
     monkeypatch.setattr(cli, "_run_release_preflight", lambda *a, **k: SimpleNamespace(commit="a" * 40))
-    monkeypatch.setattr(cli, "_record_release_attempt", lambda *a, **k: "audit")
-    monkeypatch.setattr(cli, "_tag_successful_release", lambda *a, **k: "tag")
     _autobench_repo_root(tmp_path)
 
     rc = cli.main(
@@ -503,8 +499,6 @@ def test_release_run_resumes_same_directory(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(cli, "run_release", fake_run_release)
     monkeypatch.setattr(cli, "_run_release_preflight", lambda *a, **k: SimpleNamespace(commit="a" * 40))
-    monkeypatch.setattr(cli, "_record_release_attempt", lambda *a, **k: "audit")
-    monkeypatch.setattr(cli, "_tag_successful_release", lambda *a, **k: "tag")
 
     rc = cli.main(
         [
@@ -685,37 +679,6 @@ def _fake_git_subprocess(commands: list, stdout_by_ref: dict | None = None):
         return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
 
     return fake_run
-
-
-def test_tag_successful_release_tags_deployment_commit_on_bitbucket(tmp_path, monkeypatch) -> None:
-    commands: list = []
-    monkeypatch.setattr(cli.subprocess, "run", _fake_git_subprocess(commands))
-    monkeypatch.delenv("BB_TOKEN", raising=False)
-    source = "a" * 40
-    deployed = "d" * 40
-
-    tag = cli._tag_successful_release(tmp_path, source, deployment_commit=deployed)
-
-    assert tag.startswith("release-") and tag.endswith(source[:7])
-    temp_tag = f"edge-deploy-mirror/{tag}"
-    tag_creations = [cmd for cmd in commands if cmd[:2] == ["git", "tag"] and "-d" not in cmd]
-    assert ["git", "tag", "-a", tag, source, "-m", f"Successful release {tag}"] in tag_creations
-    assert any(cmd[4] == temp_tag and cmd[5] == deployed for cmd in tag_creations if "-f" in cmd)
-    assert ["git", "push", "origin", f"refs/tags/{tag}"] in commands
-    assert ["git", "push", "bitbucket", f"refs/tags/{temp_tag}:refs/tags/{tag}"] in commands
-    assert ["git", "tag", "-d", temp_tag] in commands  # temp tag cleaned up
-
-
-def test_tag_successful_release_pushes_same_tag_when_exact(tmp_path, monkeypatch) -> None:
-    commands: list = []
-    monkeypatch.setattr(cli.subprocess, "run", _fake_git_subprocess(commands))
-    monkeypatch.delenv("BB_TOKEN", raising=False)
-    source = "a" * 40
-
-    tag = cli._tag_successful_release(tmp_path, source, deployment_commit=source)
-
-    assert ["git", "push", "bitbucket", f"refs/tags/{tag}"] in commands
-    assert not any("edge-deploy-mirror/" in part for cmd in commands for part in cmd)
 
 
 def test_resolve_release_tag_accepts_tree_equivalent_mirror(tmp_path, monkeypatch) -> None:

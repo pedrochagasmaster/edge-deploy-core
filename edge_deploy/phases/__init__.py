@@ -78,3 +78,5 @@ from edge_deploy.phases.deploy import (  # noqa: E402, I001
 )
 
 PHASE_REGISTRY.append((DEPLOY_SPEC, register_deploy))
+
+from edge_deploy.phases import tag as _tag  # noqa: E402, F401
