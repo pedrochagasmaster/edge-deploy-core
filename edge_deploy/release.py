@@ -609,6 +609,7 @@ def run_release(
                             operator_email=operator.operator_email,
                             remote=remote,
                             dependency_bundle_factory=bundle_for_tool,
+                            run_id=report_dir.name,
                         )
                     _log_successful_preflight_repair(
                         tracker, tool=tool, node=node_name, report=report
@@ -635,6 +636,7 @@ def run_release(
                                 operator_email=operator.operator_email,
                                 remote=remote,
                                 dependency_bundle_factory=bundle_for_tool,
+                                run_id=report_dir.name,
                             )
                         _log_successful_preflight_repair(
                             tracker, tool=tool, node=node_name, report=report
