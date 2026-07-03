@@ -333,7 +333,7 @@ def test_run_remote_returns_output_and_exit_code() -> None:
     with (
         patch.object(driver, "return_to_shell", return_value=True),
         patch.object(driver, "send_keys", side_effect=fake_send_keys),
-        patch.object(driver, "send_key"),
+        patch.object(driver, "send_key") as send_key,
         patch.object(driver, "wait_for") as wait_for,
         patch.object(driver, "capture_screen") as capture_screen,
     ):
@@ -352,6 +352,7 @@ def test_run_remote_returns_output_and_exit_code() -> None:
     assert "which dispatch" in captured["cmd"]
     # The sentinel is split so the echoed command line can never match it.
     assert "__RC''_" in captured["cmd"]
+    assert [call.args[0] for call in send_key.call_args_list[:2]] == ["C-u", "Enter"]
 
 
 def test_run_remote_parses_nonzero_exit_code() -> None:
