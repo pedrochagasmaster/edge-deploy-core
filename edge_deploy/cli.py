@@ -1,9 +1,10 @@
 """Thin CLI surface: ``python -m edge_deploy {release|publish|rollout|drift|preflight}``.
 
 Resolves ``--tool`` / ``--node`` against the two config layers (OperatorConfig + the
-tool's ToolProfile), establishes an Authenticated Pane, and calls the engine. The umbrella
-``release`` orchestrator (Publish + fan-out + getpass auth seam) and the standalone
-``publish`` command are wired here on top of the Phase-1 ``rollout`` / ``drift`` engine.
+tool's ToolProfile) and dispatches commands. For Release, CLI preflight owns only the
+local repository, CI, test, and audit gates; ``run_release`` solely owns node
+authentication. The standalone ``publish`` command is wired here alongside the
+``rollout`` / ``drift`` engine.
 """
 
 from __future__ import annotations

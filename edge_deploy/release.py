@@ -1,7 +1,8 @@
 """Low-level Deploy orchestration and consolidated reporting.
 
-The public CLI supplies the Tool inferred from the current checkout and completes all
-hard preflight and authentication gates before calling this engine.
+The public CLI supplies the Tool inferred from the current checkout and completes the
+local repository, CI, test, and audit gates before calling this engine. ``run_release``
+solely owns node authentication.
 
 Pair statuses (ADR-0003): ``rolled_out | failed | refused | skipped``. ``run_rollout``
 never returns ``skipped`` (Risk #9), so the orchestrator synthesizes it for
