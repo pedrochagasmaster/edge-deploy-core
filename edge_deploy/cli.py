@@ -24,11 +24,12 @@ from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, OperatorConfig, loa
 from edge_deploy.ledger import LedgerError, RunLedger
 from edge_deploy.mirror import MirrorError, mirror_release
 from edge_deploy.phases import PHASE_REGISTRY, EngineMismatchError
+from edge_deploy.phases.verify import ensure_verified
 from edge_deploy.posture import PostureError
 from edge_deploy.publish import PublishError, publish_snapshot
 from edge_deploy.release import ReleaseSelection, resolve_nodes, run_release
 from edge_deploy.reporting import OperationReport, redact, write_release_report, write_report
-from edge_deploy.repository import RepositoryError, inspect_repository, require_successful_github_ci
+from edge_deploy.repository import RepositoryError, inspect_repository
 from edge_deploy.tmux_driver import AuthenticationError, SessionGoneError, TmuxDriver
 
 TOOL_CHOICES = ("autobench", "robocop")
@@ -273,6 +274,7 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
             profile,
             repo_root,
             node_names,
+            ledger,
             auth_mode=args.auth_mode,
             max_auth_attempts=args.max_auth_attempts,
             auth_wait_seconds=args.auth_wait_seconds,
@@ -454,6 +456,7 @@ def _cmd_rollback(args: argparse.Namespace, operator: OperatorConfig) -> int:
             profile,
             repo_root,
             node_names,
+            ledger,
             auth_mode=args.auth_mode,
             max_auth_attempts=args.max_auth_attempts,
             auth_wait_seconds=args.auth_wait_seconds,
@@ -497,6 +500,7 @@ def _run_release_preflight(
     profile,
     repo_root: Path,
     node_names: list[str],
+    ledger: RunLedger,
     *,
     auth_mode: str,
     max_auth_attempts: int,
@@ -505,19 +509,14 @@ def _run_release_preflight(
     allow_unresolved: bool = False,
     repo_state=None,
 ):
-    if not profile.github_url:
-        raise RepositoryError("edge_deploy.yaml must define github_url")
-    state = repo_state or inspect_repository(
+    state = ensure_verified(
+        operator,
+        profile,
         repo_root,
-        tool=profile.tool,
-        expected_origin=profile.github_url,
-        expected_bitbucket=profile.bitbucket_url,
+        ledger,
+        reverify=False,
+        repo_state=repo_state,
     )
-    require_successful_github_ci(state)
-    pytest_command = [sys.executable, "-m", "pytest", "-n", "8", "--dist", "loadfile"]
-    completed = subprocess.run(pytest_command, cwd=repo_root)
-    if completed.returncode:
-        raise RuntimeError("python -m pytest -n 8 --dist loadfile failed; release blocked")
     if not operator.audit_repo:
         raise AuditSyncError("operator config must define audit_repo")
     check_audit_remote(
