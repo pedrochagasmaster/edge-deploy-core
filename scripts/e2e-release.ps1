@@ -186,10 +186,20 @@ function Ensure-BbToken {
     Remove-Variable secureToken
 }
 
+function Confirm-GitHubPosture {
+    param([Parameter(Mandatory)][string]$Reason)
+
+    Write-Host ''
+    Write-Host '==> GitHub posture required' -ForegroundColor Yellow
+    Write-Host $Reason
+    Write-Host 'Switch firewall posture to GitHub now, then press Enter to continue.'
+    Read-Host 'Continue'
+}
+
 function Get-BranchName {
     param([Parameter(Mandatory)][string]$ReleaseKind)
 
-    $dateStamp = Get-Date -Format 'yyyyMMdd'
+    $dateStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     return "codex/e2e-$ReleaseKind-$dateStamp"
 }
 
@@ -370,6 +380,8 @@ try {
 
     Set-Location $ToolPath
 
+    Confirm-GitHubPosture -Reason 'Preparation reads GitHub origin/main before creating the release exercise branch.'
+
     git switch main
     Assert-CommandPassed "Switch $Tool to main"
 
@@ -426,6 +438,8 @@ try {
     git commit -m $commitMessage
     Assert-CommandPassed 'Commit cosmetic change'
 
+    Confirm-GitHubPosture -Reason 'The PR workflow now pushes the branch, creates the GitHub PR, and watches GitHub checks.'
+
     git push -u origin HEAD
     Assert-CommandPassed 'Push branch'
 
@@ -462,6 +476,8 @@ try {
 
     Write-Host ''
     Write-Host '==> Merge and post-merge CI' -ForegroundColor Cyan
+
+    Confirm-GitHubPosture -Reason 'Merging the PR and waiting for post-merge CI require GitHub access.'
 
     gh pr merge $prNumber --squash --delete-branch
     Assert-CommandPassed 'Squash-merge pull request'
