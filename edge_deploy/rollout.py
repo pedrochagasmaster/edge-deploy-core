@@ -463,6 +463,7 @@ def run_rollout(
     remote: str = "bitbucket",
     dependency_bundle: DependencyBundle | None = None,
     dependency_bundle_factory: Callable[[], DependencyBundle] | None = None,
+    run_id: str = "edge-deploy",
 ) -> OperationReport:
     """Roll one Edge Node to ``target_commit`` and return an :class:`OperationReport`.
 
@@ -543,7 +544,9 @@ def run_rollout(
                 extra={"changed_paths": changed_paths, "dependency_paths": refused},
             )
         try:
-            delivered = deliver_dependency_bundle(driver, profile, dependency_bundle)
+            delivered = deliver_dependency_bundle(
+                driver, profile, dependency_bundle, run_id=run_id
+            )
         except BundleError as exc:
             check = ReportCheck("dependency_delivery", False, str(exc))
             return OperationReport(
@@ -600,7 +603,9 @@ def run_rollout(
         else:
             try:
                 dependency_bundle = dependency_bundle or dependency_bundle_factory()
-                delivered = deliver_dependency_bundle(driver, profile, dependency_bundle)
+                delivered = deliver_dependency_bundle(
+                    driver, profile, dependency_bundle, run_id=run_id
+                )
             except BundleError as exc:
                 return OperationReport(
                     operation="rollout",

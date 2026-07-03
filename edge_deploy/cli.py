@@ -17,17 +17,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from edge_deploy import __version__, drift, preflight, rollout
-from edge_deploy.audit import AuditAttempt, AuditSyncError, append_audit_attempt, check_audit_remote
+from edge_deploy.audit import AuditAttempt, AuditSyncError, append_audit_attempt
 from edge_deploy.auth import authenticate_node, authenticate_node_via_pane
 from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, OperatorConfig, load_tool_profile
 from edge_deploy.ledger import LedgerError, RunLedger
 from edge_deploy.mirror import MirrorError, mirror_release
 from edge_deploy.phases import PHASE_REGISTRY, EngineMismatchError
+from edge_deploy.phases.verify import ensure_verified
 from edge_deploy.posture import PostureError
 from edge_deploy.publish import PublishError, publish_snapshot
 from edge_deploy.release import ReleaseSelection, resolve_nodes, run_release
 from edge_deploy.reporting import OperationReport, redact, write_release_report, write_report
-from edge_deploy.repository import RepositoryError, inspect_repository, require_successful_github_ci
+from edge_deploy.repository import RepositoryError, inspect_repository
 from edge_deploy.tmux_driver import AuthenticationError, SessionGoneError, TmuxDriver
 
 TOOL_CHOICES = ("autobench", "robocop")
@@ -272,6 +273,7 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
             profile,
             repo_root,
             node_names,
+            ledger,
             auth_mode=args.auth_mode,
             max_auth_attempts=args.max_auth_attempts,
             auth_wait_seconds=args.auth_wait_seconds,
@@ -439,11 +441,10 @@ def _cmd_rollback(args: argparse.Namespace, operator: OperatorConfig) -> int:
             profile,
             repo_root,
             node_names,
+            ledger,
             auth_mode=args.auth_mode,
             max_auth_attempts=args.max_auth_attempts,
             auth_wait_seconds=args.auth_wait_seconds,
-            release_sha=target,
-            allow_unresolved=True,
         )
         report = run_release(
             effective_operator,
@@ -482,36 +483,21 @@ def _run_release_preflight(
     profile,
     repo_root: Path,
     node_names: list[str],
+    ledger: RunLedger,
     *,
     auth_mode: str,
     max_auth_attempts: int,
     auth_wait_seconds: float,
-    release_sha: str | None = None,
-    allow_unresolved: bool = False,
     repo_state=None,
 ):
-    if not profile.github_url:
-        raise RepositoryError("edge_deploy.yaml must define github_url")
-    state = repo_state or inspect_repository(
+    state = ensure_verified(
+        operator,
+        profile,
         repo_root,
-        tool=profile.tool,
-        expected_origin=profile.github_url,
-        expected_bitbucket=profile.bitbucket_url,
+        ledger,
+        reverify=False,
+        repo_state=repo_state,
     )
-    require_successful_github_ci(state)
-    pytest_command = [sys.executable, "-m", "pytest", "-n", "8", "--dist", "loadfile"]
-    completed = subprocess.run(pytest_command, cwd=repo_root)
-    if completed.returncode:
-        raise RuntimeError("python -m pytest -n 8 --dist loadfile failed; release blocked")
-    if not operator.audit_repo:
-        raise AuditSyncError("operator config must define audit_repo")
-    check_audit_remote(
-        Path(operator.audit_repo),
-        tool=profile.tool,
-        source_sha=release_sha or state.commit,
-        allow_unresolved=allow_unresolved,
-    )
-
     for node_name in node_names:
         node = operator.node(node_name)
         driver = TmuxDriver.from_node_and_profile(node, profile, retries=2)
