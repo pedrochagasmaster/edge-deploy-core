@@ -7,11 +7,13 @@ no nodes. A subprocess smoke test exercises the real ``python -m edge_deploy`` e
 from __future__ import annotations
 
 import json
+import os
 import socket
 import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -456,10 +458,16 @@ def test_release_chain_holds_lock_between_phases(tmp_path, monkeypatch, capsys) 
 
     phases_checked: list[str] = []
 
+    def _assert_locked_against_other_processes(run_dir) -> None:
+        # A ledger loaded in the *same* process may borrow the held lock, so a
+        # foreign process is simulated by reporting a different PID.
+        foreign = RunLedger.load(run_dir)
+        with patch("edge_deploy.ledger.os.getpid", return_value=os.getpid() + 1):
+            with pytest.raises(RunLockError):
+                foreign.acquire_lock()
+
     def fake_ensure_verified(operator, profile, repo_root, ledger, **kwargs):
-        foreign = RunLedger.load(ledger.run_dir)
-        with pytest.raises(RunLockError):
-            foreign.acquire_lock()
+        _assert_locked_against_other_processes(ledger.run_dir)
         phases_checked.append("verify")
         ledger.set_phase(
             "verify",
@@ -474,9 +482,7 @@ def test_release_chain_holds_lock_between_phases(tmp_path, monkeypatch, capsys) 
         return SimpleNamespace(commit=SOURCE_SHA)
 
     def fake_publish(ledger, operator, repo_root, **kwargs):
-        foreign = RunLedger.load(ledger.run_dir)
-        with pytest.raises(RunLockError):
-            foreign.acquire_lock()
+        _assert_locked_against_other_processes(ledger.run_dir)
         phases_checked.append("publish")
         ledger.set_phase(
             "publish",
@@ -489,9 +495,12 @@ def test_release_chain_holds_lock_between_phases(tmp_path, monkeypatch, capsys) 
         from edge_deploy.phases.deploy import _load_run
 
         ledger, _repo_root = _load_run(args, operator)
-        foreign = RunLedger.load(ledger.run_dir)
-        with pytest.raises(RunLockError):
-            foreign.acquire_lock()
+        _assert_locked_against_other_processes(ledger.run_dir)
+        # Regression: the chained phase itself reloads the ledger and must be able
+        # to borrow the outer lock instead of self-deadlocking on its own PID.
+        ledger.acquire_lock()
+        ledger.release_lock()
+        assert (ledger.run_dir / "run.lock").is_file()
         phases_checked.append("deploy")
         for node in ledger.state["nodes"]:
             ledger.set_phase("deploy", "passed", node=node, evidence={"status": "rolled_out"})
@@ -501,9 +510,7 @@ def test_release_chain_holds_lock_between_phases(tmp_path, monkeypatch, capsys) 
         from edge_deploy.phases.deploy import _load_run
 
         ledger, _repo_root = _load_run(args, operator)
-        foreign = RunLedger.load(ledger.run_dir)
-        with pytest.raises(RunLockError):
-            foreign.acquire_lock()
+        _assert_locked_against_other_processes(ledger.run_dir)
         phases_checked.append("tag_github")
         ledger.set_phase("tag_github", "passed", evidence={"tag": RELEASE_TAG, "pushed_sha": SOURCE_SHA})
         return 0
@@ -512,9 +519,7 @@ def test_release_chain_holds_lock_between_phases(tmp_path, monkeypatch, capsys) 
         from edge_deploy.phases.deploy import _load_run
 
         ledger, _repo_root = _load_run(args, operator)
-        foreign = RunLedger.load(ledger.run_dir)
-        with pytest.raises(RunLockError):
-            foreign.acquire_lock()
+        _assert_locked_against_other_processes(ledger.run_dir)
         phases_checked.append("tag_bitbucket")
         ledger.set_phase("tag_bitbucket", "passed", evidence={"tag": RELEASE_TAG, "pushed_sha": SNAPSHOT_SHA})
         ledger.complete()

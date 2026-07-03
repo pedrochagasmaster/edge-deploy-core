@@ -94,6 +94,7 @@ class RunLedger:
     run_dir: Path
     state: dict
     _lock_depth: int = field(default=0, repr=False)
+    _lock_borrowed: bool = field(default=False, repr=False)
 
     @classmethod
     def create(
@@ -264,6 +265,17 @@ class RunLedger:
         lock_path = self.run_dir / "run.lock"
         if lock_path.is_file():
             payload = json.loads(lock_path.read_text(encoding="utf-8"))
+            if (
+                payload.get("pid") == os.getpid()
+                and payload.get("hostname") == socket.gethostname()
+            ):
+                # Another RunLedger instance in this same process already holds the
+                # lock (chained phases reload the ledger from disk). Borrow it:
+                # reentry within one process is safe, and the owning instance stays
+                # responsible for unlinking the lock file.
+                self._lock_depth = 1
+                self._lock_borrowed = True
+                return
             if not force:
                 self._raise_foreign_lock(payload)
             lock_path.unlink()
@@ -292,6 +304,10 @@ class RunLedger:
             return
         self._lock_depth -= 1
         if self._lock_depth > 0:
+            return
+        if self._lock_borrowed:
+            # The lock file belongs to the instance that created it; leave it.
+            self._lock_borrowed = False
             return
         lock_path = self.run_dir / "run.lock"
         lock_path.unlink(missing_ok=True)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 from pathlib import Path
@@ -132,3 +133,34 @@ def test_acquire_lock_reentrant_same_instance(tmp_path: Path) -> None:
     assert (ledger.run_dir / "run.lock").is_file()
     ledger.release_lock()
     assert not (ledger.run_dir / "run.lock").is_file()
+
+
+def test_acquire_lock_borrows_same_process_lock_across_instances(tmp_path: Path) -> None:
+    """Regression: chained phases reload the ledger from disk, so a second
+    RunLedger instance in the same process must borrow the held lock instead of
+    raising RunLockError against the process's own PID (self-deadlock)."""
+    outer = _create_ledger(tmp_path)
+    outer.acquire_lock()
+
+    inner = RunLedger.load(outer.run_dir)
+    inner.acquire_lock()  # must not raise
+    assert (outer.run_dir / "run.lock").is_file()
+
+    # The borrowing instance must not unlink the owner's lock file.
+    inner.release_lock()
+    assert (outer.run_dir / "run.lock").is_file()
+
+    outer.release_lock()
+    assert not (outer.run_dir / "run.lock").is_file()
+
+
+def test_acquire_lock_same_pid_other_host_still_raises(tmp_path: Path) -> None:
+    ledger = _create_ledger(tmp_path)
+    lock_payload = {
+        "pid": os.getpid(),
+        "hostname": "some-other-host",
+        "acquired_at": "2026-07-03T12:00:00+00:00",
+    }
+    (ledger.run_dir / "run.lock").write_text(json.dumps(lock_payload), encoding="utf-8")
+    with pytest.raises(RunLockError):
+        ledger.acquire_lock()
