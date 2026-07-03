@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -54,11 +55,51 @@ def _git_output(args: list[str], root: str | Path, *, text: bool = True) -> subp
     return subprocess.run(args, cwd=root, check=True, capture_output=True, text=text)
 
 
+def _glob_regex(pattern: str) -> re.Pattern[str]:
+    """Translate a ``runtime_paths`` glob into a regex over posix repo-relative paths.
+
+    Mirrors :meth:`pathlib.Path.glob` semantics for the shapes profiles use:
+    ``**`` spans zero or more directories, ``*`` / ``?`` stay within a segment.
+    """
+    parts: list[str] = []
+    i = 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            parts.append("(?:[^/]+/)*")
+            i += 3
+        elif pattern.startswith("**", i):
+            parts.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            parts.append("[^/]*")
+            i += 1
+        elif pattern[i] == "?":
+            parts.append("[^/]")
+            i += 1
+        else:
+            parts.append(re.escape(pattern[i]))
+            i += 1
+    return re.compile("".join(parts) + r"\Z")
+
+
+def snapshot_runtime_paths(profile: ToolProfile, root: str | Path, commit: str) -> list[str]:
+    """Enumerate the runtime-critical paths as they exist in ``commit``'s tree.
+
+    Deliberately *not* the working tree: on a rollback the Snapshot is older than
+    HEAD, so files added since would 128 out of ``git show`` (and files deleted
+    since would silently escape drift checking).
+    """
+    listing = _git_output(["git", "ls-tree", "-r", "--name-only", "-z", commit], root).stdout
+    names = [name for name in listing.split("\0") if name]
+    regexes = [_glob_regex(pattern) for pattern in profile.runtime_paths]
+    return sorted({name for name in names if any(rx.match(name) for rx in regexes)})
+
+
 def local_runtime_map(profile: ToolProfile, root: str | Path, commit: str) -> dict[str, str]:
-    """Map each runtime-critical path to the md5 of its blob at ``commit`` (git ``show``)."""
+    """Map each runtime-critical path in ``commit``'s tree to the md5 of its blob."""
     _git_output(["git", "rev-parse", "--verify", commit], root)
     mapping: dict[str, str] = {}
-    for path in runtime_critical_paths(profile, root):
+    for path in snapshot_runtime_paths(profile, root, commit):
         blob = subprocess.run(
             ["git", "show", f"{commit}:{path}"],
             cwd=root,

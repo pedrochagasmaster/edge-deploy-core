@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import subprocess
+
 import pytest
 
 from edge_deploy import drift
@@ -64,6 +66,57 @@ def test_runtime_critical_paths_discovers_profile_globs(load_profile, tmp_path, 
     _make_tree(tmp_path, files)
 
     assert set(drift.runtime_critical_paths(profile, tmp_path)) == expected
+
+
+def _git(root, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=root, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def test_local_runtime_map_reads_snapshot_tree_not_working_tree(load_profile, tmp_path) -> None:
+    """Regression: rollback drift check globbed the working tree, then 128'd on
+    ``git show`` for files added after the snapshot (and silently skipped files
+    deleted since)."""
+    profile = load_profile("autobench")
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.email", "t@example.com")
+    _git(tmp_path, "config", "user.name", "t")
+
+    _make_tree(tmp_path, ["benchmark.py", "core/engine.py"])
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-q", "-m", "snapshot")
+    snapshot = _git(tmp_path, "rev-parse", "HEAD")
+
+    # HEAD moves on: one runtime file added, one deleted.
+    (tmp_path / "core" / "added_later.py").write_text("new", encoding="utf-8")
+    (tmp_path / "core" / "engine.py").unlink()
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-q", "-m", "later work")
+
+    mapping = drift.local_runtime_map(profile, tmp_path, snapshot)
+
+    assert "core/added_later.py" not in mapping  # not in the snapshot -> not expected on node
+    assert "core/engine.py" in mapping  # deleted since, but the snapshot still ships it
+    assert "benchmark.py" in mapping
+
+
+@pytest.mark.parametrize(
+    "pattern, path, matches",
+    [
+        ("core/**/*.py", "core/engine.py", True),
+        ("core/**/*.py", "core/sub/deep.py", True),
+        ("core/**/*.py", "coreX/engine.py", False),
+        ("core/**/*.py", "core/engine.txt", False),
+        ("benchmark.py", "benchmark.py", True),
+        ("benchmark.py", "sub/benchmark.py", False),
+        ("dispatch/**/*.tcss", "dispatch/widgets/table.tcss", True),
+        ("*.py", "top.py", True),
+        ("*.py", "sub/nested.py", False),
+    ],
+)
+def test_glob_regex_mirrors_pathlib_glob_semantics(pattern: str, path: str, matches: bool) -> None:
+    assert bool(drift._glob_regex(pattern).match(path)) is matches
 
 
 def test_summarize_drift_counts_states() -> None:
