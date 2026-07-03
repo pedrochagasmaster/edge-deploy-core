@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from edge_deploy.cli import build_parser
-from edge_deploy.ledger import RunLedger, RunLockError
+from edge_deploy.ledger import LedgerError, RunLedger, RunLockError
 from edge_deploy.phases import (
     PHASE_REGISTRY,
     EngineMismatchError,
@@ -170,6 +170,22 @@ def test_enter_phase_success_records_event_and_exit_stack_releases_lock(
 
     stack.close()
     assert not (ledger.run_dir / "run.lock").is_file()
+
+
+def test_enter_phase_refuses_non_open_run(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ledger = _create_ledger(tmp_path)
+    ledger.complete()
+    run_id = ledger.state["run_id"]
+    current = ledger.state["engine"]["content_sha256"]
+    monkeypatch.setattr(
+        "edge_deploy.phases.engine_identity",
+        lambda: {"content_sha256": current, "version": "1.0.0", "package_dir": "/pkg"},
+    )
+
+    with pytest.raises(LedgerError, match=f"phase 'verify' refused: run {run_id} is complete"):
+        enter_phase(_verify_spec(), None, ledger, next_command="python -m edge_deploy verify --run x")
 
 
 def test_registry_driven_subcommand_appears_in_help() -> None:

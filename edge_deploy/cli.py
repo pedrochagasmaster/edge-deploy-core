@@ -329,6 +329,15 @@ def _chain_release_phases(
     return 0
 
 
+def _refuse_non_open_run(command: str, run_id: str, status: str) -> int:
+    print(
+        f"{command} refused: run {run_id} is {status}; "
+        f"only open runs can be continued — abandon it or start a new {command}",
+        file=sys.stderr,
+    )
+    return 2
+
+
 def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
     repo_root = Path.cwd().resolve()
     if args.tool:
@@ -346,6 +355,8 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
             print(f"no such run: {args.run} under {runs_root}", file=sys.stderr)
             return 2
         ledger = RunLedger.load(run_dir)
+        if ledger.state["status"] != "open":
+            return _refuse_non_open_run("release", args.run, ledger.state["status"])
     else:
         open_runs = RunLedger.find_open(runs_root)
         if open_runs:
@@ -372,16 +383,17 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
             expected_origin=profile.github_url,
             expected_bitbucket=profile.bitbucket_url,
         )
-    return _chain_release_phases(
-        args,
-        operator,
-        ledger,
-        repo_root=repo_root,
-        profile=profile,
-        effective_operator=effective_operator,
-        node_names=node_names,
-        repo_state=repo_state,
-    )
+    with ledger.locked(force=args.force_lock):
+        return _chain_release_phases(
+            args,
+            operator,
+            ledger,
+            repo_root=repo_root,
+            profile=profile,
+            effective_operator=effective_operator,
+            node_names=node_names,
+            repo_state=repo_state,
+        )
 
 
 def _remote_tag_sha(repo_root: Path, remote: str, tag: str) -> str:
@@ -519,16 +531,17 @@ def _cmd_rollback(args: argparse.Namespace, operator: OperatorConfig) -> int:
         expected_origin=profile.github_url,
         expected_bitbucket=profile.bitbucket_url,
     )
-    return _chain_release_phases(
-        args,
-        operator,
-        ledger,
-        repo_root=repo_root,
-        profile=profile,
-        effective_operator=effective_operator,
-        node_names=node_names,
-        repo_state=repo_state,
-    )
+    with ledger.locked(force=args.force_lock):
+        return _chain_release_phases(
+            args,
+            operator,
+            ledger,
+            repo_root=repo_root,
+            profile=profile,
+            effective_operator=effective_operator,
+            node_names=node_names,
+            repo_state=repo_state,
+        )
 
 
 def _run_release_preflight(
@@ -593,7 +606,8 @@ def _cmd_abandon(args: argparse.Namespace, operator: OperatorConfig) -> int:
         print(f"no such run: {args.run} under {runs_root}", file=sys.stderr)
         return 2
     ledger = RunLedger.load(run_dir)
-    ledger.abandon(args.reason)
+    with ledger.locked():
+        ledger.abandon(args.reason)
     print(f"abandoned {args.run}")
     return 0
 
