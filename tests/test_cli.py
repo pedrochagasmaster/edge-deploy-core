@@ -418,12 +418,22 @@ def test_release_command_nonzero_exit_on_failure(tmp_path, monkeypatch) -> None:
     assert rc == 1
 
 
-def test_release_command_resume_loads_publish_snapshots(tmp_path, monkeypatch) -> None:
+def test_release_command_resume_preserves_source_and_deployment_provenance(tmp_path, monkeypatch) -> None:
     config_path = _write_operator_config_both(tmp_path)
     resume_dir = tmp_path / "resume"
     resume_dir.mkdir()
+    source = "a" * 40
+    deployed = "d" * 40
     (resume_dir / "publish-autobench.json").write_text(
-        json.dumps({"tool": "autobench", "status": "published", "deployment_commit": "a" * 40}) + "\n",
+        json.dumps(
+            {
+                "tool": "autobench",
+                "status": "published",
+                "source_commit": source,
+                "deployment_commit": deployed,
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
     captured: dict = {}
@@ -441,19 +451,98 @@ def test_release_command_resume_loads_publish_snapshots(tmp_path, monkeypatch) -
 
     def fake_preflight(*args, **kwargs):
         captured["preflight_kwargs"] = kwargs
-        return SimpleNamespace(commit="c" * 40)
+        return SimpleNamespace(commit=source)
 
     monkeypatch.setattr(cli, "_run_release_preflight", fake_preflight)
-    monkeypatch.setattr(cli, "_record_release_attempt", lambda *a, **k: "audit")
-    monkeypatch.setattr(cli, "_tag_successful_release", lambda *a, **k: "tag")
+
+    def fake_record(*args, **kwargs):
+        captured["audit_commit"] = args[2]
+        return "audit"
+
+    def fake_tag(*args, **kwargs):
+        captured["tag_commit"] = args[1]
+        return "release-test"
+
+    def fake_handoff(*args, **kwargs):
+        captured["handoff_kwargs"] = kwargs
+        return resume_dir / "push-release-test.ps1"
+
+    monkeypatch.setattr(cli, "_record_release_attempt", fake_record)
+    monkeypatch.setattr(cli, "_tag_successful_release", fake_tag)
+    monkeypatch.setattr(cli, "_write_tag_push_handoff", fake_handoff)
 
     rc = cli.main(["--config", str(config_path), "release", "--tool", "autobench", "--resume", str(resume_dir)])
 
     assert rc == 0
     assert captured["report_dir"] == resume_dir
-    assert captured["selection"].snapshot_by_tool == {"autobench": "a" * 40}
-    assert captured["preflight_kwargs"]["release_sha"] == "a" * 40
+    assert captured["selection"].snapshot_by_tool == {"autobench": deployed}
+    assert captured["preflight_kwargs"]["release_sha"] == source
+    assert captured["preflight_kwargs"]["expected_checkout_sha"] == source
+    assert captured["audit_commit"] == source
+    assert captured["tag_commit"] == source
+    assert captured["handoff_kwargs"] == {
+        "tag": "release-test",
+        "source_commit": source,
+        "deployment_commit": deployed,
+    }
     assert (resume_dir / "release.json").exists()
+
+
+def test_release_command_resume_rejects_missing_source_provenance(tmp_path, monkeypatch, capsys) -> None:
+    config_path = _write_operator_config_both(tmp_path)
+    resume_dir = tmp_path / "resume"
+    resume_dir.mkdir()
+    (resume_dir / "publish-autobench.json").write_text(
+        json.dumps(
+            {
+                "tool": "autobench",
+                "status": "published",
+                "deployment_commit": "d" * 40,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        cli,
+        "_run_release_preflight",
+        lambda *args, **kwargs: pytest.fail("preflight must not run without source provenance"),
+    )
+
+    rc = cli.main(["--config", str(config_path), "release", "--tool", "autobench", "--resume", str(resume_dir)])
+
+    assert rc == 2
+    assert "source_commit" in capsys.readouterr().err
+
+
+def test_release_preflight_rejects_resume_when_checkout_advanced(tmp_path, monkeypatch) -> None:
+    source = "a" * 40
+    current = "b" * 40
+    profile = SimpleNamespace(
+        tool="autobench",
+        github_url="https://github.example/autobench.git",
+        bitbucket_url="https://bitbucket.example/autobench.git",
+    )
+    operator = SimpleNamespace(audit_repo=str(tmp_path / "audit"))
+    monkeypatch.setattr(cli, "inspect_repository", lambda *args, **kwargs: SimpleNamespace(commit=current))
+    monkeypatch.setattr(
+        cli,
+        "require_successful_github_ci",
+        lambda state: pytest.fail("CI check must not run for a stale resume"),
+    )
+
+    with pytest.raises(cli.RepositoryError, match="resume source.*does not match current checkout"):
+        cli._run_release_preflight(
+            operator,
+            profile,
+            tmp_path,
+            [],
+            auth_mode="pane",
+            max_auth_attempts=1,
+            auth_wait_seconds=1,
+            release_sha=source,
+            expected_checkout_sha=source,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -570,7 +659,7 @@ def test_tag_successful_release_creates_local_source_tag_only(tmp_path, monkeypa
     source = "a" * 40
     deployed = "d" * 40
 
-    tag = cli._tag_successful_release(tmp_path, source, deployment_commit=deployed)
+    tag = cli._tag_successful_release(tmp_path, source)
 
     assert tag.startswith("release-") and tag.endswith(source[:7])
     tag_creations = [cmd for cmd in commands if cmd[:2] == ["git", "tag"] and "-d" not in cmd]
@@ -578,10 +667,12 @@ def test_tag_successful_release_creates_local_source_tag_only(tmp_path, monkeypa
     assert not any(cmd[:2] == ["git", "push"] for cmd in commands)
 
 
-def test_tag_push_handoff_records_split_firewall_commands(tmp_path) -> None:
+def test_tag_push_handoff_is_fail_closed_and_does_not_persist_token(tmp_path, monkeypatch) -> None:
     tag = "release-20260702T223038Z-aaaaaaa"
     source = "a" * 40
     deployed = "d" * 40
+    secret = "top-secret-bitbucket-token"
+    monkeypatch.setenv("BB_TOKEN", secret)
 
     path = cli._write_tag_push_handoff(
         tmp_path,
@@ -592,39 +683,49 @@ def test_tag_push_handoff_records_split_firewall_commands(tmp_path) -> None:
 
     text = path.read_text(encoding="utf-8")
     temp_tag = f"edge-deploy-mirror/{tag}"
+    lines = text.splitlines()
     assert "switch firewall/network posture to GitHub access" in text
     assert f"git push origin refs/tags/{tag}" in text
     assert "switch firewall/network posture to Bitbucket/Edge access" in text
-    assert f"git push bitbucket refs/tags/{temp_tag}:refs/tags/{tag}" in text
-    assert f"git tag -d {temp_tag}" in text
+    assert '$env:BB_TOKEN' in text
+    assert secret not in text
+    assert (
+        f'git -c "http.extraHeader=Authorization: Bearer $env:BB_TOKEN" '
+        f"push bitbucket refs/tags/{temp_tag}:refs/tags/{tag}"
+    ) in text
+    assert f'"refs/tags/{tag}^{{}}"' in text
+    assert f'$githubCommit -ne "{source}"' in text
+    assert f'$bitbucketCommit -ne "{deployed}"' in text
+
+    command_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if line.startswith("git push ") or " ls-remote " in line or " push bitbucket " in line
+    ]
+    assert command_indexes
+    for index in command_indexes:
+        assert lines[index + 1].startswith("if ($LASTEXITCODE -ne 0)")
+
+    verify_index = lines.index(f'if ($bitbucketCommit -ne "{deployed}") {{')
+    delete_index = lines.index(f"git tag -d {temp_tag}")
+    assert verify_index < delete_index
 
 
-def test_push_release_tag_to_bitbucket_tags_deployment_commit(tmp_path, monkeypatch) -> None:
-    commands: list = []
-    monkeypatch.setattr(cli.subprocess, "run", _fake_git_subprocess(commands))
+def test_tag_push_handoff_verifies_same_source_and_deployment_commit(tmp_path) -> None:
     tag = "release-20260702T223038Z-aaaaaaa"
     source = "a" * 40
-    deployed = "d" * 40
 
-    cli._push_release_tag_to_bitbucket(tmp_path, tag, source, deployment_commit=deployed)
+    path = cli._write_tag_push_handoff(
+        tmp_path,
+        tag=tag,
+        source_commit=source,
+        deployment_commit=source,
+    )
 
-    temp_tag = f"edge-deploy-mirror/{tag}"
-    tag_creations = [cmd for cmd in commands if cmd[:2] == ["git", "tag"] and "-d" not in cmd]
-    assert any(cmd[4] == temp_tag and cmd[5] == deployed for cmd in tag_creations if "-f" in cmd)
-    assert ["git", "push", "bitbucket", f"refs/tags/{temp_tag}:refs/tags/{tag}"] in commands
-    assert ["git", "tag", "-d", temp_tag] in commands  # temp tag cleaned up
-
-
-def test_tag_successful_release_pushes_same_tag_when_exact(tmp_path, monkeypatch) -> None:
-    commands: list = []
-    monkeypatch.setattr(cli.subprocess, "run", _fake_git_subprocess(commands))
-    tag = "release-20260702T223038Z-aaaaaaa"
-    source = "a" * 40
-
-    cli._push_release_tag_to_bitbucket(tmp_path, tag, source, deployment_commit=source)
-
-    assert ["git", "push", "bitbucket", f"refs/tags/{tag}"] in commands
-    assert not any("edge-deploy-mirror/" in part for cmd in commands for part in cmd)
+    text = path.read_text(encoding="utf-8")
+    assert f"push bitbucket refs/tags/{tag}" in text
+    assert text.count(f'-ne "{source}"') == 2
+    assert "edge-deploy-mirror/" not in text
 
 
 def test_resolve_release_tag_accepts_tree_equivalent_mirror(tmp_path, monkeypatch) -> None:

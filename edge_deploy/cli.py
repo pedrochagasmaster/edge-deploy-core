@@ -12,7 +12,7 @@ import argparse
 import json
 import subprocess
 import sys
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -145,16 +145,30 @@ def _default_report_dir() -> Path:
     return Path("edge-deploy") / "reports" / f"release-{stamp}"
 
 
-def _load_resume_snapshots(report_dir: Path, tools: list[str]) -> dict[str, str]:
-    snapshots: dict[str, str] = {}
+@dataclass(frozen=True)
+class ResumeProvenance:
+    source_commit: str
+    deployment_commit: str
+
+
+def _load_resume_provenance(report_dir: Path, tools: list[str]) -> dict[str, ResumeProvenance]:
+    provenance: dict[str, ResumeProvenance] = {}
     for tool in tools:
         path = report_dir / f"publish-{tool}.json"
         payload = json.loads(path.read_text(encoding="utf-8"))
-        snapshot = payload.get("deployment_commit") or payload.get("snapshot")
-        if payload.get("status") != "published" or not snapshot:
+        if payload.get("status") != "published":
             raise ValueError(f"Cannot resume {tool}: {path} is not a successful publish report")
-        snapshots[tool] = str(snapshot)
-    return snapshots
+        source_commit = payload.get("source_commit")
+        deployment_commit = payload.get("deployment_commit")
+        if not source_commit or not deployment_commit:
+            raise ValueError(
+                f"Cannot resume {tool}: {path} must contain source_commit and deployment_commit"
+            )
+        provenance[tool] = ResumeProvenance(
+            source_commit=str(source_commit),
+            deployment_commit=str(deployment_commit),
+        )
+    return provenance
 
 
 def _print_release_summary(report, consolidated_path: Path) -> None:
@@ -186,10 +200,17 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
         report_dir = Path(args.report_dir)
     else:
         report_dir = _default_report_dir()
-    snapshot_by_tool: dict[str, str] = {}
+    resume_provenance: dict[str, ResumeProvenance] = {}
     if args.resume:
-        snapshot_by_tool.update(_load_resume_snapshots(report_dir, tools))
-    release_sha = snapshot_by_tool.get(profile.tool) if args.resume else None
+        resume_provenance.update(_load_resume_provenance(report_dir, tools))
+    snapshot_by_tool = {
+        tool: provenance.deployment_commit for tool, provenance in resume_provenance.items()
+    }
+    release_sha = (
+        resume_provenance[profile.tool].source_commit
+        if profile.tool in resume_provenance
+        else None
+    )
     selection = ReleaseSelection(
         tools=tools,
         nodes=resolve_nodes(effective_operator, args.nodes),
@@ -208,7 +229,9 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
         max_auth_attempts=args.max_auth_attempts,
         auth_wait_seconds=args.auth_wait_seconds,
         release_sha=release_sha,
+        expected_checkout_sha=release_sha,
     )
+    source_commit = release_sha or state.commit
     report = run_release(
         effective_operator,
         selection,
@@ -224,20 +247,16 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
     _record_release_attempt(
         effective_operator,
         profile.tool,
-        state.commit,
+        source_commit,
         report_dir,
         report.summary()["overall"],
     )
     if report.exit_code() == 0:
-        tag = _tag_successful_release(
-            repo_root,
-            state.commit,
-            deployment_commit=_deployment_commit_for_tool(report, profile.tool, snapshot_by_tool),
-        )
+        tag = _tag_successful_release(repo_root, source_commit)
         tag_handoff = _write_tag_push_handoff(
             report_dir,
             tag=tag,
-            source_commit=state.commit,
+            source_commit=source_commit,
             deployment_commit=_deployment_commit_for_tool(report, profile.tool, snapshot_by_tool),
         )
         print(redact(f"[release] local release tag created: {tag}"))
@@ -426,6 +445,7 @@ def _run_release_preflight(
     max_auth_attempts: int,
     auth_wait_seconds: float,
     release_sha: str | None = None,
+    expected_checkout_sha: str | None = None,
     allow_unresolved: bool = False,
 ):
     if not profile.github_url:
@@ -436,6 +456,10 @@ def _run_release_preflight(
         expected_origin=profile.github_url,
         expected_bitbucket=profile.bitbucket_url,
     )
+    if expected_checkout_sha and state.commit != expected_checkout_sha:
+        raise RepositoryError(
+            f"resume source {expected_checkout_sha} does not match current checkout {state.commit}"
+        )
     require_successful_github_ci(state)
     pytest_command = [sys.executable, "-m", "pytest", "-n", "8", "--dist", "loadfile"]
     completed = subprocess.run(pytest_command, cwd=repo_root)
@@ -491,7 +515,7 @@ def _record_release_attempt(
     return append_audit_attempt(Path(operator.audit_repo), attempt)
 
 
-def _tag_successful_release(repo_root: Path, commit: str, deployment_commit: str | None = None) -> str:
+def _tag_successful_release(repo_root: Path, commit: str) -> str:
     """Create the local annotated source release tag.
 
     Remote tag pushes are an explicit operator step because the release environment can
@@ -509,17 +533,33 @@ def _tag_push_handoff_lines(tag: str, source_commit: str, deployment_commit: str
     deployed = deployment_commit or source_commit
     lines = [
         "# Edge Deploy release tag handoff",
+        '$ErrorActionPreference = "Stop"',
+        "",
         "# Phase 1: switch firewall/network posture to GitHub access.",
         f"git push origin refs/tags/{tag}",
-        f"git ls-remote --tags origin refs/tags/{tag}",
+        'if ($LASTEXITCODE -ne 0) { throw "GitHub tag push failed" }',
+        f'$githubRows = @(git ls-remote --exit-code --tags origin "refs/tags/{tag}^{{}}")',
+        'if ($LASTEXITCODE -ne 0) { throw "GitHub tag verification query failed" }',
+        'if ($githubRows.Count -eq 0) { throw "GitHub tag verification returned no rows" }',
+        r"$githubCommit = ($githubRows[0] -split '\s+')[0]",
+        f'if ($githubCommit -ne "{source_commit}") {{',
+        f'    throw "GitHub tag resolved to $githubCommit; expected {source_commit}"',
+        "}",
         "",
         "# Phase 2: switch firewall/network posture to Bitbucket/Edge access.",
+        (
+            'if ([string]::IsNullOrWhiteSpace($env:BB_TOKEN)) '
+            '{ throw "BB_TOKEN is required for Bitbucket tag finalization" }'
+        ),
     ]
     if deployed == source_commit:
         lines.extend(
             [
-                f"git push bitbucket refs/tags/{tag}",
-                f"git ls-remote --tags bitbucket refs/tags/{tag}",
+                (
+                    'git -c "http.extraHeader=Authorization: Bearer $env:BB_TOKEN" '
+                    f"push bitbucket refs/tags/{tag}"
+                ),
+                'if ($LASTEXITCODE -ne 0) { throw "Bitbucket tag push failed" }',
             ]
         )
     else:
@@ -528,9 +568,34 @@ def _tag_push_handoff_lines(tag: str, source_commit: str, deployment_commit: str
         lines.extend(
             [
                 f'git tag -a -f {temp_tag} {deployed} -m "{message}"',
-                f"git push bitbucket refs/tags/{temp_tag}:refs/tags/{tag}",
-                f"git tag -d {temp_tag}",
-                f"git ls-remote --tags bitbucket refs/tags/{tag}",
+                'if ($LASTEXITCODE -ne 0) { throw "Temporary Bitbucket tag creation failed" }',
+                (
+                    'git -c "http.extraHeader=Authorization: Bearer $env:BB_TOKEN" '
+                    f"push bitbucket refs/tags/{temp_tag}:refs/tags/{tag}"
+                ),
+                'if ($LASTEXITCODE -ne 0) { throw "Bitbucket tag push failed" }',
+            ]
+        )
+    lines.extend(
+        [
+            (
+                '$bitbucketRows = @(git -c '
+                '"http.extraHeader=Authorization: Bearer $env:BB_TOKEN" '
+                f'ls-remote --exit-code --tags bitbucket "refs/tags/{tag}^{{}}")'
+            ),
+            'if ($LASTEXITCODE -ne 0) { throw "Bitbucket tag verification query failed" }',
+            'if ($bitbucketRows.Count -eq 0) { throw "Bitbucket tag verification returned no rows" }',
+            r"$bitbucketCommit = ($bitbucketRows[0] -split '\s+')[0]",
+            f'if ($bitbucketCommit -ne "{deployed}") {{',
+            f'    throw "Bitbucket tag resolved to $bitbucketCommit; expected {deployed}"',
+            "}",
+        ]
+    )
+    if deployed != source_commit:
+        lines.extend(
+            [
+                f"git tag -d edge-deploy-mirror/{tag}",
+                'if ($LASTEXITCODE -ne 0) { throw "Temporary Bitbucket tag cleanup failed" }',
             ]
         )
     return lines
@@ -549,34 +614,6 @@ def _write_tag_push_handoff(
         encoding="utf-8",
     )
     return path
-
-
-def _push_release_tag_to_bitbucket(
-    repo_root: Path,
-    tag: str,
-    commit: str,
-    deployment_commit: str | None = None,
-) -> None:
-    """Push a previously created release tag to Bitbucket.
-
-    Used by tests and future explicit finalization commands; release rollout does not
-    call this because Bitbucket and GitHub tag pushes require different firewall modes.
-    """
-    deployed = deployment_commit or commit
-    if deployed == commit:
-        subprocess.run(["git", "push", "bitbucket", f"refs/tags/{tag}"], cwd=repo_root, check=True)
-        return
-    temp_tag = f"edge-deploy-mirror/{tag}"
-    subprocess.run(
-        ["git", "tag", "-a", "-f", temp_tag, deployed,
-         "-m", f"Successful release {tag} (source {commit}) [edge-deploy]"],
-        cwd=repo_root,
-        check=True,
-    )
-    try:
-        subprocess.run(["git", "push", "bitbucket", f"refs/tags/{temp_tag}:refs/tags/{tag}"], cwd=repo_root, check=True)
-    finally:
-        subprocess.run(["git", "tag", "-d", temp_tag], cwd=repo_root, check=True)
 
 
 def _cmd_publish(args: argparse.Namespace, operator: OperatorConfig) -> int:
