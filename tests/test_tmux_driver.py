@@ -299,6 +299,50 @@ def test_upload_file_tilde_path_expands_home_in_every_remote_command(tmp_path: P
     assert _decode_script_payload(decode_cmd).count(".expanduser()") == 2
 
 
+def test_upload_file_verify_finds_digest_above_rc_sentinel(tmp_path: Path) -> None:
+    """Regression: real ``run_remote`` screens end with the ``__RC__`` sentinel
+    line, so the sha256 from the verify (and precheck) step sits above the last
+    line. Matching only the last line reported a bogus digest mismatch."""
+    source = tmp_path / "runner.sh"
+    source.write_bytes(b"#!/bin/sh\n")
+    local_digest = hashlib.sha256(b"#!/bin/sh\n").hexdigest()
+    driver = TmuxDriver("user@edge", "sess", "/repo")
+
+    def fake_run_remote(command: str, **kwargs: object) -> tuple[str, int]:
+        if "test -f" in command and "sha256sum" in command:
+            return "__START_ab12cd34ef56__\nMISSING\n\n__RC_ab12cd34ef56_0__", 0
+        if _is_decode_command(command):
+            return "", 0
+        if command.startswith("sha256sum "):
+            return f"__START_ab12cd34ef56__\n{local_digest}\n\n__RC_ab12cd34ef56_0__", 0
+        return "", 0
+
+    with patch.object(driver, "run_remote", side_effect=fake_run_remote):
+        digest = driver.upload_file(source, "/remote/runner.sh")
+
+    assert digest == local_digest
+
+
+def test_upload_file_precheck_reuse_with_realistic_sentinel_screen(tmp_path: Path) -> None:
+    source = tmp_path / "runner.sh"
+    source.write_bytes(b"#!/bin/sh\n")
+    local_digest = hashlib.sha256(b"#!/bin/sh\n").hexdigest()
+    driver = TmuxDriver("user@edge", "sess", "/repo")
+    commands: list[str] = []
+
+    def fake_run_remote(command: str, **kwargs: object) -> tuple[str, int]:
+        commands.append(command)
+        if "test -f" in command and "sha256sum" in command:
+            return f"__START_ab12cd34ef56__\n{local_digest}\n\n__RC_ab12cd34ef56_0__", 0
+        raise AssertionError(f"unexpected remote command during reuse: {command!r}")
+
+    with patch.object(driver, "run_remote", side_effect=fake_run_remote):
+        digest = driver.upload_file(source, "/remote/runner.sh")
+
+    assert digest == local_digest
+    assert len(commands) == 1
+
+
 def test_upload_file_decode_ships_base64_piped_script(tmp_path: Path) -> None:
     """Regression x2: bare ``python3`` is not on PATH on the Edge Nodes, and psmux
     strips quote characters from whitespace-free pane lines (it only re-quotes

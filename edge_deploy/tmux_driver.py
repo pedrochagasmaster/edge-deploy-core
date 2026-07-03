@@ -348,7 +348,7 @@ class TmuxDriver:
             f"sha256sum {shell_path} | cut -d' ' -f1 || echo MISSING"
         )
         screen, _rc = self.run_remote(precheck_cmd, timeout=60.0)
-        if self._last_nonempty_line(screen) == local_digest:
+        if self._extract_hex_digest(screen) == local_digest:
             return local_digest
 
         encoded = base64.b64encode(source_path.read_bytes()).decode("ascii")
@@ -650,11 +650,20 @@ class TmuxDriver:
         return lines[-1] if lines else ""
 
     def _extract_hex_digest(self, screen: str) -> str | None:
-        last_line = self._last_nonempty_line(screen)
-        if not last_line:
-            return None
-        match = re.search(r"\b[0-9a-f]{64}\b", last_line)
-        return match.group(0) if match else None
+        """Find the most recent sha256 on the screen, scanning lines bottom-up.
+
+        ``run_remote`` screens end with the ``__RC_<nonce>_<code>__`` sentinel
+        line, so the digest printed by ``sha256sum | cut`` sits *above* the last
+        line. Only whole-line matches count: echoed command lines can embed
+        64-hex strings inside file names (e.g. bundle digests) and must never be
+        mistaken for command output.
+        """
+        text = re.sub(_ANSI_RE, "", screen)
+        for line in reversed(text.splitlines()):
+            match = re.fullmatch(r"[0-9a-f]{64}", line.strip())
+            if match:
+                return match.group(0)
+        return None
 
     def type_command_confirmed(
         self,
