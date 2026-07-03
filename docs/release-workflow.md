@@ -106,6 +106,37 @@ state, prints the posture message above, and exits 0. Re-run `release --run
 <run_id>` (or the individual phase command from `status`) after switching the
 firewall.
 
+#### Guided release (single command)
+
+To walk through all posture switches in one invocation, use `--guided`:
+
+```powershell
+python -m edge_deploy release --guided --tool autobench
+```
+
+At each posture boundary the engine prints the required posture keys and any
+unreachable endpoints, then prompts:
+
+```text
+Switch firewall posture to [bitbucket+edge], then press Enter to continue...
+```
+
+Switch the firewall, press Enter, and the engine re-probes and continues. If
+endpoints are still unreachable, it re-prompts with the updated unreachable
+list. Press Ctrl+C (or EOF) to pause: the run stays `open` and the engine prints
+the resume command, for example:
+
+```text
+Paused at posture boundary. Resume with: python -m edge_deploy release --guided --run <run_id>
+```
+
+Resume works across postures: when `verify` is already `passed` or `skipped`,
+`release --run <id>` does not fetch from GitHub, so you can continue from
+Bitbucket-only posture without repeating verify.
+
+On completion, guided mode prints `release complete: <run_id>` followed by the
+same status summary as `python -m edge_deploy status --run <run_id>`.
+
 During deploy, enter the RSA passcode in the controller tmux pane when prompted.
 The progress heartbeat shows `>>> WAITING FOR OPERATOR - …` while waiting.
 
@@ -165,6 +196,8 @@ re-running verify or publish when their ledger state is already `passed`.
 - Do not start a second release for a different SHA while an open run for the
   same tool remains unresolved.
 
-See [docs/DESIGN.md](DESIGN.md) for module boundaries and
+See [docs/DESIGN.md](DESIGN.md) for module boundaries,
 [docs/adr/0008-run-ledger-and-posture-phases.md](adr/0008-run-ledger-and-posture-phases.md)
-for architecture decisions.
+for architecture decisions, and
+[docs/adr/0010-guided-posture-loop.md](adr/0010-guided-posture-loop.md) for
+guided mode and cross-posture resume.

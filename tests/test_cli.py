@@ -85,7 +85,7 @@ def _unreachable_bitbucket_connect(address: tuple[str, int], timeout: float) -> 
     return SimpleNamespace(close=lambda: None)
 
 
-def _patch_all_phases_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+def _patch_all_phases_pass(monkeypatch: pytest.MonkeyPatch, *, patch_probe: bool = True) -> None:
     def fake_ensure_verified(operator, profile, repo_root, ledger, **kwargs):
         ledger.set_phase(
             "verify",
@@ -135,7 +135,8 @@ def _patch_all_phases_pass(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli, "run_deploy", fake_deploy)
     monkeypatch.setattr(cli, "_cmd_tag_github", fake_tag_github)
     monkeypatch.setattr(cli, "_cmd_tag_bitbucket", fake_tag_bitbucket)
-    monkeypatch.setattr(cli, "probe", lambda *a, **k: [])
+    if patch_probe:
+        monkeypatch.setattr(cli, "probe", lambda *a, **k: [])
     monkeypatch.setattr(cli, "enter_phase", lambda *a, **k: __import__("contextlib").ExitStack())
 
 
@@ -608,6 +609,193 @@ def test_release_resumes_without_rerunning_verify(tmp_path, monkeypatch) -> None
     assert pytest_runs == []
     reloaded = RunLedger.load(ledger.run_dir)
     assert reloaded.state["status"] == "complete"
+
+
+def test_release_resume_with_verify_passed_skips_inspect_repository(tmp_path, monkeypatch) -> None:
+    config_path = _write_operator_config_both(tmp_path)
+    autobench_path = _autobench_repo_root(tmp_path)
+    ledger = _create_open_run(autobench_path)
+    ledger.set_phase(
+        "verify",
+        "passed",
+        evidence={
+            "commit": SOURCE_SHA,
+            "ci": "success",
+            "tests": "passed",
+            "verified_at": "2026-07-03T12:00:00+00:00",
+        },
+    )
+    run_id = ledger.state["run_id"]
+    inspect_calls: list = []
+
+    def tracking_inspect(*args, **kwargs):
+        inspect_calls.append(1)
+        return SimpleNamespace(commit=SOURCE_SHA)
+
+    monkeypatch.setattr(cli, "inspect_repository", tracking_inspect)
+    _patch_all_phases_pass(monkeypatch)
+
+    rc = cli.main(
+        ["--config", str(config_path), "release", "--tool", "autobench", "--run", run_id]
+    )
+
+    assert rc == 0
+    assert inspect_calls == []
+    reloaded = RunLedger.load(ledger.run_dir)
+    assert reloaded.state["status"] == "complete"
+
+
+def test_release_guided_crosses_posture_boundary_after_enter(tmp_path, monkeypatch, capsys) -> None:
+    config_path = _write_operator_config_both(tmp_path)
+    autobench_path = _autobench_repo_root(tmp_path)
+    ledger = _create_open_run(autobench_path)
+    ledger.set_phase(
+        "verify",
+        "passed",
+        evidence={
+            "commit": SOURCE_SHA,
+            "ci": "success",
+            "tests": "passed",
+            "verified_at": "2026-07-03T12:00:00+00:00",
+        },
+    )
+    run_id = ledger.state["run_id"]
+    _patch_all_phases_pass(monkeypatch, patch_probe=False)
+    bitbucket_reachable = False
+
+    def toggling_connect(address: tuple[str, int], timeout: float) -> object:
+        host, port = address
+        if host == "scm.mastercard.int" and port == 443 and not bitbucket_reachable:
+            raise TimeoutError("timed out")
+        return SimpleNamespace(close=lambda: None)
+
+    def fake_input(_prompt: str = "") -> str:
+        nonlocal bitbucket_reachable
+        bitbucket_reachable = True
+        return ""
+
+    monkeypatch.setattr(cli.socket, "create_connection", toggling_connect)
+    monkeypatch.setattr("builtins.input", fake_input)
+
+    rc = cli.main(
+        [
+            "--config",
+            str(config_path),
+            "release",
+            "--tool",
+            "autobench",
+            "--run",
+            run_id,
+            "--guided",
+        ]
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Phase 'publish' requires posture [bitbucket]." in out
+    assert "Unreachable: scm.mastercard.int:443." in out
+    assert f"release complete: {run_id}" in out
+    assert "next: none (complete)" in out
+    reloaded = RunLedger.load(ledger.run_dir)
+    assert reloaded.state["status"] == "complete"
+
+
+def test_release_guided_reprompts_while_probe_still_fails(tmp_path, monkeypatch, capsys) -> None:
+    config_path = _write_operator_config_both(tmp_path)
+    autobench_path = _autobench_repo_root(tmp_path)
+    ledger = _create_open_run(autobench_path)
+    ledger.set_phase(
+        "verify",
+        "passed",
+        evidence={
+            "commit": SOURCE_SHA,
+            "ci": "success",
+            "tests": "passed",
+            "verified_at": "2026-07-03T12:00:00+00:00",
+        },
+    )
+    run_id = ledger.state["run_id"]
+    _patch_all_phases_pass(monkeypatch, patch_probe=False)
+    bitbucket_reachable = False
+    input_calls = 0
+
+    def toggling_connect(address: tuple[str, int], timeout: float) -> object:
+        host, port = address
+        if host == "scm.mastercard.int" and port == 443 and not bitbucket_reachable:
+            raise TimeoutError("timed out")
+        return SimpleNamespace(close=lambda: None)
+
+    def fake_input(_prompt: str = "") -> str:
+        nonlocal bitbucket_reachable, input_calls
+        input_calls += 1
+        if input_calls >= 2:
+            bitbucket_reachable = True
+        return ""
+
+    monkeypatch.setattr(cli.socket, "create_connection", toggling_connect)
+    monkeypatch.setattr("builtins.input", fake_input)
+
+    rc = cli.main(
+        [
+            "--config",
+            str(config_path),
+            "release",
+            "--tool",
+            "autobench",
+            "--run",
+            run_id,
+            "--guided",
+        ]
+    )
+
+    assert rc == 0
+    assert input_calls == 2
+    out = capsys.readouterr().out
+    assert out.count("Phase 'publish' requires posture [bitbucket].") >= 2
+    assert out.count("Unreachable: scm.mastercard.int:443.") >= 2
+
+
+def test_release_guided_interrupted_leaves_run_open(tmp_path, monkeypatch, capsys) -> None:
+    config_path = _write_operator_config_both(tmp_path)
+    autobench_path = _autobench_repo_root(tmp_path)
+    ledger = _create_open_run(autobench_path)
+    ledger.set_phase(
+        "verify",
+        "passed",
+        evidence={
+            "commit": SOURCE_SHA,
+            "ci": "success",
+            "tests": "passed",
+            "verified_at": "2026-07-03T12:00:00+00:00",
+        },
+    )
+    run_id = ledger.state["run_id"]
+    monkeypatch.setattr(cli.socket, "create_connection", _unreachable_bitbucket_connect)
+
+    def fake_input(_prompt: str = "") -> str:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", fake_input)
+
+    rc = cli.main(
+        [
+            "--config",
+            str(config_path),
+            "release",
+            "--tool",
+            "autobench",
+            "--run",
+            run_id,
+            "--guided",
+        ]
+    )
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert f"Paused at posture boundary. Resume with: python -m edge_deploy release --guided --run {run_id}" in out
+    reloaded = RunLedger.load(ledger.run_dir)
+    assert reloaded.state["status"] == "open"
+    assert reloaded.phase_state("publish") == "pending"
 
 
 def test_release_command_forwards_no_local_check(tmp_path, monkeypatch) -> None:
