@@ -64,3 +64,8 @@ def enter_phase(
         stack.close()
         raise
     return stack
+
+
+from edge_deploy.phases.verify import VERIFY_SPEC, register_verify  # noqa: E402
+
+PHASE_REGISTRY.append((VERIFY_SPEC, register_verify))
