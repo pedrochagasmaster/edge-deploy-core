@@ -35,6 +35,7 @@ def test_progress_event_ordering_and_release_progress_json_lifecycle(tmp_path) -
     assert payload["schema"] == PROGRESS_SCHEMA
     assert payload["active"]["label"] == "publish autobench"
     assert payload["active"]["phase"] == "publish"
+    assert payload["active"]["waiting_on"] is None
 
     tracker.complete("publish autobench", phase="publish")
     payload = json.loads(progress_path.read_text(encoding="utf-8"))
@@ -137,3 +138,69 @@ def test_release_log_created_with_phase_transitions_and_redacts_secrets(tmp_path
     assert "Authorization: Bearer ***REDACTED***" in log_text
     assert "passcode=***REDACTED***" in log_text
     assert "final reports:" in log_text
+
+
+def test_progress_json_contains_waiting_on(tmp_path) -> None:
+    clock = FakeClock()
+    tracker = ReleaseProgressTracker(tmp_path, clock=clock, notify_fn=lambda _message: None)
+    progress_path = tmp_path / "release-progress.json"
+
+    tracker.start("auth node03", phase="auth", node="node03")
+    payload = json.loads(progress_path.read_text(encoding="utf-8"))
+    assert payload["active"]["waiting_on"] is None
+
+    tracker.set_waiting("operator")
+    payload = json.loads(progress_path.read_text(encoding="utf-8"))
+    assert payload["active"]["waiting_on"] == "operator"
+
+
+def test_heartbeat_switches_format_when_waiting_on_operator(tmp_path) -> None:
+    clock = FakeClock()
+    messages: list[str] = []
+    tracker = ReleaseProgressTracker(
+        tmp_path,
+        heartbeat_interval_s=1.0,
+        stall_threshold_s=100.0,
+        clock=clock,
+        notify_fn=messages.append,
+    )
+
+    tracker.start("auth node03", phase="auth", node="node03")
+    clock.advance(5)
+    tracker._maybe_heartbeat()
+    assert any("still running: auth node03 (5s elapsed)" in message for message in messages)
+
+    tracker.set_waiting("operator")
+    messages.clear()
+    clock.advance(10)
+    tracker._maybe_heartbeat()
+    assert any(">>> WAITING FOR OPERATOR - auth node03 (15s) <<<" in message for message in messages)
+    assert not any("still running:" in message for message in messages)
+
+
+def test_set_waiting_none_reverts_heartbeat_format(tmp_path) -> None:
+    clock = FakeClock()
+    messages: list[str] = []
+    tracker = ReleaseProgressTracker(
+        tmp_path,
+        heartbeat_interval_s=1.0,
+        stall_threshold_s=100.0,
+        clock=clock,
+        notify_fn=messages.append,
+    )
+
+    tracker.start("auth node03", phase="auth", node="node03")
+    tracker.set_waiting("operator")
+    clock.advance(5)
+    tracker._maybe_heartbeat()
+    assert any(">>> WAITING FOR OPERATOR - auth node03 (5s) <<<" in message for message in messages)
+
+    tracker.set_waiting(None)
+    payload = json.loads((tmp_path / "release-progress.json").read_text(encoding="utf-8"))
+    assert payload["active"]["waiting_on"] is None
+
+    messages.clear()
+    clock.advance(3)
+    tracker._maybe_heartbeat()
+    assert any("still running: auth node03 (8s elapsed)" in message for message in messages)
+    assert not any("WAITING FOR OPERATOR" in message for message in messages)

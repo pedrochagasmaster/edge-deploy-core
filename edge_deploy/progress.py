@@ -25,6 +25,7 @@ class ActiveOperation:
     tmux_session: str | None = None
     tool: str | None = None
     node: str | None = None
+    waiting_on: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -73,7 +74,15 @@ class ReleaseProgressTracker:
             self._active.last_meaningful_output_at = utc_iso_timestamp()
             self._stall_warned = False
 
-    def start(self, label: str, *, phase: str = "release", tmux_session: str | None = None, **meta: Any) -> None:
+    def start(
+        self,
+        label: str,
+        *,
+        phase: str = "release",
+        tmux_session: str | None = None,
+        waiting_on: str | None = None,
+        **meta: Any,
+    ) -> None:
         now = self._clock()
         self._active = ActiveOperation(
             phase=phase,
@@ -84,10 +93,17 @@ class ReleaseProgressTracker:
             tmux_session=tmux_session,
             tool=meta.get("tool"),
             node=meta.get("node"),
+            waiting_on=waiting_on,
             extra=dict(meta),
         )
         self._stall_warned = False
         self.emit(f"starting: {label}", phase=phase)
+        self._write_progress_json()
+
+    def set_waiting(self, waiting_on: str | None) -> None:
+        if self._active is None:
+            return
+        self._active.waiting_on = waiting_on
         self._write_progress_json()
 
     def complete(self, message: str, *, phase: str | None = None) -> None:
@@ -149,7 +165,10 @@ class ReleaseProgressTracker:
         elapsed = int(self._elapsed_s())
         inactive = int(self._inactive_s())
         label = self._active.label
-        message = f"still running: {label} ({elapsed}s elapsed)"
+        if self._active.waiting_on == "operator":
+            message = f">>> WAITING FOR OPERATOR - {label} ({elapsed}s) <<<"
+        else:
+            message = f"still running: {label} ({elapsed}s elapsed)"
         self._events.append(redact(message))
         self._notify(redact(message))
         self._write_progress_json()
@@ -185,6 +204,7 @@ class ReleaseProgressTracker:
                 "node": self._active.node,
                 "tmux_session": self._active.tmux_session,
                 "last_meaningful_output_at": self._active.last_meaningful_output_at,
+                "waiting_on": self._active.waiting_on,
             }
             payload["inactive_s"] = round(self._inactive_s(), 1)
             if self._inactive_s() >= self.stall_threshold_s:
