@@ -561,7 +561,6 @@ def _run_release_preflight(
         reverify=False,
         repo_state=repo_state,
     )
-
     for node_name in node_names:
         node = operator.node(node_name)
         driver = TmuxDriver.from_node_and_profile(node, profile, retries=2)

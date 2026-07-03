@@ -37,7 +37,7 @@ def enter_phase(
     *,
     next_command: str,
     force_lock: bool = False,
-    connect: SocketConnector = socket.create_connection,
+    connect: SocketConnector | None = None,
 ) -> ExitStack:
     stack = ExitStack()
     ledger.acquire_lock(force=force_lock)
@@ -57,7 +57,7 @@ def enter_phase(
             spec.name,
             operator,
             next_command=next_command,
-            connect=connect,
+            connect=connect or socket.create_connection,
         )
         ledger.record_event("phase_entered", phase=spec.name)
     except Exception:
