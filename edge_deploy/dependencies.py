@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import re
 import subprocess
 import sys
+import tempfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 from edge_deploy.config import DependencyBundleConfig, ToolProfile
+from edge_deploy.runner import bootstrap_runner, read_remote_json, run_step
 
 BUNDLE_SCHEMA = "edge-deploy/dependency-bundle/1"
 _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
@@ -243,11 +244,13 @@ def _stage_script(
     config: DependencyBundleConfig,
     *,
     remote_archive: str,
+    run_id: str,
 ) -> str:
     expected_files = {
         str(item["path"]): str(item["sha256"])
         for item in bundle.manifest["files"]  # type: ignore[index]
     }
+    evidence_path = f"$HOME/.edge-deploy/runs/{run_id}/steps/dependency-stage-evidence.json"
     return f"""
 import hashlib, json, os, shutil, subprocess, sys, tempfile, zipfile
 from pathlib import Path
@@ -260,6 +263,7 @@ expected_digest = {bundle.digest!r}
 expected_archive = {bundle.archive_sha256!r}
 expected_files = {expected_files!r}
 target_python = {config.python_version!r}
+evidence_path = Path(os.path.expanduser({evidence_path!r}))
 
 def sha(path):
     digest = hashlib.sha256()
@@ -269,9 +273,11 @@ def sha(path):
     return digest.hexdigest()
 
 def emit(reused):
-    print("DEPENDENCY_STAGE_START")
-    print(json.dumps({{"remote_dir": str(final), "reused": reused, "bundle_digest": expected_digest}}))
-    print("DEPENDENCY_STAGE_END")
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    evidence_path.write_text(
+        json.dumps({{"remote_dir": str(final), "reused": reused, "bundle_digest": expected_digest}}),
+        encoding="utf-8",
+    )
 
 if final.exists():
     manifest = json.loads((final / "manifest.json").read_text(encoding="utf-8"))
@@ -338,6 +344,8 @@ def deliver_dependency_bundle(
     driver: object,
     profile: ToolProfile,
     bundle: DependencyBundle,
+    *,
+    run_id: str,
 ) -> DeliveredBundle:
     """Transfer and verify one bundle through an authenticated TmuxDriver."""
     config = profile.dependency_bundle
@@ -347,31 +355,48 @@ def deliver_dependency_bundle(
         f"/ads_storage/$USER/.edge-deploy/bundles/{profile.tool}/"
         f".incoming/{bundle.digest}.zip"
     )
+    stage_script_remote = (
+        f"/ads_storage/$USER/.edge-deploy/bundles/{profile.tool}/"
+        f".incoming/stage-{bundle.digest}.py"
+    )
+    runner_path = bootstrap_runner(driver, run_id)  # type: ignore[arg-type]
     screen, code = driver.run_remote(  # type: ignore[attr-defined]
         f"mkdir -p /ads_storage/$USER/.edge-deploy/bundles/{profile.tool}/.incoming",
         timeout=30,
     )
     if code:
         raise BundleError(f"could not create remote bundle staging directory: {screen.strip()}")
-    driver.upload_file(bundle.archive_path, remote_archive)  # type: ignore[attr-defined]
-    script = _stage_script(bundle, config, remote_archive=remote_archive)
-    encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    _archive_digest = driver.upload_file(bundle.archive_path, remote_archive)  # type: ignore[attr-defined]
+    script = _stage_script(bundle, config, remote_archive=remote_archive, run_id=run_id)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as handle:
+        handle.write(script)
+        script_tmp = handle.name
+    try:
+        driver.upload_file(script_tmp, stage_script_remote)  # type: ignore[attr-defined]
+    finally:
+        Path(script_tmp).unlink(missing_ok=True)
     fallback = (
         "/sys_apps_01/python/python310/bin/python3.10"
         if config.python_version == "3.10"
         else f"python{config.python_version}"
     )
     python_expr = f"$(command -v python{config.python_version} || printf %s {fallback})"
-    screen, code = driver.run_remote(  # type: ignore[attr-defined]
-        f"printf %s {encoded} | base64 -d | {python_expr} -",
+    stage_command = f"{python_expr} {stage_script_remote}"
+    step_result = run_step(
+        driver,  # type: ignore[arg-type]
+        runner_path,
+        run_id,
+        "dependency-stage",
+        stage_command,
         timeout=900,
     )
-    if code:
-        raise BundleError(f"remote dependency verification failed: {screen.strip()}")
-    match = re.search(r"DEPENDENCY_STAGE_START\s*(\{.*?\})\s*DEPENDENCY_STAGE_END", screen, re.DOTALL)
-    if not match:
+    if step_result.get("exit_code") != 0:
+        tail = step_result.get("stdout_tail", "")
+        raise BundleError(f"remote dependency verification failed: {tail}")
+    evidence_path = f"~/.edge-deploy/runs/{run_id}/steps/dependency-stage-evidence.json"
+    evidence = read_remote_json(driver, evidence_path)  # type: ignore[arg-type]
+    if "remote_dir" not in evidence or "reused" not in evidence:
         raise BundleError("remote dependency verification returned no provenance")
-    evidence = json.loads(match.group(1))
     return DeliveredBundle(
         remote_dir=str(evidence["remote_dir"]),
         reused=bool(evidence["reused"]),

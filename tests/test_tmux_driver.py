@@ -7,8 +7,12 @@ the shared ``__RC_<nonce>_<code>__`` exit-code protocol still parses.
 
 from __future__ import annotations
 
+import hashlib
+import subprocess
 from pathlib import Path
 from unittest.mock import call, patch
+
+import pytest
 
 from edge_deploy.config import NodeConfig
 from edge_deploy.tmux_driver import TmuxDriver
@@ -19,6 +23,87 @@ AUTOBENCH_CHROME = "Privacy-Compliant Peer Benchmark|Control 3.2 dimensional ana
 
 def _driver(tui_exit: str, chrome: str) -> TmuxDriver:
     return TmuxDriver("user@edge", "sess", "/repo", tui_chrome_regex=chrome, tui_exit=tui_exit)
+
+
+def test_enable_pane_log_invokes_pipe_pane(tmp_path: Path) -> None:
+    log_path = tmp_path / "pane.log"
+    driver = TmuxDriver("user@edge", "sess", "/repo")
+
+    with patch.object(driver, "_tmux") as tmux:
+        tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
+        result = driver.enable_pane_log(log_path)
+
+    assert result is True
+    assert driver.pane_log_supported is True
+    tmux.assert_called_once_with(
+        ["pipe-pane", "-t", "sess", "-o", f"cat >> {log_path}"],
+        check=False,
+    )
+
+
+def test_enable_pane_log_unsupported_sets_flag_without_raise(tmp_path: Path) -> None:
+    log_path = tmp_path / "pane.log"
+    driver = TmuxDriver("user@edge", "sess", "/repo")
+
+    with patch.object(driver, "_tmux") as tmux:
+        tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr=""
+        )
+        result = driver.enable_pane_log(log_path)
+
+    assert result is False
+    assert driver.pane_log_supported is False
+
+
+def test_start_session_enables_pane_log_when_configured(tmp_path: Path) -> None:
+    log_path = tmp_path / "pane.log"
+    driver = TmuxDriver("user@edge", "sess", "/repo", pane_log_path=log_path)
+
+    with (
+        patch.object(driver, "_tmux") as tmux,
+        patch.object(driver, "send_keys"),
+        patch.object(driver, "wait_for", return_value="user@host:/repo$ "),
+        patch("edge_deploy.tmux_driver.time.sleep"),
+    ):
+        tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
+        driver.start_session()
+
+    pipe_pane_calls = [
+        call_args
+        for call_args in tmux.call_args_list
+        if call_args[0][0] and call_args[0][0][0] == "pipe-pane"
+    ]
+    assert len(pipe_pane_calls) == 1
+    assert pipe_pane_calls[0] == call(
+        ["pipe-pane", "-t", "sess", "-o", f"cat >> {log_path}"],
+        check=False,
+    )
+
+
+def test_start_session_unsupported_pane_log_does_not_raise(tmp_path: Path) -> None:
+    log_path = tmp_path / "pane.log"
+    driver = TmuxDriver("user@edge", "sess", "/repo", pane_log_path=log_path)
+
+    def fake_tmux(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if argv and argv[0] == "pipe-pane":
+            return subprocess.CompletedProcess(
+                args=[], returncode=1, stdout="", stderr=""
+            )
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    with (
+        patch.object(driver, "_tmux", side_effect=fake_tmux),
+        patch.object(driver, "send_keys"),
+        patch.object(driver, "wait_for", return_value="user@host:/repo$ "),
+        patch("edge_deploy.tmux_driver.time.sleep"),
+    ):
+        driver.start_session()
+
+    assert driver.pane_log_supported is False
 
 
 def test_from_node_and_profile_injects_profile_strategy(real_profile) -> None:
@@ -34,55 +119,125 @@ def test_from_node_and_profile_injects_profile_strategy(real_profile) -> None:
     assert driver.tui_chrome_regex == real_profile.tui_chrome_regex
 
 
-def test_authenticated_session_exposes_control_socket_for_scp(tmp_path: Path) -> None:
+def test_pane_command_omits_control_master_and_uploads_via_authenticated_pane(tmp_path: Path) -> None:
     source = tmp_path / "bundle.zip"
     source.write_bytes(b"bundle")
-    with patch.dict("edge_deploy.tmux_driver.os.environ", {"EDGE_DEPLOY_SSH_MULTIPLEX": "1"}):
-        driver = TmuxDriver("user@edge", "sess", "/repo", ssh_options="-p 2222")
+    local_digest = hashlib.sha256(b"bundle").hexdigest()
+    driver = TmuxDriver("user@edge", "sess", "/repo", ssh_options="-p 2222")
 
     pane_command = driver._build_pane_command()
-    assert "ControlMaster=yes" in pane_command
-    assert "ControlPath=" in pane_command
-
-    with patch("edge_deploy.tmux_driver.subprocess.run") as run:
-        run.return_value.returncode = 0
-        run.return_value.stdout = ""
-        run.return_value.stderr = ""
-        driver.upload_file(source, "/remote/bundle.zip")
-
-    argv = run.call_args.args[0]
-    assert argv[0] == "scp"
-    assert any(str(item).startswith("ControlPath=") for item in argv)
-    assert str(source) in argv
-    assert "user@edge:/remote/bundle.zip" in argv
-
-
-def test_disabled_multiplex_session_omits_control_master_and_uploads_via_authenticated_pane(tmp_path: Path) -> None:
-    source = tmp_path / "bundle.zip"
-    source.write_bytes(b"bundle")
-    with patch.dict("edge_deploy.tmux_driver.os.environ", {"EDGE_DEPLOY_SSH_MULTIPLEX": "0"}):
-        driver = TmuxDriver("user@edge", "sess", "/repo", ssh_options="-p 2222")
-
-    pane_command = driver._build_pane_command()
-    assert "ControlMaster=yes" not in pane_command
-    assert "ControlPath=" not in pane_command
+    for token in ("Control" + "Master", "Control" + "Path"):
+        assert token not in pane_command
 
     commands: list[str] = []
 
     def fake_run_remote(command: str, **kwargs: object) -> tuple[str, int]:
         commands.append(command)
+        if "test -f" in command and "sha256sum" in command:
+            return "MISSING\n", 0
+        if command.startswith("sha256sum ") and "cut -d' ' -f1" in command:
+            return f"{local_digest}\n", 0
         return "", 0
 
     with (
         patch.object(driver, "run_remote", side_effect=fake_run_remote),
         patch("edge_deploy.tmux_driver.subprocess.run") as run,
     ):
-        driver.upload_file(source, "/remote/bundle.zip")
+        digest = driver.upload_file(source, "/remote/bundle.zip")
 
+    assert digest == local_digest
     run.assert_not_called()
-    assert commands[0].startswith("mkdir -p /remote")
+    assert commands[0].startswith("test -f /remote/bundle.zip")
+    assert commands[1].startswith("mkdir -p /remote")
     assert any("cat >> /remote/bundle.zip.edge-deploy-" in command for command in commands)
     assert any("base64.b64decode" in command for command in commands)
+    assert any(
+        command.startswith("sha256sum /remote/bundle.zip") and "cut -d' ' -f1" in command
+        for command in commands
+    )
+
+
+def test_upload_file_skips_transfer_when_precheck_digest_matches(tmp_path: Path) -> None:
+    source = tmp_path / "bundle.zip"
+    source.write_bytes(b"already-there")
+    local_digest = hashlib.sha256(b"already-there").hexdigest()
+    driver = TmuxDriver("user@edge", "sess", "/repo")
+    commands: list[str] = []
+
+    def fake_run_remote(command: str, **kwargs: object) -> tuple[str, int]:
+        commands.append(command)
+        if "test -f" in command and "sha256sum" in command:
+            return f"{local_digest}\n", 0
+        raise AssertionError(f"unexpected remote command during reuse: {command!r}")
+
+    with patch.object(driver, "run_remote", side_effect=fake_run_remote):
+        digest = driver.upload_file(source, "/remote/bundle.zip")
+
+    assert digest == local_digest
+    assert len(commands) == 1
+    assert commands[0].startswith("test -f /remote/bundle.zip")
+
+
+def test_upload_file_digest_mismatch_deletes_remote_and_raises(tmp_path: Path) -> None:
+    source = tmp_path / "bundle.zip"
+    source.write_bytes(b"fresh-bundle")
+    driver = TmuxDriver("user@edge", "sess", "/repo")
+    commands: list[str] = []
+
+    def fake_run_remote(command: str, **kwargs: object) -> tuple[str, int]:
+        commands.append(command)
+        if "test -f" in command and "sha256sum" in command:
+            return "MISSING\n", 0
+        if command.startswith("mkdir -p"):
+            return "", 0
+        if "cat >>" in command:
+            return "", 0
+        if "base64.b64decode" in command:
+            return "", 0
+        if command.startswith("sha256sum /remote/bundle.zip") and "cut -d' ' -f1" in command:
+            return "deadbeef" * 8 + "\n", 0
+        if command == "rm -f /remote/bundle.zip":
+            return "", 0
+        raise AssertionError(f"unexpected remote command: {command!r}")
+
+    with patch.object(driver, "run_remote", side_effect=fake_run_remote):
+        with pytest.raises(RuntimeError, match="digest mismatch for /remote/bundle.zip"):
+            driver.upload_file(source, "/remote/bundle.zip")
+
+    assert any(command == "rm -f /remote/bundle.zip" for command in commands)
+
+
+def test_upload_file_success_returns_local_digest(tmp_path: Path) -> None:
+    source = tmp_path / "bundle.zip"
+    source.write_bytes(b"verified-upload")
+    local_digest = hashlib.sha256(b"verified-upload").hexdigest()
+    driver = TmuxDriver("user@edge", "sess", "/repo")
+    commands: list[str] = []
+
+    def fake_run_remote(command: str, **kwargs: object) -> tuple[str, int]:
+        commands.append(command)
+        if "test -f" in command and "sha256sum" in command:
+            return "MISSING\n", 0
+        if command.startswith("mkdir -p"):
+            return "", 0
+        if "cat >>" in command:
+            return "", 0
+        if "base64.b64decode" in command:
+            return "", 0
+        if command.startswith("sha256sum /remote/bundle.zip") and "cut -d' ' -f1" in command:
+            return f"{local_digest}\n", 0
+        raise AssertionError(f"unexpected remote command: {command!r}")
+
+    with patch.object(driver, "run_remote", side_effect=fake_run_remote):
+        digest = driver.upload_file(source, "/remote/bundle.zip")
+
+    assert digest == local_digest
+    assert commands[0].startswith("test -f /remote/bundle.zip")
+    assert any("base64.b64decode" in command for command in commands)
+    assert any(
+        command.startswith("sha256sum /remote/bundle.zip") and "cut -d' ' -f1" in command
+        for command in commands
+    )
 
 
 def test_dispatch_dynamic_quits_from_dashboard_top() -> None:

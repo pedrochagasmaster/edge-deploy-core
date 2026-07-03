@@ -11,6 +11,7 @@ round-trips.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -50,6 +51,20 @@ def _decode_remote_python(command: str) -> str:
         return ""
 
 
+def encode_step_result(payload: dict) -> str:
+    """Build a D8 pane screen with realistically wrapped base64."""
+    content = json.dumps(payload, sort_keys=True).encode("utf-8")
+    digest = hashlib.sha256(content).hexdigest()
+    b64 = base64.b64encode(content).decode("ascii")
+    wrapped = "\n".join(b64[index : index + 80] for index in range(0, len(b64), 80))
+    return (
+        f"\n__EDGE_RESULT_START__\n"
+        f"{wrapped}\n"
+        f"__EDGE_RESULT_SHA_{digest}__\n"
+        f"__EDGE_RESULT_END__\n"
+    )
+
+
 class FakeTmuxDriver:
     """Record-and-replay double for ``TmuxDriver`` used by the rollout/drift tests.
 
@@ -78,6 +93,8 @@ class FakeTmuxDriver:
       a test can model "no ticket, then acquired".
     * ``command_codes`` — optional ``{substring: exit_code}`` overrides so smoke commands
       can be made to fail by content.
+    * ``runner_step_results`` — optional ``{step_name: payload}`` for runner step JSON
+      and ``dependency-stage-evidence`` evidence reads via the D8 protocol.
 
     Captured secret/key traffic is exposed via ``sent_secrets`` (``submit_secret``) and
     ``sent_keys`` (``send_keys`` / ``send_key`` / ``send_text``); the RSA passcode and the
@@ -98,6 +115,7 @@ class FakeTmuxDriver:
         klist_code: int | list[int] = 0,
         command_codes: dict[str, int] | None = None,
         fetch_script: list[tuple[int, str]] | None = None,
+        runner_step_results: dict[str, dict] | None = None,
     ) -> None:
         self.commands: list[str] = []
         self.call_log: list[dict[str, Any]] = []
@@ -113,6 +131,8 @@ class FakeTmuxDriver:
         self._klist_codes = [klist_code] if isinstance(klist_code, int) else list(klist_code) or [0]
         self._command_codes = dict(command_codes) if command_codes else {}
         self._fetch_script = list(fetch_script) if fetch_script else [(0, "")]
+        self.runner_step_results = dict(runner_step_results) if runner_step_results else {}
+        self.runner_step_commands: list[tuple[str, str, str]] = []
         self.sent_secrets: list[str] = []
         self.sent_keys: list[str] = []
         self.uploads: list[tuple[Path, str]] = []
@@ -137,8 +157,9 @@ class FakeTmuxDriver:
     def stop_session(self) -> None:
         return None
 
-    def upload_file(self, source: Path, remote_path: str) -> None:
+    def upload_file(self, source: Path, remote_path: str) -> str:
         self.uploads.append((Path(source), remote_path))
+        return hashlib.sha256(Path(source).read_bytes()).hexdigest()
 
     def run_remote(self, command: str, *, timeout: float = 30.0, ensure_shell: bool = True) -> tuple[str, int]:
         self.commands.append(command)
@@ -200,25 +221,50 @@ class FakeTmuxDriver:
         for needle, code in self._command_codes.items():
             if needle in command:
                 return self._sentinel(f"{needle} -> exit {code}", code)
+        runner_match = re.search(r"sh (\S*runner-\S+\.sh) (\S+) (\S+)", command)
+        if runner_match:
+            runner_path, run_id, step_name = runner_match.groups()
+            self.runner_step_commands.append((runner_path, run_id, step_name))
+            return self._sentinel("", 0)
+        if "__EDGE_RESULT_START__" in command and "base64 -w0" in command:
+            path_match = re.search(r"base64 -w0 ([^;\s]+)", command)
+            remote_path = path_match.group(1) if path_match else ""
+            payload: dict[str, Any] | None = None
+            if remote_path.endswith("dependency-stage-evidence.json"):
+                payload = self.runner_step_results.get("dependency-stage-evidence")
+                if payload is None:
+                    digest_match = re.search(
+                        r"stage-([0-9a-f]+)\.py",
+                        " ".join(path for _, path in self.uploads),
+                    )
+                    digest = digest_match.group(1) if digest_match else "unknown"
+                    payload = {
+                        "remote_dir": f"/ads_storage/test/.edge-deploy/bundles/tool/{digest}",
+                        "reused": False,
+                        "bundle_digest": digest,
+                    }
+            elif remote_path.endswith("dependency-stage.json"):
+                payload = self.runner_step_results.get("dependency-stage")
+                if payload is None:
+                    payload = {
+                        "schema": "edge-deploy/step/1",
+                        "step": "dependency-stage",
+                        "exit_code": 0,
+                        "started_at": "2026-07-03T12:00:00Z",
+                        "finished_at": "2026-07-03T12:00:01Z",
+                        "stdout_tail": "",
+                    }
+            else:
+                for step_name, step_payload in self.runner_step_results.items():
+                    if remote_path.endswith(f"{step_name}.json"):
+                        payload = step_payload
+                        break
+            if payload is not None:
+                return self._sentinel(encode_step_result(payload), 0)
         if "klist -s" in command:
             return self._sentinel("", self._next_klist())
         if "base64 -d" in command:
             script = _decode_remote_python(command)
-            if "DEPENDENCY_STAGE_START" in script:
-                digest_match = re.search(r"expected_digest = '([0-9a-f]+)'", script)
-                digest = digest_match.group(1) if digest_match else "unknown"
-                body = (
-                    "DEPENDENCY_STAGE_START\n"
-                    + json.dumps(
-                        {
-                            "remote_dir": f"/ads_storage/test/.edge-deploy/bundles/tool/{digest}",
-                            "reused": False,
-                            "bundle_digest": digest,
-                        }
-                    )
-                    + "\nDEPENDENCY_STAGE_END"
-                )
-                return self._sentinel(body, 0)
             if "PERMISSION_PAYLOAD_START" in script:
                 body = (
                     "PERMISSION_PAYLOAD_START\n"
