@@ -8,6 +8,7 @@ the shared ``__RC_<nonce>_<code>__`` exit-code protocol still parses.
 from __future__ import annotations
 
 import hashlib
+import subprocess
 from pathlib import Path
 from unittest.mock import call, patch
 
@@ -22,6 +23,87 @@ AUTOBENCH_CHROME = "Privacy-Compliant Peer Benchmark|Control 3.2 dimensional ana
 
 def _driver(tui_exit: str, chrome: str) -> TmuxDriver:
     return TmuxDriver("user@edge", "sess", "/repo", tui_chrome_regex=chrome, tui_exit=tui_exit)
+
+
+def test_enable_pane_log_invokes_pipe_pane(tmp_path: Path) -> None:
+    log_path = tmp_path / "pane.log"
+    driver = TmuxDriver("user@edge", "sess", "/repo")
+
+    with patch.object(driver, "_tmux") as tmux:
+        tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
+        result = driver.enable_pane_log(log_path)
+
+    assert result is True
+    assert driver.pane_log_supported is True
+    tmux.assert_called_once_with(
+        ["pipe-pane", "-t", "sess", "-o", f"cat >> {log_path}"],
+        check=False,
+    )
+
+
+def test_enable_pane_log_unsupported_sets_flag_without_raise(tmp_path: Path) -> None:
+    log_path = tmp_path / "pane.log"
+    driver = TmuxDriver("user@edge", "sess", "/repo")
+
+    with patch.object(driver, "_tmux") as tmux:
+        tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr=""
+        )
+        result = driver.enable_pane_log(log_path)
+
+    assert result is False
+    assert driver.pane_log_supported is False
+
+
+def test_start_session_enables_pane_log_when_configured(tmp_path: Path) -> None:
+    log_path = tmp_path / "pane.log"
+    driver = TmuxDriver("user@edge", "sess", "/repo", pane_log_path=log_path)
+
+    with (
+        patch.object(driver, "_tmux") as tmux,
+        patch.object(driver, "send_keys"),
+        patch.object(driver, "wait_for", return_value="user@host:/repo$ "),
+        patch("edge_deploy.tmux_driver.time.sleep"),
+    ):
+        tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
+        driver.start_session()
+
+    pipe_pane_calls = [
+        call_args
+        for call_args in tmux.call_args_list
+        if call_args[0][0] and call_args[0][0][0] == "pipe-pane"
+    ]
+    assert len(pipe_pane_calls) == 1
+    assert pipe_pane_calls[0] == call(
+        ["pipe-pane", "-t", "sess", "-o", f"cat >> {log_path}"],
+        check=False,
+    )
+
+
+def test_start_session_unsupported_pane_log_does_not_raise(tmp_path: Path) -> None:
+    log_path = tmp_path / "pane.log"
+    driver = TmuxDriver("user@edge", "sess", "/repo", pane_log_path=log_path)
+
+    def fake_tmux(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if argv and argv[0] == "pipe-pane":
+            return subprocess.CompletedProcess(
+                args=[], returncode=1, stdout="", stderr=""
+            )
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    with (
+        patch.object(driver, "_tmux", side_effect=fake_tmux),
+        patch.object(driver, "send_keys"),
+        patch.object(driver, "wait_for", return_value="user@host:/repo$ "),
+        patch("edge_deploy.tmux_driver.time.sleep"),
+    ):
+        driver.start_session()
+
+    assert driver.pane_log_supported is False
 
 
 def test_from_node_and_profile_injects_profile_strategy(real_profile) -> None:
