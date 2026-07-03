@@ -7,6 +7,7 @@ the shared ``__RC_<nonce>_<code>__`` exit-code protocol still parses.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import shlex
 import subprocess
@@ -20,6 +21,19 @@ from edge_deploy.tmux_driver import TmuxDriver
 
 ROBO_CHROME = "Active Jobs|esc Back|n New Job"
 AUTOBENCH_CHROME = "Privacy-Compliant Peer Benchmark|Control 3.2 dimensional analysis"
+
+# The upload decode step ships its Python source base64-encoded through a pipe
+# (never as raw pane lines, which psmux strips quotes from).
+_DECODE_MARKER = "| base64 -d |"
+
+
+def _is_decode_command(command: str) -> bool:
+    return command.startswith("printf %s ") and _DECODE_MARKER in command
+
+
+def _decode_script_payload(command: str) -> str:
+    encoded = command.split()[2]
+    return base64.b64decode(encoded).decode("ascii")
 
 
 def _driver(tui_exit: str, chrome: str) -> TmuxDriver:
@@ -151,7 +165,7 @@ def test_pane_command_omits_control_master_and_uploads_via_authenticated_pane(tm
     assert commands[0].startswith("test -f /remote/bundle.zip")
     assert commands[1].startswith("mkdir -p /remote")
     assert any("cat >> /remote/bundle.zip.edge-deploy-" in command for command in commands)
-    assert any("base64.b64decode" in command for command in commands)
+    assert any(_is_decode_command(command) for command in commands)
     assert any(
         command.startswith("sha256sum /remote/bundle.zip") and "cut -d' ' -f1" in command
         for command in commands
@@ -193,7 +207,7 @@ def test_upload_file_digest_mismatch_deletes_remote_and_raises(tmp_path: Path) -
             return "", 0
         if "cat >>" in command:
             return "", 0
-        if "base64.b64decode" in command:
+        if _is_decode_command(command):
             return "", 0
         if command.startswith("sha256sum /remote/bundle.zip") and "cut -d' ' -f1" in command:
             return "deadbeef" * 8 + "\n", 0
@@ -223,7 +237,7 @@ def test_upload_file_success_returns_local_digest(tmp_path: Path) -> None:
             return "", 0
         if "cat >>" in command:
             return "", 0
-        if "base64.b64decode" in command:
+        if _is_decode_command(command):
             return "", 0
         if command.startswith("sha256sum /remote/bundle.zip") and "cut -d' ' -f1" in command:
             return f"{local_digest}\n", 0
@@ -234,7 +248,7 @@ def test_upload_file_success_returns_local_digest(tmp_path: Path) -> None:
 
     assert digest == local_digest
     assert commands[0].startswith("test -f /remote/bundle.zip")
-    assert any("base64.b64decode" in command for command in commands)
+    assert any(_is_decode_command(command) for command in commands)
     assert any(
         command.startswith("sha256sum /remote/bundle.zip") and "cut -d' ' -f1" in command
         for command in commands
@@ -263,7 +277,7 @@ def test_upload_file_tilde_path_expands_home_in_every_remote_command(tmp_path: P
             return "", 0
         if "cat >>" in command:
             return "", 0
-        if "base64.b64decode" in command:
+        if _is_decode_command(command):
             return "", 0
         if command.startswith("sha256sum $HOME/") and "cut -d' ' -f1" in command:
             return f"{local_digest}\n", 0
@@ -274,21 +288,24 @@ def test_upload_file_tilde_path_expands_home_in_every_remote_command(tmp_path: P
 
     assert digest == local_digest
     for command in commands:
-        if "base64.b64decode" in command:
+        if _is_decode_command(command):
             continue  # tilde inside the Python script is resolved via .expanduser()
         assert "'~" not in command, f"quoted tilde would not expand: {command!r}"
     mkdir_cmd = next(c for c in commands if c.startswith("mkdir -p"))
     assert mkdir_cmd.startswith("mkdir -p $HOME/")
     append_cmd = next(c for c in commands if "cat >>" in c)
     assert "cat >> $HOME/" in append_cmd
-    decode_cmd = next(c for c in commands if "base64.b64decode" in c)
-    assert decode_cmd.count(".expanduser()") == 2
+    decode_cmd = next(c for c in commands if _is_decode_command(c))
+    assert _decode_script_payload(decode_cmd).count(".expanduser()") == 2
 
 
-def test_upload_file_decode_resolves_concrete_interpreter(tmp_path: Path) -> None:
-    """Regression: bare ``python3`` is not on PATH on the Edge Nodes; the decode
-    step must resolve an interpreter and stay compatible with old platform
-    Pythons (no ``unlink(missing_ok=...)``, which needs 3.8+)."""
+def test_upload_file_decode_ships_base64_piped_script(tmp_path: Path) -> None:
+    """Regression x2: bare ``python3`` is not on PATH on the Edge Nodes, and psmux
+    strips quote characters from whitespace-free pane lines (it only re-quotes
+    args containing spaces), which silently corrupted ``encoding='ascii'`` into
+    ``encoding=ascii``. The decode step must resolve a concrete interpreter and
+    ship its Python source base64-encoded on a single space-containing line,
+    never as raw pane lines."""
     source = tmp_path / "runner.sh"
     source.write_bytes(b"#!/bin/sh\n")
     local_digest = hashlib.sha256(b"#!/bin/sh\n").hexdigest()
@@ -298,7 +315,7 @@ def test_upload_file_decode_resolves_concrete_interpreter(tmp_path: Path) -> Non
     def fake_run_remote(command: str, **kwargs: object) -> tuple[str, int]:
         if "test -f" in command and "sha256sum" in command:
             return "MISSING\n", 0
-        if "base64.b64decode" in command:
+        if _is_decode_command(command):
             decode_cmds.append(command)
             return "", 0
         if command.startswith("sha256sum "):
@@ -309,9 +326,14 @@ def test_upload_file_decode_resolves_concrete_interpreter(tmp_path: Path) -> Non
         driver.upload_file(source, "/remote/runner.sh")
 
     (decode_cmd,) = decode_cmds
-    assert not decode_cmd.startswith("python3")
-    assert decode_cmd.startswith('"$(command -v python3.11 || command -v python3.10')
-    assert "missing_ok" not in decode_cmd
+    # Single line, so run_remote transmits it as one space-containing send.
+    assert "\n" not in decode_cmd
+    assert '| "$(command -v python3.11 || command -v python3.10' in decode_cmd
+    script = _decode_script_payload(decode_cmd)
+    assert "base64.b64decode" in script
+    assert "encoding='ascii'" in script
+    assert ".expanduser()" in script
+    assert "missing_ok" not in script
 
 
 def test_upload_file_decode_failure_reports_exit_code_and_screen(tmp_path: Path) -> None:
@@ -322,7 +344,7 @@ def test_upload_file_decode_failure_reports_exit_code_and_screen(tmp_path: Path)
     def fake_run_remote(command: str, **kwargs: object) -> tuple[str, int]:
         if "test -f" in command and "sha256sum" in command:
             return "MISSING\n", 0
-        if "base64.b64decode" in command:
+        if _is_decode_command(command):
             return "bash: python3.11: command not found\n", 127
         return "", 0
 

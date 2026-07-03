@@ -382,19 +382,23 @@ class TmuxDriver:
                     f"(exit {rc}); last screen:\n{self._screen_tail(screen)}"
                 )
 
-        # Bare ``python3`` is not on PATH on the Edge Nodes; resolve a concrete
-        # interpreter. ``unlink()`` without ``missing_ok`` keeps the script
-        # compatible with older platform interpreters (< 3.8).
-        decode_script = (
-            f"{REMOTE_PYTHON_EXPR} - <<'PY'\n"
+        # The decode script travels base64-encoded on a single line: psmux's
+        # tokenizer strips quote characters from whitespace-free arguments (the
+        # Windows side only double-quotes args containing spaces), so raw Python
+        # source must never be sent as pane lines. Bare ``python3`` is not on
+        # PATH on the Edge Nodes; resolve a concrete interpreter. ``unlink()``
+        # without ``missing_ok`` keeps the script compatible with older
+        # platform interpreters (< 3.8).
+        decode_source = (
             "import base64, pathlib\n"
             f"source = pathlib.Path({remote_b64!r}).expanduser()\n"
             f"target = pathlib.Path({remote_path!r}).expanduser()\n"
             "target.parent.mkdir(parents=True, exist_ok=True)\n"
             "target.write_bytes(base64.b64decode(source.read_text(encoding='ascii')))\n"
             "source.unlink()\n"
-            "PY"
         )
+        encoded_decode = base64.b64encode(decode_source.encode("ascii")).decode("ascii")
+        decode_script = f"printf %s {encoded_decode} | base64 -d | {REMOTE_PYTHON_EXPR} -"
         screen, rc = self.run_remote(decode_script, timeout=300.0)
         if rc:
             cleanup_cmd = f"rm -f {shell_b64}"
