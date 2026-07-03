@@ -19,7 +19,6 @@ from edge_deploy import cli
 from edge_deploy.ledger import RunLedger
 from edge_deploy.mirror import MirrorError, MirrorResult
 from edge_deploy.publish import PublishError, PublishResult
-from edge_deploy.reporting import ReleaseReport
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -68,6 +67,76 @@ def _ok_addrinfo(host: str, port: int, *, type: int):  # noqa: A002 - mirrors so
 
 def _raise_timeout(address: tuple[str, int], timeout: float) -> object:
     raise TimeoutError("timed out")
+
+
+SOURCE_SHA = "a" * 40
+SNAPSHOT_SHA = "d" * 40
+RELEASE_TAG = f"release-20260703T120000Z-{SOURCE_SHA[:7]}"
+
+
+def _reachable_connect(address: tuple[str, int], timeout: float) -> object:
+    return SimpleNamespace(close=lambda: None)
+
+
+def _unreachable_bitbucket_connect(address: tuple[str, int], timeout: float) -> object:
+    host, port = address
+    if host == "scm.mastercard.int" and port == 443:
+        raise TimeoutError("timed out")
+    return SimpleNamespace(close=lambda: None)
+
+
+def _patch_all_phases_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_ensure_verified(operator, profile, repo_root, ledger, **kwargs):
+        ledger.set_phase(
+            "verify",
+            "passed",
+            evidence={
+                "commit": SOURCE_SHA,
+                "ci": "success",
+                "tests": "passed",
+                "verified_at": "2026-07-03T12:00:00+00:00",
+            },
+        )
+        return SimpleNamespace(commit=SOURCE_SHA)
+
+    def fake_publish(ledger, operator, repo_root, **kwargs):
+        ledger.set_phase(
+            "publish",
+            "passed",
+            evidence={"snapshot_sha": SNAPSHOT_SHA, "source_commit": SOURCE_SHA},
+        )
+        return 0
+
+    def fake_deploy(args, operator):
+        from edge_deploy.phases.deploy import _load_run
+
+        ledger, _repo_root = _load_run(args, operator)
+        for node in ledger.state["nodes"]:
+            ledger.set_phase("deploy", "passed", node=node, evidence={"status": "rolled_out"})
+        return 0
+
+    def fake_tag_github(args, operator):
+        from edge_deploy.phases.deploy import _load_run
+
+        ledger, _repo_root = _load_run(args, operator)
+        ledger.set_phase("tag_github", "passed", evidence={"tag": RELEASE_TAG, "pushed_sha": SOURCE_SHA})
+        return 0
+
+    def fake_tag_bitbucket(args, operator):
+        from edge_deploy.phases.deploy import _load_run
+
+        ledger, _repo_root = _load_run(args, operator)
+        ledger.set_phase("tag_bitbucket", "passed", evidence={"tag": RELEASE_TAG, "pushed_sha": SNAPSHOT_SHA})
+        ledger.complete()
+        return 0
+
+    monkeypatch.setattr(cli, "ensure_verified", fake_ensure_verified)
+    monkeypatch.setattr(cli, "run_publish_phase", fake_publish)
+    monkeypatch.setattr(cli, "run_deploy", fake_deploy)
+    monkeypatch.setattr(cli, "_cmd_tag_github", fake_tag_github)
+    monkeypatch.setattr(cli, "_cmd_tag_bitbucket", fake_tag_bitbucket)
+    monkeypatch.setattr(cli, "probe", lambda *a, **k: [])
+    monkeypatch.setattr(cli, "enter_phase", lambda *a, **k: __import__("contextlib").ExitStack())
 
 
 def _write_operator_config(tmp_path: Path) -> Path:
@@ -350,69 +419,125 @@ def test_rollout_command_refused_returns_1(tmp_path, fake_tmux, monkeypatch) -> 
 
 
 # ---------------------------------------------------------------------------
-# release command dispatch (run_release monkeypatched)
+# release command dispatch (phase chain)
 # ---------------------------------------------------------------------------
 
 
-def test_release_command_dispatches_and_writes_consolidated_report(tmp_path, monkeypatch, capsys) -> None:
+def test_release_chain_completes_all_phases(tmp_path, monkeypatch, capsys) -> None:
     config_path = _write_operator_config_both(tmp_path)
-    captured: dict = {}
-    _patch_inspect_repository(monkeypatch)
-
-    def fake_run_release(operator, selection, *, report_dir, max_auth_attempts, **kwargs) -> ReleaseReport:
-        captured["selection"] = selection
-        captured["report_dir"] = report_dir
-        captured["max_auth_attempts"] = max_auth_attempts
-        captured["auth_mode"] = kwargs["auth_mode"]
-        captured["progress_fn"] = kwargs["progress_fn"]
-        return ReleaseReport(
-            selection={"tools": selection.tools},
-            publishes=[{"tool": "autobench", "status": "published", "snapshot": "abc", "source_commit": "a" * 40}],
-            rollouts=[{"tool": "autobench", "node": "node03", "status": "rolled_out", "state_left": ""}],
-        )
-
-    monkeypatch.setattr(cli, "run_release", fake_run_release)
-    monkeypatch.setattr(cli, "_run_release_preflight", lambda *a, **k: SimpleNamespace(commit="a" * 40))
-    _autobench_repo_root(tmp_path)
+    autobench_path = _autobench_repo_root(tmp_path)
+    _patch_inspect_repository(monkeypatch, commit=SOURCE_SHA)
+    _patch_all_phases_pass(monkeypatch)
 
     rc = cli.main(
-        ["--config", str(config_path), "release", "--tool", "autobench", "--nodes", "03,04",
-         "--smoke", "deep", "--max-auth-attempts", "5"]
+        ["--config", str(config_path), "release", "--tool", "autobench", "--nodes", "03,04"]
     )
 
     assert rc == 0
-    selection = captured["selection"]
-    assert selection.tools == ["autobench"]
-    assert selection.nodes == ["node03", "node04"]
-    assert selection.smoke == "deep"
-    assert selection.snapshot_by_tool == {}
-    assert selection.run_local_check is True
-    assert captured["auth_mode"] == "pane"
-    assert callable(captured["progress_fn"])
-    assert captured["max_auth_attempts"] == 5
-    assert captured["report_dir"].parent.name == "runs"
-    assert (captured["report_dir"] / "release.json").exists()
-    loaded = RunLedger.load(captured["report_dir"])
-    assert loaded.state["status"] == "open"
-    assert loaded.state["phases"]["publish"]["evidence"]["snapshot_sha"] == "abc"
-    assert "Release: passed" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    runs = list((autobench_path / "edge-deploy" / "runs").iterdir())
+    assert len(runs) == 1
+    loaded = RunLedger.load(runs[0])
+    assert loaded.state["status"] == "complete"
+    assert loaded.phase_state("verify") == "passed"
+    assert loaded.phase_state("publish") == "passed"
+    assert loaded.phase_state("deploy", node="node03") == "passed"
+    assert loaded.phase_state("deploy", node="node04") == "passed"
+    assert loaded.phase_state("tag_github") == "passed"
+    assert loaded.phase_state("tag_bitbucket") == "passed"
+    assert f"release complete: {loaded.state['run_id']}" in out
+
+
+def test_release_posture_failure_mid_chain_exits_zero(tmp_path, monkeypatch, capsys) -> None:
+    config_path = _write_operator_config_both(tmp_path)
+    autobench_path = _autobench_repo_root(tmp_path)
+    ledger = _create_open_run(autobench_path, run_id=None)
+    ledger.set_phase(
+        "verify",
+        "passed",
+        evidence={
+            "commit": SOURCE_SHA,
+            "ci": "success",
+            "tests": "passed",
+            "verified_at": "2026-07-03T12:00:00+00:00",
+        },
+    )
+    run_id = ledger.state["run_id"]
+    _patch_inspect_repository(monkeypatch, commit=SOURCE_SHA)
+    monkeypatch.setattr(cli.socket, "create_connection", _unreachable_bitbucket_connect)
+
+    rc = cli.main(
+        ["--config", str(config_path), "release", "--tool", "autobench", "--run", run_id]
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    expected = (
+        f"phase 'publish' requires posture [bitbucket]; unreachable: scm.mastercard.int:443.\n"
+        f"Switch the firewall posture, then re-run: python -m edge_deploy release --run {run_id}\n"
+    )
+    assert out == expected
+    reloaded = RunLedger.load(ledger.run_dir)
+    assert reloaded.phase_state("verify") == "passed"
+    assert reloaded.phase_state("publish") == "pending"
+
+
+def test_release_resumes_without_rerunning_verify(tmp_path, monkeypatch) -> None:
+    config_path = _write_operator_config_both(tmp_path)
+    autobench_path = _autobench_repo_root(tmp_path)
+    ledger = _create_open_run(autobench_path)
+    ledger.set_phase(
+        "verify",
+        "passed",
+        evidence={
+            "commit": SOURCE_SHA,
+            "ci": "success",
+            "tests": "passed",
+            "verified_at": "2026-07-03T12:00:00+00:00",
+        },
+    )
+    run_id = ledger.state["run_id"]
+    _patch_inspect_repository(monkeypatch, commit=SOURCE_SHA)
+    _patch_all_phases_pass(monkeypatch)
+
+    def fail_verify(*args, **kwargs):
+        raise AssertionError("verify must not re-run when already passed")
+
+    monkeypatch.setattr(cli, "ensure_verified", fail_verify)
+    pytest_runs: list = []
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *a, **k: pytest_runs.append(a) or SimpleNamespace(returncode=0),
+    )
+    monkeypatch.setattr(cli, "probe", lambda *a, **k: [])
+
+    rc = cli.main(
+        ["--config", str(config_path), "release", "--tool", "autobench", "--run", run_id]
+    )
+
+    assert rc == 0
+    assert pytest_runs == []
+    reloaded = RunLedger.load(ledger.run_dir)
+    assert reloaded.state["status"] == "complete"
 
 
 def test_release_command_forwards_no_local_check(tmp_path, monkeypatch) -> None:
     config_path = _write_operator_config_both(tmp_path)
     captured: dict = {}
-    _patch_inspect_repository(monkeypatch)
+    _patch_inspect_repository(monkeypatch, commit=SOURCE_SHA)
+    _patch_all_phases_pass(monkeypatch)
 
-    def fake_run_release(operator, selection, *, report_dir, max_auth_attempts, **kwargs) -> ReleaseReport:
-        captured["selection"] = selection
-        return ReleaseReport(
-            selection={"tools": selection.tools},
-            publishes=[{"tool": "autobench", "status": "published", "snapshot": "abc", "source_commit": "a" * 40}],
-            rollouts=[{"tool": "autobench", "node": "node03", "status": "rolled_out", "state_left": ""}],
+    def fake_publish(ledger, operator, repo_root, **kwargs):
+        captured["no_local_check"] = kwargs.get("no_local_check")
+        ledger.set_phase(
+            "publish",
+            "passed",
+            evidence={"snapshot_sha": SNAPSHOT_SHA, "source_commit": SOURCE_SHA},
         )
+        return 0
 
-    monkeypatch.setattr(cli, "run_release", fake_run_release)
-    monkeypatch.setattr(cli, "_run_release_preflight", lambda *a, **k: SimpleNamespace(commit="a" * 40))
+    monkeypatch.setattr(cli, "run_publish_phase", fake_publish)
     _autobench_repo_root(tmp_path)
 
     rc = cli.main(
@@ -427,23 +552,32 @@ def test_release_command_forwards_no_local_check(tmp_path, monkeypatch) -> None:
     )
 
     assert rc == 0
-    assert captured["selection"].run_local_check is False
+    assert captured["no_local_check"] is True
 
 
 def test_release_command_nonzero_exit_on_failure(tmp_path, monkeypatch) -> None:
     config_path = _write_operator_config_both(tmp_path)
-    _patch_inspect_repository(monkeypatch)
-
-    def fake_run_release(operator, selection, *, report_dir, max_auth_attempts, **kwargs) -> ReleaseReport:
-        return ReleaseReport(
-            selection={},
-            rollouts=[{"tool": "autobench", "node": "node03", "status": "failed", "state_left": "boom"}],
-        )
-
-    monkeypatch.setattr(cli, "run_release", fake_run_release)
-    monkeypatch.setattr(cli, "_run_release_preflight", lambda *a, **k: SimpleNamespace(commit="a" * 40))
-    monkeypatch.setattr(cli, "_record_release_attempt", lambda *a, **k: "audit")
     autobench_path = _autobench_repo_root(tmp_path)
+    _patch_inspect_repository(monkeypatch, commit=SOURCE_SHA)
+    monkeypatch.setattr(cli, "probe", lambda *a, **k: [])
+
+    def fake_ensure_verified(operator, profile, repo_root, ledger, **kwargs):
+        ledger.set_phase("verify", "passed", evidence={"commit": SOURCE_SHA})
+        return SimpleNamespace(commit=SOURCE_SHA)
+
+    def fake_publish(ledger, operator, repo_root, **kwargs):
+        ledger.set_phase(
+            "publish",
+            "passed",
+            evidence={"snapshot_sha": SNAPSHOT_SHA, "source_commit": SOURCE_SHA},
+        )
+        return 0
+
+    monkeypatch.setattr(cli, "ensure_verified", fake_ensure_verified)
+    monkeypatch.setattr(cli, "run_publish_phase", fake_publish)
+    monkeypatch.setattr(cli, "run_deploy", lambda *a, **k: 1)
+    monkeypatch.setattr(cli, "probe", lambda *a, **k: [])
+    monkeypatch.setattr(cli, "enter_phase", lambda *a, **k: __import__("contextlib").ExitStack())
 
     rc = cli.main(
         ["--config", str(config_path), "release", "--tool", "autobench"]
@@ -454,6 +588,53 @@ def test_release_command_nonzero_exit_on_failure(tmp_path, monkeypatch) -> None:
     assert len(runs) == 1
     loaded = RunLedger.load(runs[0])
     assert loaded.state["status"] == "open"
+
+
+def test_release_run_resumes_same_directory(tmp_path, monkeypatch) -> None:
+    config_path = _write_operator_config_both(tmp_path)
+    autobench_path = _autobench_repo_root(tmp_path)
+    ledger = _create_open_run(autobench_path)
+    ledger.set_phase(
+        "publish",
+        "passed",
+        evidence={"snapshot_sha": SNAPSHOT_SHA, "source_commit": SOURCE_SHA},
+    )
+    ledger.set_phase(
+        "verify",
+        "passed",
+        evidence={"commit": SOURCE_SHA, "ci": "success", "tests": "passed", "verified_at": "t"},
+    )
+    captured: dict = {}
+    _patch_inspect_repository(monkeypatch, commit=SOURCE_SHA)
+
+    def fake_deploy(args, operator):
+        captured["run_id"] = args.run
+        for node in ["node03", "node04"]:
+            RunLedger.load(ledger.run_dir).set_phase(
+                "deploy", "passed", node=node, evidence={"status": "rolled_out"}
+            )
+        return 0
+
+    monkeypatch.setattr(cli, "run_deploy", fake_deploy)
+    monkeypatch.setattr(cli, "_cmd_tag_github", lambda *a, **k: 0)
+    monkeypatch.setattr(cli, "_cmd_tag_bitbucket", lambda *a, **k: (RunLedger.load(ledger.run_dir).complete() or 0))
+    monkeypatch.setattr(cli, "probe", lambda *a, **k: [])
+    monkeypatch.setattr(cli, "enter_phase", lambda *a, **k: __import__("contextlib").ExitStack())
+
+    rc = cli.main(
+        [
+            "--config",
+            str(config_path),
+            "release",
+            "--tool",
+            "autobench",
+            "--run",
+            ledger.state["run_id"],
+        ]
+    )
+
+    assert rc == 0
+    assert captured["run_id"] == ledger.state["run_id"]
 
 
 def test_release_refuses_when_open_run_exists(tmp_path, monkeypatch, capsys) -> None:
@@ -474,48 +655,6 @@ def test_release_refuses_when_open_run_exists(tmp_path, monkeypatch, capsys) -> 
         f'  2. abandon it:    python -m edge_deploy abandon --run {run["run_id"]} --reason "<why>"\n'
     )
     assert out == expected
-
-
-def test_release_run_resumes_same_directory(tmp_path, monkeypatch) -> None:
-    config_path = _write_operator_config_both(tmp_path)
-    autobench_path = _autobench_repo_root(tmp_path)
-    ledger = _create_open_run(autobench_path)
-    ledger.set_phase(
-        "publish",
-        "passed",
-        evidence={"snapshot_sha": "d" * 40, "source_commit": "a" * 40},
-    )
-    captured: dict = {}
-    _patch_inspect_repository(monkeypatch)
-
-    def fake_run_release(operator, selection, *, report_dir, max_auth_attempts, **kwargs) -> ReleaseReport:
-        captured["selection"] = selection
-        captured["report_dir"] = report_dir
-        return ReleaseReport(
-            selection={"tools": selection.tools},
-            publishes=[],
-            rollouts=[{"tool": "autobench", "node": "node03", "status": "rolled_out", "state_left": ""}],
-        )
-
-    monkeypatch.setattr(cli, "run_release", fake_run_release)
-    monkeypatch.setattr(cli, "_run_release_preflight", lambda *a, **k: SimpleNamespace(commit="a" * 40))
-
-    rc = cli.main(
-        [
-            "--config",
-            str(config_path),
-            "release",
-            "--tool",
-            "autobench",
-            "--run",
-            ledger.state["run_id"],
-        ]
-    )
-
-    assert rc == 0
-    assert captured["report_dir"] == ledger.run_dir
-    assert captured["selection"].snapshot_by_tool == {"autobench": "d" * 40}
-    assert (ledger.run_dir / "release.json").exists()
 
 
 def test_abandon_flips_status_and_excludes_from_find_open(tmp_path, monkeypatch, capsys) -> None:
