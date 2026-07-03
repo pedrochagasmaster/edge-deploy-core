@@ -26,6 +26,7 @@ from edge_deploy.mirror import MirrorError, mirror_release
 from edge_deploy.phases import PHASE_REGISTRY, EngineMismatchError, enter_phase
 from edge_deploy.phases.deploy import run_deploy
 from edge_deploy.phases.publish import run_publish_phase
+from edge_deploy.phases.status import register_status
 from edge_deploy.phases.tag import _cmd_tag_bitbucket, _cmd_tag_github
 from edge_deploy.phases.verify import VERIFY_SPEC, ensure_verified
 from edge_deploy.posture import PHASE_ENDPOINTS, PostureError, SocketConnector, endpoints_for, probe
@@ -123,6 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     for _spec, register_fn in sorted(PHASE_REGISTRY, key=lambda item: item[0].order):
         register_fn(subparsers)
+    register_status(subparsers)
 
     return parser
 
