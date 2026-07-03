@@ -668,6 +668,13 @@ def main(argv: list[str] | None = None) -> int:
         except MirrorError as exc:
             print(f"mirror failed: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 2
+    if args.command == "status":
+        # Status only reads local run ledgers and must work without operator config.
+        try:
+            return args.func(args, None)
+        except (LedgerError, KeyError, ValueError) as exc:
+            print(f"status failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 2
     try:
         operator = OperatorConfig.load(args.config)
     except FileNotFoundError:
