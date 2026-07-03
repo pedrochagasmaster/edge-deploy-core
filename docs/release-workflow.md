@@ -36,6 +36,24 @@ committed. Per-node reports record build, transfer, verification, installation, 
 resume provenance. A failed dependency phase is resumed from the original report
 directory so the reviewed source SHA remains available.
 
+## Interactive Tool release authentication
+
+Run `edge_deploy release` in a dedicated tmux controller whenever
+`--auth-mode prompt` is selected. The authentication prompt belongs to the
+controller process, not to the per-node SSH panes.
+
+```powershell
+tmux new-session -d -s edge-release-pr35 -c D:\Projects\autobench
+$releaseCommand = '$env:PYTHONPATH=''D:\Projects\edge-deploy-core''; $env:EDGE_DEPLOY_SSH_MULTIPLEX=''0''; $stamp=(Get-Date).ToUniversalTime().ToString(''yyyyMMddTHHmmssZ''); $env:EDGE_DEPLOY_PR35_REPORT="D:\Projects\autobench\edge-deploy\reports\release-$stamp-pr35-localcore"; py -m edge_deploy release --auth-mode prompt --report-dir $env:EDGE_DEPLOY_PR35_REPORT'
+tmux send-keys -t edge-release-pr35 -l $releaseCommand
+tmux send-keys -t edge-release-pr35 Enter
+tmux attach -t edge-release-pr35
+```
+
+Enter each fresh RSA PASSCODE only at `[nodeNN] Enter RSA PASSCODE:`. It is
+forwarded transiently to the per-node SSH pane and must never be copied into
+logs, reports, shell history, or config.
+
 ## Tool release tag finalization
 
 The `edge_deploy release` and rollback resume paths run while the operator can
