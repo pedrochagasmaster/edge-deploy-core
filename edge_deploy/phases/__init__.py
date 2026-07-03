@@ -70,7 +70,7 @@ from edge_deploy.phases.verify import VERIFY_SPEC, register_verify  # noqa: E402
 
 PHASE_REGISTRY.append((VERIFY_SPEC, register_verify))
 
-from . import publish as _publish  # noqa: E402, F401
+from . import publish as _publish  # noqa: E402, F401, I001
 
 from edge_deploy.phases.deploy import (  # noqa: E402, I001
     DEPLOY_SPEC,
