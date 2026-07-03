@@ -25,14 +25,14 @@ from edge_deploy.mirror import MirrorError, mirror_release
 from edge_deploy.phases import PHASE_REGISTRY, EngineMismatchError, enter_phase
 from edge_deploy.phases.deploy import run_deploy
 from edge_deploy.phases.publish import run_publish_phase
-from edge_deploy.phases.status import register_status
+from edge_deploy.phases.status import format_run_status, register_status
 from edge_deploy.phases.tag import _cmd_tag_bitbucket, _cmd_tag_github
 from edge_deploy.phases.verify import VERIFY_SPEC, ensure_verified
 from edge_deploy.posture import PHASE_ENDPOINTS, PostureError, SocketConnector, endpoints_for, probe
 from edge_deploy.publish import PublishError, publish_snapshot
 from edge_deploy.release import resolve_nodes
 from edge_deploy.reporting import OperationReport, redact, write_report
-from edge_deploy.repository import RepositoryError, inspect_repository
+from edge_deploy.repository import RepositoryError, RepositoryState, inspect_repository
 from edge_deploy.tmux_driver import AuthenticationError, SessionGoneError, TmuxDriver
 
 TOOL_CHOICES = ("autobench", "robocop")
@@ -66,6 +66,11 @@ def build_parser() -> argparse.ArgumentParser:
     release_parser.add_argument("--heartbeat-interval", type=float, default=30.0)
     release_parser.add_argument("--stall-threshold", type=float, default=300.0)
     release_parser.add_argument("--no-local-check", action="store_true", help="Bypass the local_check.ps1 publish gate")
+    release_parser.add_argument(
+        "--guided",
+        action="store_true",
+        help="Pause at posture boundaries until the operator switches firewall posture and confirms",
+    )
 
     rollback_parser = subparsers.add_parser(
         "rollback", help="Restore a previously successful immutable release tag"
@@ -181,25 +186,53 @@ def _phase_already_passed(ledger: RunLedger, phase: str, requested_nodes: list[s
     return ledger.phase_state(phase) in ("passed", "skipped")
 
 
-def _posture_blocks_phase(
+def _posture_display_keys(phase: str) -> str:
+    return "+".join(PHASE_ENDPOINTS[phase])
+
+
+def _unreachable_hosts(endpoints: list) -> str:
+    return ", ".join(f"{endpoint.host}:{endpoint.port}" for endpoint in endpoints)
+
+
+def _resume_release_command(run_id: str, *, guided: bool) -> str:
+    guided_flag = " --guided" if guided else ""
+    return f"python -m edge_deploy release{guided_flag} --run {run_id}"
+
+
+def _wait_for_posture(
     phase: str,
     operator: OperatorConfig,
     run_id: str,
     *,
+    guided: bool,
     connect: SocketConnector | None = None,
 ) -> bool:
     connector = connect or socket.create_connection
-    unreachable = probe(endpoints_for(phase, operator), connect=connector)
-    if not unreachable:
-        return False
-    posture_keys = ", ".join(PHASE_ENDPOINTS[phase])
-    unreachable_hosts = ", ".join(f"{endpoint.host}:{endpoint.port}" for endpoint in unreachable)
-    next_command = f"python -m edge_deploy release --run {run_id}"
-    print(
-        f"phase '{phase}' requires posture [{posture_keys}]; unreachable: {unreachable_hosts}.\n"
-        f"Switch the firewall posture, then re-run: {next_command}"
-    )
-    return True
+    posture_keys = _posture_display_keys(phase)
+    resume_command = _resume_release_command(run_id, guided=guided)
+
+    while True:
+        unreachable = probe(endpoints_for(phase, operator), connect=connector)
+        if not unreachable:
+            return True
+
+        if not guided:
+            posture_keys_csv = ", ".join(PHASE_ENDPOINTS[phase])
+            print(
+                f"phase '{phase}' requires posture [{posture_keys_csv}]; "
+                f"unreachable: {_unreachable_hosts(unreachable)}.\n"
+                f"Switch the firewall posture, then re-run: {resume_command}"
+            )
+            return False
+
+        print(f"Phase '{phase}' requires posture [{posture_keys}].")
+        print(f"Unreachable: {_unreachable_hosts(unreachable)}.")
+        try:
+            input(f"Switch firewall posture to [{posture_keys}], then press Enter to continue...")
+        except (KeyboardInterrupt, EOFError):
+            print()
+            print(f"Paused at posture boundary. Resume with: {resume_command}")
+            return False
 
 
 def _run_verify_phase(
@@ -301,14 +334,21 @@ def _chain_release_phases(
     node_names: list[str],
     repo_state=None,
     connect: SocketConnector | None = None,
+    guided: bool = False,
 ) -> int:
     run_id = ledger.state["run_id"]
     connector = connect or socket.create_connection
     for phase in RELEASE_PHASES:
         if _phase_already_passed(ledger, phase, node_names):
             continue
-        if _posture_blocks_phase(phase, effective_operator, run_id, connect=connector):
-            return 0
+        if not _wait_for_posture(
+            phase,
+            effective_operator,
+            run_id,
+            guided=guided,
+            connect=connector,
+        ):
+            return 1 if guided else 0
         code = _invoke_release_phase(
             phase,
             args,
@@ -324,6 +364,9 @@ def _chain_release_phases(
             return code
         ledger = RunLedger.load(ledger.run_dir)
     print(f"release complete: {run_id}")
+    if guided:
+        print()
+        print(format_run_status(ledger))
     return 0
 
 
@@ -334,6 +377,24 @@ def _refuse_non_open_run(command: str, run_id: str, status: str) -> int:
         file=sys.stderr,
     )
     return 2
+
+
+def _verify_satisfied(ledger: RunLedger) -> bool:
+    return ledger.phase_state("verify") in ("passed", "skipped")
+
+
+def _repo_state_from_ledger(
+    repo_root: Path,
+    profile,
+    ledger: RunLedger,
+) -> RepositoryState:
+    return RepositoryState(
+        repo_root,
+        profile.tool,
+        ledger.state["source_sha"],
+        profile.github_url,
+        profile.bitbucket_url,
+    )
 
 
 def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
@@ -375,12 +436,15 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
             operator=operator.operator_email,
         )
     if repo_state is None:
-        repo_state = inspect_repository(
-            repo_root,
-            tool=profile.tool,
-            expected_origin=profile.github_url,
-            expected_bitbucket=profile.bitbucket_url,
-        )
+        if _verify_satisfied(ledger):
+            repo_state = _repo_state_from_ledger(repo_root, profile, ledger)
+        else:
+            repo_state = inspect_repository(
+                repo_root,
+                tool=profile.tool,
+                expected_origin=profile.github_url,
+                expected_bitbucket=profile.bitbucket_url,
+            )
     with ledger.locked(force=args.force_lock):
         return _chain_release_phases(
             args,
@@ -390,6 +454,7 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
             effective_operator=effective_operator,
             node_names=node_names,
             repo_state=repo_state,
+            guided=args.guided,
         )
 
 
