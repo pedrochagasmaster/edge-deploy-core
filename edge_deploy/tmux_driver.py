@@ -22,35 +22,20 @@ of being hardcoded Dispatch constants.
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import posixpath
 import re
 import shlex
 import subprocess
-import tempfile
 import time
 import uuid
-from hashlib import sha256
 from pathlib import Path
 
 # Matches an ANSI escape sequence so screen text can be inspected as plain text.
 _ANSI_RE = r"\x1b\[[0-9;?]*[ -/]*[@-~]"
 
 
-def _ssh_multiplex_enabled() -> bool:
-    """Return whether OpenSSH ControlMaster should be used for the pane.
-
-    Windows OpenSSH/psmux can fail the control socket handshake with
-    ``getsockname failed: Not a socket``. Keep multiplexing as the default on
-    POSIX, allow operators to force either mode, and default Windows to the
-    authenticated-pane transport.
-    """
-    value = os.environ.get("EDGE_DEPLOY_SSH_MULTIPLEX", "").strip().lower()
-    if value in {"1", "true", "yes", "on"}:
-        return True
-    if value in {"0", "false", "no", "off"}:
-        return False
-    return os.name != "nt"
 # A bash/sh *primary* prompt at the end of a line (``$`` or ``#``). The ``>`` PS2
 # continuation prompt is intentionally excluded: treating it as a real prompt would let
 # the harness append commands onto a dangling, unterminated line instead of recognising
@@ -124,6 +109,7 @@ class TmuxDriver:
         retries: int = 0,
         retry_backoff: float = 3.0,
         ssh_connect_timeout: int = 15,
+        pane_log_path: Path | None = None,
     ) -> None:
         self.host = host
         self.session = session
@@ -136,9 +122,8 @@ class TmuxDriver:
         self.ssh_connect_timeout = ssh_connect_timeout
         self.retries = retries
         self.retry_backoff = retry_backoff
-        socket_id = sha256(f"{host}\0{session}".encode("utf-8")).hexdigest()[:16]
-        self.control_path = Path(tempfile.gettempdir()) / f"edge-deploy-{socket_id}.sock"
-        self.use_ssh_multiplex = _ssh_multiplex_enabled()
+        self.pane_log_path = pane_log_path
+        self.pane_log_supported: bool | None = None
 
     @classmethod
     def from_node_and_profile(
@@ -200,17 +185,6 @@ class TmuxDriver:
         control, readline, etc.).
         """
         ssh_parts = ["ssh", "-t"]
-        if self.use_ssh_multiplex:
-            ssh_parts.extend(
-                [
-                    "-o",
-                    "ControlMaster=yes",
-                    "-o",
-                    f"ControlPath={self.control_path}",
-                    "-o",
-                    "ControlPersist=no",
-                ]
-            )
         if self.ssh_options:
             ssh_parts.extend(shlex.split(self.ssh_options))
         ssh_parts.append(self.host)
@@ -224,6 +198,15 @@ class TmuxDriver:
         """Return True if the local tmux session is currently alive."""
         result = self._tmux(["has-session", "-t", self.session], check=False)
         return result.returncode == 0
+
+    def enable_pane_log(self, log_path: Path) -> bool:
+        """Mirror pane output to a local log file via ``tmux pipe-pane``."""
+        result = self._tmux(
+            ["pipe-pane", "-t", self.session, "-o", f"cat >> {log_path}"],
+            check=False,
+        )
+        self.pane_log_supported = result.returncode == 0
+        return self.pane_log_supported
 
     def start_session(self, *, connect_timeout: float | None = None, passcode: str | None = None) -> bool:
         """Create a local tmux session whose pane SSHes into the Edge Node.
@@ -248,7 +231,6 @@ class TmuxDriver:
 
         # Kill any stale local session with the same name.
         self._tmux(["kill-session", "-t", self.session], check=False)
-        self.control_path.unlink(missing_ok=True)
 
         self._tmux(
             [
@@ -260,6 +242,9 @@ class TmuxDriver:
         )
         time.sleep(0.2)
         self.send_keys(self._build_pane_command())
+
+        if self.pane_log_path is not None:
+            self.enable_pane_log(self.pane_log_path)
 
         combined = rf"(?:{_PROMPT_RE})|(?:{_AUTH_RE})"
 
@@ -338,32 +323,19 @@ class TmuxDriver:
             ["kill-session", "-t", self.session],
             check=False,
         )
-        self.control_path.unlink(missing_ok=True)
 
-    def upload_file(self, source: str | Path, remote_path: str) -> None:
-        """Copy a file over the already-authenticated SSH master connection."""
-        if not self.use_ssh_multiplex:
-            self._upload_file_via_pane(source, remote_path)
-            return
-        completed = subprocess.run(
-            [
-                "scp",
-                "-o",
-                f"ControlPath={self.control_path}",
-                str(Path(source)),
-                f"{self.host}:{remote_path}",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if completed.returncode:
-            detail = (completed.stderr or completed.stdout).strip()
-            raise RuntimeError(f"authenticated bundle transfer failed: {detail}")
-
-    def _upload_file_via_pane(self, source: str | Path, remote_path: str) -> None:
-        """Copy a file through the authenticated tmux pane when scp multiplexing is unavailable."""
+    def upload_file(self, source: str | Path, remote_path: str) -> str:
+        """Copy a file through the authenticated tmux pane."""
         source_path = Path(source)
+        local_digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        precheck_cmd = (
+            f"test -f {shlex.quote(remote_path)} && "
+            f"sha256sum {shlex.quote(remote_path)} | cut -d' ' -f1 || echo MISSING"
+        )
+        screen, _rc = self.run_remote(precheck_cmd, timeout=60.0)
+        if self._last_nonempty_line(screen) == local_digest:
+            return local_digest
+
         encoded = base64.b64encode(source_path.read_bytes()).decode("ascii")
         remote_dir = posixpath.dirname(remote_path) or "."
         upload_id = uuid.uuid4().hex[:12]
@@ -397,6 +369,20 @@ class TmuxDriver:
             cleanup_cmd = f"rm -f {shlex.quote(remote_b64)}"
             self.run_remote(cleanup_cmd, timeout=30.0, ensure_shell=False)
             raise RuntimeError(f"authenticated bundle transfer failed: could not decode {remote_path}")
+
+        verify_cmd = f"sha256sum {shlex.quote(remote_path)} | cut -d' ' -f1"
+        screen, _rc = self.run_remote(verify_cmd, timeout=60.0)
+        remote_digest = self._extract_hex_digest(screen)
+        if remote_digest is None:
+            screen = self.capture_screen(history_lines=4000)
+            remote_digest = self._extract_hex_digest(screen)
+        if remote_digest != local_digest:
+            cleanup_cmd = f"rm -f {shlex.quote(remote_path)}"
+            self.run_remote(cleanup_cmd, timeout=30.0, ensure_shell=False)
+            raise RuntimeError(
+                f"authenticated bundle transfer failed: digest mismatch for {remote_path}"
+            )
+        return local_digest
 
     # ------------------------------------------------------------------
     # Pane control (local tmux)
@@ -608,6 +594,13 @@ class TmuxDriver:
         text = re.sub(_ANSI_RE, "", text)
         lines = [line for line in text.splitlines() if line.strip()]
         return lines[-1] if lines else ""
+
+    def _extract_hex_digest(self, screen: str) -> str | None:
+        last_line = self._last_nonempty_line(screen)
+        if not last_line:
+            return None
+        match = re.search(r"\b[0-9a-f]{64}\b", last_line)
+        return match.group(0) if match else None
 
     def type_command_confirmed(
         self,

@@ -563,7 +563,6 @@ def _run_release_preflight(
         reverify=False,
         repo_state=repo_state,
     )
-
     for node_name in node_names:
         node = operator.node(node_name)
         driver = TmuxDriver.from_node_and_profile(node, profile, retries=2)
@@ -662,6 +661,7 @@ def _cmd_rollout(args: argparse.Namespace, operator: OperatorConfig) -> int:
         profile,
         node,
         target_commit=args.commit,
+        run_id="edge-deploy",
         install_mode=args.install,
         operator_email=operator.operator_email,
     )
