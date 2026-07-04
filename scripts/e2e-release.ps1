@@ -186,14 +186,64 @@ function Ensure-BbToken {
     Remove-Variable secureToken
 }
 
-function Confirm-GitHubPosture {
-    param([Parameter(Mandatory)][string]$Reason)
+function Test-PostureEndpoint {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('github', 'bitbucket')]
+        [string]$Posture
+    )
 
-    Write-Host ''
-    Write-Host '==> GitHub posture required' -ForegroundColor Yellow
-    Write-Host $Reason
-    Write-Host 'Switch firewall posture to GitHub now, then press Enter to continue.'
-    Read-Host 'Continue'
+    # Protocol-level probes only. TCP connects lie behind the corporate proxy
+    # (it accepts the connection, then 503s at the HTTP layer), and GitHub
+    # *reads* can succeed in postures where pushes fail — so the GitHub probe
+    # exercises the push path (dry-run negotiates git-receive-pack without
+    # updating any ref).
+    if ($Posture -eq 'github') {
+        cmd /c 'git push --dry-run origin HEAD >NUL 2>&1' | Out-Null
+    }
+    else {
+        cmd /c 'git ls-remote bitbucket HEAD >NUL 2>&1' | Out-Null
+    }
+
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Wait-PostureGate {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('github', 'bitbucket')]
+        [string]$Posture,
+
+        [Parameter(Mandatory)][string]$Reason
+    )
+
+    # Already in the right posture: continue silently, no prompt.
+    if (Test-PostureEndpoint -Posture $Posture) {
+        return
+    }
+
+    while ($true) {
+        Write-Host ''
+        Write-Host "==> $Posture posture required" -ForegroundColor Yellow
+        Write-Host $Reason
+        Read-Host "Switch firewall posture to [$Posture], then press Enter"
+
+        # Posture switches propagate over roughly a minute; the first requests
+        # after a switch flake (503s / exit 128), so poll instead of trusting
+        # one attempt.
+        Write-Host "Verifying $Posture reachability" -NoNewline
+        for ($attempt = 0; $attempt -lt 18; $attempt++) {
+            if (Test-PostureEndpoint -Posture $Posture) {
+                Write-Host ' ok' -ForegroundColor Green
+                return
+            }
+            Write-Host '.' -NoNewline
+            Start-Sleep -Seconds 5
+        }
+
+        Write-Host ''
+        Write-Host "$Posture endpoints still unreachable after 90s; posture switch may not have taken effect." -ForegroundColor Yellow
+    }
 }
 
 function Get-BranchName {
@@ -380,7 +430,7 @@ try {
 
     Set-Location $ToolPath
 
-    Confirm-GitHubPosture -Reason 'Preparation reads GitHub origin/main before creating the release exercise branch.'
+    Wait-PostureGate -Posture github -Reason 'Preparation reads GitHub origin/main before creating the release exercise branch.'
 
     git switch main
     Assert-CommandPassed "Switch $Tool to main"
@@ -438,7 +488,7 @@ try {
     git commit -m $commitMessage
     Assert-CommandPassed 'Commit cosmetic change'
 
-    Confirm-GitHubPosture -Reason 'The PR workflow now pushes the branch, creates the GitHub PR, and watches GitHub checks.'
+    Wait-PostureGate -Posture github -Reason 'The PR workflow now pushes the branch, creates the GitHub PR, and watches GitHub checks.'
 
     git push -u origin HEAD
     Assert-CommandPassed 'Push branch'
@@ -477,7 +527,7 @@ try {
     Write-Host ''
     Write-Host '==> Merge and post-merge CI' -ForegroundColor Cyan
 
-    Confirm-GitHubPosture -Reason 'Merging the PR and waiting for post-merge CI require GitHub access.'
+    Wait-PostureGate -Posture github -Reason 'Merging the PR and waiting for post-merge CI require GitHub access.'
 
     gh pr merge $prNumber --squash --delete-branch
     Assert-CommandPassed 'Squash-merge pull request'
@@ -499,15 +549,45 @@ try {
     Write-Host 'Switch firewall posture when prompted and enter RSA passcodes at each node prompt.'
     Write-Host ''
 
-    py -m edge_deploy release --guided
-    if ($LASTEXITCODE -ne 0) {
+    # Posture switches make transient failures normal (the first pushes after a
+    # switch can 503 while the firewall change propagates). The run ledger makes
+    # resume safe, so loop: on failure, show status and resume the same run.
+    $releaseAttempt = 0
+    while ($true) {
+        if ($script:RunId) {
+            py -m edge_deploy release --guided --run $script:RunId
+        }
+        else {
+            py -m edge_deploy release --guided
+        }
+        if ($LASTEXITCODE -eq 0) {
+            break
+        }
+
         try {
             $script:RunId = Get-OpenReleaseRun -SourceSha $script:SourceSha
         }
         catch {
             $script:RunId = $null
         }
-        throw "Guided release failed with exit code $LASTEXITCODE"
+
+        if (-not $script:RunId) {
+            throw "Guided release failed with exit code $LASTEXITCODE and left no open run to resume"
+        }
+
+        $releaseAttempt++
+        if ($releaseAttempt -ge 5) {
+            throw "Guided release failed after $releaseAttempt resume attempts (run $script:RunId preserved)"
+        }
+
+        Write-Host ''
+        Write-Host "Guided release interrupted (exit $LASTEXITCODE); run $script:RunId is preserved." -ForegroundColor Yellow
+        cmd /c "py -m edge_deploy status --run $script:RunId 2>&1" | Out-String | Write-Host
+
+        $answer = Read-Host 'Ensure the posture shown above, then press Enter to resume (or type stop to abort)'
+        if ($answer -eq 'stop') {
+            throw "Guided release aborted by operator; resume later with: python -m edge_deploy release --guided --run $script:RunId"
+        }
     }
 
     Write-Host ''
