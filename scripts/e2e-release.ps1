@@ -292,16 +292,18 @@ p.write_bytes(content.rstrip() + b'\n\n' + marker + b'\n')
 }
 
 function Update-ReleaseEnginePin {
-    $pinOld = 'edge-deploy-core @ git+https://github.com/pedrochagasmaster/edge-deploy-core.git@v1.1.0'
+    # Replace whatever engine version is currently pinned; no-op when the pin
+    # already matches, so a pre-bumped checkout does not break the deps flow.
+    $pinPattern = 'edge-deploy-core @ git\+https://github\.com/pedrochagasmaster/edge-deploy-core\.git@v\d+\.\d+\.\d+'
     $pinNew = 'edge-deploy-core @ git+https://github.com/pedrochagasmaster/edge-deploy-core.git@v1.3.0'
     $pyprojectPath = Join-Path $ToolPath 'pyproject.toml'
     $content = Get-Content $pyprojectPath -Raw
 
-    if ($content -notlike "*$pinOld*") {
-        throw "Expected v1.1.0 pin string not found in pyproject.toml: $pinOld"
+    if ($content -notmatch $pinPattern) {
+        throw "No edge-deploy-core release pin found in pyproject.toml (pattern: $pinPattern)"
     }
 
-    $updated = $content.Replace($pinOld, $pinNew)
+    $updated = [regex]::Replace($content, $pinPattern, $pinNew)
     Set-Content -Path $pyprojectPath -Value $updated -NoNewline
 }
 
@@ -322,7 +324,7 @@ Cosmetic Python comment only. No runtime or dependency behavior changes.
 ## Validation
 - powershell -NoProfile -File tools/dev/local_check.ps1
 - Effective non-comment requirements compared before and after
-- Bumps edge-deploy-core release extra pin from v1.1.0 to v1.3.0
+- Pins edge-deploy-core release extra to v1.3.0
 
 ## Release risk
 Comment-only requirements.txt change plus release-engine pin bump to v1.3.0.
