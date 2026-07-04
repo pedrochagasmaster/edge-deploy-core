@@ -13,6 +13,7 @@ import json
 import socket
 import subprocess
 import sys
+import time
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,7 +29,16 @@ from edge_deploy.phases.publish import run_publish_phase
 from edge_deploy.phases.status import format_run_status, register_status
 from edge_deploy.phases.tag import _cmd_tag_bitbucket, _cmd_tag_github
 from edge_deploy.phases.verify import VERIFY_SPEC, ensure_verified
-from edge_deploy.posture import PHASE_ENDPOINTS, PostureError, SocketConnector, endpoints_for, probe
+from edge_deploy.posture import (
+    PHASE_ENDPOINTS,
+    PHASE_GIT_PROBES,
+    GitProbeRunner,
+    PostureError,
+    SocketConnector,
+    endpoints_for,
+    git_probe_failures,
+    probe,
+)
 from edge_deploy.publish import PublishError, publish_snapshot
 from edge_deploy.release import resolve_nodes
 from edge_deploy.reporting import OperationReport, redact, write_report
@@ -36,7 +46,17 @@ from edge_deploy.repository import RepositoryError, RepositoryState, inspect_rep
 from edge_deploy.tmux_driver import AuthenticationError, SessionGoneError, TmuxDriver
 
 TOOL_CHOICES = ("autobench", "robocop")
-RELEASE_PHASES = ("verify", "publish", "deploy", "tag_github", "tag_bitbucket")
+# tag_bitbucket precedes tag_github (ADR-0012): it shares deploy's
+# bitbucket+edge posture, leaving one final switch to GitHub per release.
+RELEASE_PHASES = ("verify", "publish", "deploy", "tag_bitbucket", "tag_github")
+
+# Guided-mode retry backoff for transient remote failures right after a
+# posture switch (the firewall change propagates over ~a minute).
+_GUIDED_RETRY_DELAYS = (10.0, 20.0, 30.0)
+# Poll intervals after the operator confirms a posture switch, before
+# concluding the switch did not take effect.
+_POSTURE_SETTLE_DELAYS = (5.0, 10.0, 15.0, 30.0, 30.0)
+_sleep = time.sleep
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -190,13 +210,36 @@ def _posture_display_keys(phase: str) -> str:
     return "+".join(PHASE_ENDPOINTS[phase])
 
 
-def _unreachable_hosts(endpoints: list) -> str:
-    return ", ".join(f"{endpoint.host}:{endpoint.port}" for endpoint in endpoints)
-
-
 def _resume_release_command(run_id: str, *, guided: bool) -> str:
     guided_flag = " --guided" if guided else ""
     return f"python -m edge_deploy release{guided_flag} --run {run_id}"
+
+
+def _posture_probe_failures(
+    phase: str,
+    operator: OperatorConfig,
+    *,
+    connect: SocketConnector,
+    repo_root: Path | None = None,
+    git_runner: GitProbeRunner | None = None,
+) -> list[str]:
+    """TCP failures for edge/unprobed endpoints plus protocol-level git failures.
+
+    Kept in cli (rather than delegating to :func:`posture.posture_failures`) so
+    tests can keep patching ``cli.probe`` / ``cli.git_probe_failures``.
+    """
+    git_keys = set(PHASE_GIT_PROBES.get(phase, {})) if repo_root is not None else set()
+    tcp_endpoints = [
+        endpoint
+        for endpoint in endpoints_for(phase, operator)
+        if endpoint.key not in git_keys
+    ]
+    failures = [
+        f"{endpoint.host}:{endpoint.port}"
+        for endpoint in probe(tcp_endpoints, connect=connect)
+    ]
+    failures.extend(git_probe_failures(phase, repo_root, runner=git_runner))
+    return failures
 
 
 def _wait_for_posture(
@@ -206,33 +249,59 @@ def _wait_for_posture(
     *,
     guided: bool,
     connect: SocketConnector | None = None,
+    repo_root: Path | None = None,
+    git_runner: GitProbeRunner | None = None,
 ) -> bool:
     connector = connect or socket.create_connection
     posture_keys = _posture_display_keys(phase)
     resume_command = _resume_release_command(run_id, guided=guided)
 
     while True:
-        unreachable = probe(endpoints_for(phase, operator), connect=connector)
-        if not unreachable:
+        failures = _posture_probe_failures(
+            phase,
+            operator,
+            connect=connector,
+            repo_root=repo_root,
+            git_runner=git_runner,
+        )
+        if not failures:
             return True
 
         if not guided:
             posture_keys_csv = ", ".join(PHASE_ENDPOINTS[phase])
             print(
                 f"phase '{phase}' requires posture [{posture_keys_csv}]; "
-                f"unreachable: {_unreachable_hosts(unreachable)}.\n"
+                f"unreachable: {', '.join(failures)}.\n"
                 f"Switch the firewall posture, then re-run: {resume_command}"
             )
             return False
 
         print(f"Phase '{phase}' requires posture [{posture_keys}].")
-        print(f"Unreachable: {_unreachable_hosts(unreachable)}.")
+        print(f"Unreachable: {', '.join(failures)}.")
         try:
             input(f"Switch firewall posture to [{posture_keys}], then press Enter to continue...")
         except (KeyboardInterrupt, EOFError):
             print()
             print(f"Paused at posture boundary. Resume with: {resume_command}")
             return False
+
+        # A posture switch propagates over roughly a minute; poll for a while
+        # before concluding the switch did not take and re-prompting.
+        print("Verifying posture", end="", flush=True)
+        for delay in _POSTURE_SETTLE_DELAYS:
+            failures = _posture_probe_failures(
+                phase,
+                operator,
+                connect=connector,
+                repo_root=repo_root,
+                git_runner=git_runner,
+            )
+            if not failures:
+                print(" ok")
+                return True
+            print(".", end="", flush=True)
+            _sleep(delay)
+        print()
 
 
 def _run_verify_phase(
@@ -255,6 +324,7 @@ def _run_verify_phase(
         next_command=next_command,
         force_lock=force_lock,
         connect=connector,
+        repo_root=repo_root,
     )
     try:
         ensure_verified(
@@ -341,25 +411,47 @@ def _chain_release_phases(
     for phase in RELEASE_PHASES:
         if _phase_already_passed(ledger, phase, node_names):
             continue
-        if not _wait_for_posture(
-            phase,
-            effective_operator,
-            run_id,
-            guided=guided,
-            connect=connector,
-        ):
-            return 1 if guided else 0
-        code = _invoke_release_phase(
-            phase,
-            args,
-            ledger,
-            repo_root=repo_root,
-            profile=profile,
-            effective_operator=effective_operator,
-            node_names=node_names,
-            repo_state=repo_state,
-            connect=connector,
-        )
+        retries = iter(_GUIDED_RETRY_DELAYS)
+        while True:
+            if not _wait_for_posture(
+                phase,
+                effective_operator,
+                run_id,
+                guided=guided,
+                connect=connector,
+                repo_root=repo_root,
+            ):
+                return 1 if guided else 0
+            try:
+                code = _invoke_release_phase(
+                    phase,
+                    args,
+                    ledger,
+                    repo_root=repo_root,
+                    profile=profile,
+                    effective_operator=effective_operator,
+                    node_names=node_names,
+                    repo_state=repo_state,
+                    connect=connector,
+                )
+            except (subprocess.CalledProcessError, PostureError) as exc:
+                # Remote git operations flake transiently while a posture
+                # switch propagates. Phases are idempotent and ledger-guarded,
+                # so guided mode retries with backoff instead of crashing the
+                # single-command flow (ADR-0012).
+                if not guided:
+                    raise
+                delay = next(retries, None)
+                if delay is None:
+                    raise
+                print(
+                    f"phase '{phase}' hit a transient remote error "
+                    f"({type(exc).__name__}: {exc}); retrying in {delay:.0f}s"
+                )
+                _sleep(delay)
+                ledger = RunLedger.load(ledger.run_dir)
+                continue
+            break
         if code != 0:
             return code
         ledger = RunLedger.load(ledger.run_dir)

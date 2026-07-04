@@ -10,12 +10,14 @@ from edge_deploy.config import OperatorConfig
 from edge_deploy.ledger import RunLedger
 from edge_deploy.posture import PHASE_ENDPOINTS
 
+# tag_bitbucket precedes tag_github (ADR-0012): it shares deploy's
+# bitbucket+edge posture, leaving one final switch to GitHub per release.
 _PHASE_ORDER: tuple[str, ...] = (
     "verify",
     "publish",
     "deploy",
-    "tag_github",
     "tag_bitbucket",
+    "tag_github",
 )
 
 
@@ -100,8 +102,8 @@ def format_run_status(ledger: RunLedger) -> str:
         _phase_line("verify", ledger.phase_state("verify")),
         _format_publish_line(ledger),
         _format_deploy_line(ledger),
-        _phase_line("tag_github", ledger.phase_state("tag_github")),
         _phase_line("tag_bitbucket", ledger.phase_state("tag_bitbucket")),
+        _phase_line("tag_github", ledger.phase_state("tag_github")),
         _resolve_next_line(ledger),
     ]
     return "\n".join(lines)

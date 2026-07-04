@@ -57,6 +57,7 @@ def run_publish_phase(
         ledger,
         next_command=next_command,
         force_lock=force_lock,
+        repo_root=repo_root,
     )
     with stack:
         if ledger.state.get("kind") == "rollback":

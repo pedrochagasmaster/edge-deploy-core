@@ -77,6 +77,8 @@ def enter_phase(
     next_command: str,
     force_lock: bool = False,
     connect: SocketConnector | None = None,
+    repo_root: Path | None = None,
+    git_probe_runner: Callable | None = None,
 ) -> ExitStack:
     run_status = ledger.state["status"]
     if run_status != "open":
@@ -104,6 +106,8 @@ def enter_phase(
             operator,
             next_command=next_command,
             connect=connect or socket.create_connection,
+            repo_root=repo_root,
+            git_runner=git_probe_runner,
         )
         ledger.record_event("phase_entered", phase=spec.name)
     except Exception:

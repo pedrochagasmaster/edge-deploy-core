@@ -15,15 +15,17 @@ from edge_deploy.ledger import RunLedger
 from edge_deploy.phases import PHASE_REGISTRY, PhaseSpec, enter_phase, load_run, run_repo_root
 from edge_deploy.posture import PHASE_ENDPOINTS
 
-TAG_GITHUB_SPEC = PhaseSpec(
-    name="tag_github",
-    order=40,
-    endpoints=PHASE_ENDPOINTS["tag_github"],
-)
+# ADR-0012: tag_bitbucket runs before tag_github so it shares the deploy
+# posture (bitbucket+edge); tag_github is then the single final posture switch.
 TAG_BITBUCKET_SPEC = PhaseSpec(
     name="tag_bitbucket",
-    order=50,
+    order=40,
     endpoints=PHASE_ENDPOINTS["tag_bitbucket"],
+)
+TAG_GITHUB_SPEC = PhaseSpec(
+    name="tag_github",
+    order=50,
+    endpoints=PHASE_ENDPOINTS["tag_github"],
 )
 
 
@@ -43,6 +45,27 @@ def _merge_phase_evidence(ledger: RunLedger, phase: str, updates: dict) -> None:
     evidence = dict(ledger.state["phases"][phase]["evidence"])
     evidence.update(updates)
     ledger.set_phase(phase, ledger.phase_state(phase), evidence=evidence)
+
+
+def _ensure_release_tag(ledger: RunLedger, repo_root: Path, source_sha: str, *, phase: str) -> str:
+    """Return the run's release tag, minting the local annotated tag on first use.
+
+    Either tag phase may run first (ADR-0012 puts tag_bitbucket before
+    tag_github), so the tag name is looked up in both phases' evidence before
+    minting a new one.
+    """
+    for candidate in ("tag_bitbucket", "tag_github"):
+        tag = ledger.state["phases"][candidate]["evidence"].get("tag")
+        if tag:
+            return str(tag)
+    tag = _tag_successful_release(repo_root, source_sha)
+    _merge_phase_evidence(ledger, phase, {"tag": tag})
+    return tag
+
+
+def _complete_when_both_tags_passed(ledger: RunLedger) -> None:
+    if ledger.phase_state("tag_github") == "passed" and ledger.phase_state("tag_bitbucket") == "passed":
+        ledger.complete()
 
 
 def _all_deploy_nodes_passed(ledger: RunLedger) -> bool:
@@ -98,6 +121,7 @@ def _cmd_tag_github(args: argparse.Namespace, operator: OperatorConfig) -> int:
         ledger,
         next_command=next_command,
         force_lock=args.force_lock,
+        repo_root=repo_root,
     ):
         if not _all_deploy_nodes_passed(ledger):
             print(
@@ -110,11 +134,7 @@ def _cmd_tag_github(args: argparse.Namespace, operator: OperatorConfig) -> int:
             print("tag-github: already pushed (skipping)")
             return 0
 
-        evidence = ledger.state["phases"]["tag_github"]["evidence"]
-        tag = evidence.get("tag")
-        if not tag:
-            tag = _tag_successful_release(repo_root, source_sha)
-            _merge_phase_evidence(ledger, "tag_github", {"tag": tag})
+        tag = _ensure_release_tag(ledger, repo_root, source_sha, phase="tag_github")
 
         subprocess.run(["git", "push", "origin", f"refs/tags/{tag}"], cwd=repo_root, check=True)
         pushed_sha = _dereferenced_tag_sha(repo_root, "origin", tag)
@@ -129,6 +149,7 @@ def _cmd_tag_github(args: argparse.Namespace, operator: OperatorConfig) -> int:
             "passed",
             evidence={"tag": tag, "pushed_sha": pushed_sha},
         )
+        _complete_when_both_tags_passed(ledger)
     return 0
 
 
@@ -145,6 +166,7 @@ def _cmd_tag_bitbucket(args: argparse.Namespace, operator: OperatorConfig) -> in
         ledger,
         next_command=next_command,
         force_lock=args.force_lock,
+        repo_root=repo_root,
     ):
         if not _all_deploy_nodes_passed(ledger):
             print(
@@ -153,19 +175,11 @@ def _cmd_tag_bitbucket(args: argparse.Namespace, operator: OperatorConfig) -> in
             )
             return 2
 
-        if ledger.phase_state("tag_github") != "passed":
-            print(
-                f"tag-bitbucket refused: tag_github has not passed for run {run_id}",
-                file=sys.stderr,
-            )
-            return 2
-
         if ledger.phase_state("tag_bitbucket") == "passed":
             print("tag-bitbucket: already pushed (skipping)")
             return 0
 
-        github_evidence = ledger.state["phases"]["tag_github"]["evidence"]
-        tag = str(github_evidence["tag"])
+        tag = _ensure_release_tag(ledger, repo_root, source_sha, phase="tag_bitbucket")
         publish_evidence = ledger.state["phases"]["publish"]["evidence"]
         snapshot_sha = str(publish_evidence.get("snapshot_sha") or source_sha)
         deployed = snapshot_sha
@@ -221,8 +235,7 @@ def _cmd_tag_bitbucket(args: argparse.Namespace, operator: OperatorConfig) -> in
             "passed",
             evidence={"tag": tag, "pushed_sha": pushed_sha},
         )
-        if ledger.phase_state("tag_github") == "passed":
-            ledger.complete()
+        _complete_when_both_tags_passed(ledger)
     return 0
 
 
@@ -240,5 +253,5 @@ def register_tag_bitbucket(subparsers: argparse._SubParsersAction) -> None:
     parser.set_defaults(func=_cmd_tag_bitbucket)
 
 
-PHASE_REGISTRY.append((TAG_GITHUB_SPEC, register_tag_github))
 PHASE_REGISTRY.append((TAG_BITBUCKET_SPEC, register_tag_bitbucket))
+PHASE_REGISTRY.append((TAG_GITHUB_SPEC, register_tag_github))

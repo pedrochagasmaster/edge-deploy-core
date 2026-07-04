@@ -111,6 +111,7 @@ def _cmd_verify(args: argparse.Namespace, operator: OperatorConfig) -> int:
         ledger,
         next_command=next_command,
         force_lock=args.force_lock,
+        repo_root=repo_root,
     )
     try:
         ensure_verified(

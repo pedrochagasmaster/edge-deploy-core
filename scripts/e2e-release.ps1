@@ -166,12 +166,12 @@ function Assert-EngineVersion {
     $engineVersion = (& py -c 'import edge_deploy; print(edge_deploy.__version__)').Trim()
     Assert-CommandPassed 'Inspect loaded edge-deploy-core version'
 
-    if ($engineVersion -ne '1.2.9') {
+    if ($engineVersion -ne '1.3.0') {
         throw @"
-Expected edge-deploy-core version 1.2.9; loaded $engineVersion.
+Expected edge-deploy-core version 1.3.0; loaded $engineVersion.
 
 Install the tagged release engine (not editable):
-  py -m pip install "git+https://github.com/pedrochagasmaster/edge-deploy-core.git@v1.2.9"
+  py -m pip install "git+https://github.com/pedrochagasmaster/edge-deploy-core.git@v1.3.0"
 "@
     }
 }
@@ -293,7 +293,7 @@ p.write_bytes(content.rstrip() + b'\n\n' + marker + b'\n')
 
 function Update-ReleaseEnginePin {
     $pinOld = 'edge-deploy-core @ git+https://github.com/pedrochagasmaster/edge-deploy-core.git@v1.1.0'
-    $pinNew = 'edge-deploy-core @ git+https://github.com/pedrochagasmaster/edge-deploy-core.git@v1.2.9'
+    $pinNew = 'edge-deploy-core @ git+https://github.com/pedrochagasmaster/edge-deploy-core.git@v1.3.0'
     $pyprojectPath = Join-Path $ToolPath 'pyproject.toml'
     $content = Get-Content $pyprojectPath -Raw
 
@@ -322,10 +322,10 @@ Cosmetic Python comment only. No runtime or dependency behavior changes.
 ## Validation
 - powershell -NoProfile -File tools/dev/local_check.ps1
 - Effective non-comment requirements compared before and after
-- Bumps edge-deploy-core release extra pin from v1.1.0 to v1.2.9
+- Bumps edge-deploy-core release extra pin from v1.1.0 to v1.3.0
 
 ## Release risk
-Comment-only requirements.txt change plus release-engine pin bump to v1.2.9.
+Comment-only requirements.txt change plus release-engine pin bump to v1.3.0.
 Dependency resolution is intentionally unchanged, but the dependency delivery
 path will run.
 "@
@@ -547,6 +547,7 @@ try {
     Write-Host '==> Guided release' -ForegroundColor Cyan
     Write-Host 'Running: py -m edge_deploy release --guided'
     Write-Host 'Switch firewall posture when prompted and enter RSA passcodes at each node prompt.'
+    Write-Host 'Expected switches: github (verify) -> bitbucket (publish/deploy/tag-bitbucket) -> github (tag-github).'
     Write-Host ''
 
     # Posture switches make transient failures normal (the first pushes after a

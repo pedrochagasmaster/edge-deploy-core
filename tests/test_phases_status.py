@@ -55,8 +55,8 @@ def test_format_run_status_golden_block(tmp_path: Path) -> None:
             "  verify:        passed",
             f"  publish:       passed (snapshot {SNAPSHOT_SHA[:7]})",
             "  deploy:        node03=passed node04=failed",
-            "  tag_github:    pending",
             "  tag_bitbucket: pending",
+            "  tag_github:    pending",
             f"next: python -m edge_deploy deploy --run {run_id} --nodes node04   [posture: bitbucket+edge]",
         ]
     )

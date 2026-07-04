@@ -77,8 +77,8 @@ run run-20260703T120000Z-aa6d9a5  tool=autobench  kind=release  source=aa6d9a5  
   verify:        passed
   publish:       passed (snapshot bb7c8d1)
   deploy:        node03=passed node04=failed
-  tag_github:    pending
   tag_bitbucket: pending
+  tag_github:    pending
 next: python -m edge_deploy deploy --run run-20260703T120000Z-aa6d9a5 --nodes node04   [posture: bitbucket+edge]
 ```
 
@@ -89,17 +89,24 @@ firewall manually before each phase. If the wrong posture is active, the phase
 exits immediately with exactly:
 
 ```text
-phase '<phase>' requires posture [<keys, comma-joined>]; unreachable: <host:port, comma-joined>.
+phase '<phase>' requires posture [<keys, comma-joined>]; unreachable: <failures, comma-joined>.
 Switch the firewall posture, then re-run: <next command>
 ```
+
+Posture is verified with protocol-level git probes (`git ls-remote` for reads,
+`git push --dry-run` for writes; ADR-0012), because the proxy accepts TCP
+connects in every posture. Edge SSH endpoints are still TCP-probed.
 
 | Phase | Command | Posture |
 |-------|---------|---------|
 | Verify | `python -m edge_deploy verify --run <run_id>` | local + GitHub API |
 | Publish | `python -m edge_deploy publish-phase --run <run_id>` | bitbucket |
 | Deploy | `python -m edge_deploy deploy --run <run_id> [--nodes …]` | bitbucket + edge |
-| Tag GitHub | `python -m edge_deploy tag-github --run <run_id>` | github |
 | Tag Bitbucket | `python -m edge_deploy tag-bitbucket --run <run_id>` | bitbucket |
+| Tag GitHub | `python -m edge_deploy tag-github --run <run_id>` | github |
+
+Tag Bitbucket runs before Tag GitHub (ADR-0012) so a release needs only two
+posture switches: github → bitbucket+edge → github.
 
 The `release` wrapper chains phases until the first posture boundary, saves
 state, prints the posture message above, and exits 0. Re-run `release --run
@@ -121,10 +128,13 @@ unreachable endpoints, then prompts:
 Switch firewall posture to [bitbucket+edge], then press Enter to continue...
 ```
 
-Switch the firewall, press Enter, and the engine re-probes and continues. If
-endpoints are still unreachable, it re-prompts with the updated unreachable
-list. Press Ctrl+C (or EOF) to pause: the run stays `open` and the engine prints
-the resume command, for example:
+Switch the firewall, press Enter, and the engine polls the probes for up to
+~90 seconds while the switch propagates, then continues. If endpoints are still
+unreachable after that, it re-prompts with the updated unreachable list. If a
+phase still hits a transient remote error right after a switch (for example an
+HTTP 503 from the proxy), guided mode retries the phase with 10/20/30 s backoff
+before giving up (ADR-0012). Press Ctrl+C (or EOF) to pause: the run stays
+`open` and the engine prints the resume command, for example:
 
 ```text
 Paused at posture boundary. Resume with: python -m edge_deploy release --guided --run <run_id>

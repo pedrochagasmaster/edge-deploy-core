@@ -87,6 +87,19 @@ def _unreachable_bitbucket_connect(address: tuple[str, int], timeout: float) -> 
     return SimpleNamespace(close=lambda: None)
 
 
+def _fake_bitbucket_down_git_failures(bitbucket_reachable):
+    """git_probe_failures double: bitbucket git endpoints fail until the
+    ``bitbucket_reachable()`` callable flips true; everything else passes."""
+
+    def fake(phase, repo_root, runner=None):
+        probes = cli.PHASE_GIT_PROBES.get(phase, {})
+        if "bitbucket" in probes and not bitbucket_reachable():
+            return ["scm.mastercard.int:443"]
+        return []
+
+    return fake
+
+
 def _patch_all_phases_pass(monkeypatch: pytest.MonkeyPatch, *, patch_probe: bool = True) -> None:
     def fake_ensure_verified(operator, profile, repo_root, ledger, **kwargs):
         ledger.set_phase(
@@ -117,18 +130,18 @@ def _patch_all_phases_pass(monkeypatch: pytest.MonkeyPatch, *, patch_probe: bool
             ledger.set_phase("deploy", "passed", node=node, evidence={"status": "rolled_out"})
         return 0
 
-    def fake_tag_github(args, operator):
-        from edge_deploy.phases.deploy import _load_run
-
-        ledger, _repo_root = _load_run(args, operator)
-        ledger.set_phase("tag_github", "passed", evidence={"tag": RELEASE_TAG, "pushed_sha": SOURCE_SHA})
-        return 0
-
     def fake_tag_bitbucket(args, operator):
         from edge_deploy.phases.deploy import _load_run
 
         ledger, _repo_root = _load_run(args, operator)
         ledger.set_phase("tag_bitbucket", "passed", evidence={"tag": RELEASE_TAG, "pushed_sha": SNAPSHOT_SHA})
+        return 0
+
+    def fake_tag_github(args, operator):
+        from edge_deploy.phases.deploy import _load_run
+
+        ledger, _repo_root = _load_run(args, operator)
+        ledger.set_phase("tag_github", "passed", evidence={"tag": RELEASE_TAG, "pushed_sha": SOURCE_SHA})
         ledger.complete()
         return 0
 
@@ -139,6 +152,7 @@ def _patch_all_phases_pass(monkeypatch: pytest.MonkeyPatch, *, patch_probe: bool
     monkeypatch.setattr(cli, "_cmd_tag_bitbucket", fake_tag_bitbucket)
     if patch_probe:
         monkeypatch.setattr(cli, "probe", lambda *a, **k: [])
+        monkeypatch.setattr(cli, "git_probe_failures", lambda *a, **k: [])
     monkeypatch.setattr(cli, "enter_phase", lambda *a, **k: __import__("contextlib").ExitStack())
 
 
@@ -506,15 +520,6 @@ def test_release_chain_holds_lock_between_phases(tmp_path, monkeypatch, capsys) 
             ledger.set_phase("deploy", "passed", node=node, evidence={"status": "rolled_out"})
         return 0
 
-    def fake_tag_github(args, operator):
-        from edge_deploy.phases.deploy import _load_run
-
-        ledger, _repo_root = _load_run(args, operator)
-        _assert_locked_against_other_processes(ledger.run_dir)
-        phases_checked.append("tag_github")
-        ledger.set_phase("tag_github", "passed", evidence={"tag": RELEASE_TAG, "pushed_sha": SOURCE_SHA})
-        return 0
-
     def fake_tag_bitbucket(args, operator):
         from edge_deploy.phases.deploy import _load_run
 
@@ -522,6 +527,15 @@ def test_release_chain_holds_lock_between_phases(tmp_path, monkeypatch, capsys) 
         _assert_locked_against_other_processes(ledger.run_dir)
         phases_checked.append("tag_bitbucket")
         ledger.set_phase("tag_bitbucket", "passed", evidence={"tag": RELEASE_TAG, "pushed_sha": SNAPSHOT_SHA})
+        return 0
+
+    def fake_tag_github(args, operator):
+        from edge_deploy.phases.deploy import _load_run
+
+        ledger, _repo_root = _load_run(args, operator)
+        _assert_locked_against_other_processes(ledger.run_dir)
+        phases_checked.append("tag_github")
+        ledger.set_phase("tag_github", "passed", evidence={"tag": RELEASE_TAG, "pushed_sha": SOURCE_SHA})
         ledger.complete()
         return 0
 
@@ -531,13 +545,14 @@ def test_release_chain_holds_lock_between_phases(tmp_path, monkeypatch, capsys) 
     monkeypatch.setattr(cli, "_cmd_tag_github", fake_tag_github)
     monkeypatch.setattr(cli, "_cmd_tag_bitbucket", fake_tag_bitbucket)
     monkeypatch.setattr(cli, "probe", lambda *a, **k: [])
+    monkeypatch.setattr(cli, "git_probe_failures", lambda *a, **k: [])
 
     rc = cli.main(
         ["--config", str(config_path), "release", "--tool", "autobench", "--nodes", "03,04"]
     )
 
     assert rc == 0
-    assert phases_checked == ["verify", "publish", "deploy", "tag_github", "tag_bitbucket"]
+    assert phases_checked == ["verify", "publish", "deploy", "tag_bitbucket", "tag_github"]
     runs = list((autobench_path / "edge-deploy" / "runs").iterdir())
     assert not (runs[0] / "run.lock").is_file()
 
@@ -559,6 +574,7 @@ def test_release_posture_failure_mid_chain_exits_zero(tmp_path, monkeypatch, cap
     run_id = ledger.state["run_id"]
     _patch_inspect_repository(monkeypatch, commit=SOURCE_SHA)
     monkeypatch.setattr(cli.socket, "create_connection", _unreachable_bitbucket_connect)
+    monkeypatch.setattr(cli, "git_probe_failures", _fake_bitbucket_down_git_failures(lambda: False))
 
     rc = cli.main(
         ["--config", str(config_path), "release", "--tool", "autobench", "--run", run_id]
@@ -680,6 +696,10 @@ def test_release_guided_crosses_posture_boundary_after_enter(tmp_path, monkeypat
         return ""
 
     monkeypatch.setattr(cli.socket, "create_connection", toggling_connect)
+    monkeypatch.setattr(
+        cli, "git_probe_failures", _fake_bitbucket_down_git_failures(lambda: bitbucket_reachable)
+    )
+    monkeypatch.setattr(cli, "_sleep", lambda *_: None)
     monkeypatch.setattr("builtins.input", fake_input)
 
     rc = cli.main(
@@ -738,6 +758,10 @@ def test_release_guided_reprompts_while_probe_still_fails(tmp_path, monkeypatch,
         return ""
 
     monkeypatch.setattr(cli.socket, "create_connection", toggling_connect)
+    monkeypatch.setattr(
+        cli, "git_probe_failures", _fake_bitbucket_down_git_failures(lambda: bitbucket_reachable)
+    )
+    monkeypatch.setattr(cli, "_sleep", lambda *_: None)
     monkeypatch.setattr("builtins.input", fake_input)
 
     rc = cli.main(
@@ -780,6 +804,7 @@ def test_release_guided_interrupted_leaves_run_open(tmp_path, monkeypatch, capsy
     def fake_input(_prompt: str = "") -> str:
         raise KeyboardInterrupt
 
+    monkeypatch.setattr(cli, "git_probe_failures", _fake_bitbucket_down_git_failures(lambda: False))
     monkeypatch.setattr("builtins.input", fake_input)
 
     rc = cli.main(
@@ -801,6 +826,103 @@ def test_release_guided_interrupted_leaves_run_open(tmp_path, monkeypatch, capsy
     reloaded = RunLedger.load(ledger.run_dir)
     assert reloaded.state["status"] == "open"
     assert reloaded.phase_state("publish") == "pending"
+
+
+def test_release_guided_retries_transient_remote_errors(tmp_path, monkeypatch) -> None:
+    """ADR-0012: guided mode retries a phase that raises CalledProcessError
+    (remote flake while a posture switch propagates) with backoff."""
+    config_path = _write_operator_config_both(tmp_path)
+    autobench_path = _autobench_repo_root(tmp_path)
+    ledger = _create_open_run(autobench_path)
+    ledger.set_phase(
+        "verify",
+        "passed",
+        evidence={"commit": SOURCE_SHA, "ci": "success", "tests": "passed", "verified_at": "t"},
+    )
+    run_id = ledger.state["run_id"]
+    _patch_all_phases_pass(monkeypatch)
+    publish_attempts: list[int] = []
+    sleeps: list[float] = []
+
+    def flaky_publish(inner_ledger, operator, repo_root, **kwargs):
+        publish_attempts.append(1)
+        if len(publish_attempts) < 3:
+            raise subprocess.CalledProcessError(1, ["git", "push", "bitbucket"])
+        inner_ledger.set_phase(
+            "publish",
+            "passed",
+            evidence={"snapshot_sha": SNAPSHOT_SHA, "source_commit": SOURCE_SHA},
+        )
+        return 0
+
+    monkeypatch.setattr(cli, "run_publish_phase", flaky_publish)
+    monkeypatch.setattr(cli, "_sleep", lambda seconds: sleeps.append(seconds))
+
+    rc = cli.main(
+        ["--config", str(config_path), "release", "--tool", "autobench", "--run", run_id, "--guided"]
+    )
+
+    assert rc == 0
+    assert len(publish_attempts) == 3
+    assert sleeps == [10.0, 20.0]
+    assert RunLedger.load(ledger.run_dir).state["status"] == "complete"
+
+
+def test_release_unguided_propagates_transient_remote_errors(tmp_path, monkeypatch, capsys) -> None:
+    config_path = _write_operator_config_both(tmp_path)
+    autobench_path = _autobench_repo_root(tmp_path)
+    ledger = _create_open_run(autobench_path)
+    ledger.set_phase(
+        "verify",
+        "passed",
+        evidence={"commit": SOURCE_SHA, "ci": "success", "tests": "passed", "verified_at": "t"},
+    )
+    run_id = ledger.state["run_id"]
+    _patch_all_phases_pass(monkeypatch)
+    publish_attempts: list[int] = []
+
+    def flaky_publish(inner_ledger, operator, repo_root, **kwargs):
+        publish_attempts.append(1)
+        raise subprocess.CalledProcessError(1, ["git", "push", "bitbucket"])
+
+    monkeypatch.setattr(cli, "run_publish_phase", flaky_publish)
+
+    rc = cli.main(
+        ["--config", str(config_path), "release", "--tool", "autobench", "--run", run_id]
+    )
+
+    assert rc == 2
+    assert len(publish_attempts) == 1
+    assert "release failed: CalledProcessError" in capsys.readouterr().err
+
+
+def test_release_guided_gives_up_after_retry_budget(tmp_path, monkeypatch, capsys) -> None:
+    config_path = _write_operator_config_both(tmp_path)
+    autobench_path = _autobench_repo_root(tmp_path)
+    ledger = _create_open_run(autobench_path)
+    ledger.set_phase(
+        "verify",
+        "passed",
+        evidence={"commit": SOURCE_SHA, "ci": "success", "tests": "passed", "verified_at": "t"},
+    )
+    run_id = ledger.state["run_id"]
+    _patch_all_phases_pass(monkeypatch)
+    publish_attempts: list[int] = []
+
+    def always_failing_publish(inner_ledger, operator, repo_root, **kwargs):
+        publish_attempts.append(1)
+        raise subprocess.CalledProcessError(1, ["git", "push", "bitbucket"])
+
+    monkeypatch.setattr(cli, "run_publish_phase", always_failing_publish)
+    monkeypatch.setattr(cli, "_sleep", lambda seconds: None)
+
+    rc = cli.main(
+        ["--config", str(config_path), "release", "--tool", "autobench", "--run", run_id, "--guided"]
+    )
+
+    assert rc == 2
+    assert len(publish_attempts) == 1 + len(cli._GUIDED_RETRY_DELAYS)
+    assert RunLedger.load(ledger.run_dir).state["status"] == "open"
 
 
 def test_release_command_forwards_no_local_check(tmp_path, monkeypatch) -> None:
@@ -858,6 +980,7 @@ def test_release_command_nonzero_exit_on_failure(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(cli, "run_publish_phase", fake_publish)
     monkeypatch.setattr(cli, "run_deploy", lambda *a, **k: 1)
     monkeypatch.setattr(cli, "probe", lambda *a, **k: [])
+    monkeypatch.setattr(cli, "git_probe_failures", lambda *a, **k: [])
     monkeypatch.setattr(cli, "enter_phase", lambda *a, **k: __import__("contextlib").ExitStack())
 
     rc = cli.main(
@@ -897,9 +1020,10 @@ def test_release_run_resumes_same_directory(tmp_path, monkeypatch) -> None:
         return 0
 
     monkeypatch.setattr(cli, "run_deploy", fake_deploy)
-    monkeypatch.setattr(cli, "_cmd_tag_github", lambda *a, **k: 0)
-    monkeypatch.setattr(cli, "_cmd_tag_bitbucket", lambda *a, **k: (RunLedger.load(ledger.run_dir).complete() or 0))
+    monkeypatch.setattr(cli, "_cmd_tag_bitbucket", lambda *a, **k: 0)
+    monkeypatch.setattr(cli, "_cmd_tag_github", lambda *a, **k: (RunLedger.load(ledger.run_dir).complete() or 0))
     monkeypatch.setattr(cli, "probe", lambda *a, **k: [])
+    monkeypatch.setattr(cli, "git_probe_failures", lambda *a, **k: [])
     monkeypatch.setattr(cli, "enter_phase", lambda *a, **k: __import__("contextlib").ExitStack())
 
     rc = cli.main(

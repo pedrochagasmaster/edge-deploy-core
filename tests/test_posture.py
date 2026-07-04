@@ -9,9 +9,13 @@ import pytest
 from edge_deploy.config import NodeConfig, OperatorConfig
 from edge_deploy.posture import (
     PHASE_ENDPOINTS,
+    PHASE_GIT_PROBES,
     Endpoint,
     PostureError,
     endpoints_for,
+    git_probe_command,
+    git_probe_failures,
+    posture_failures,
     probe,
     require_posture,
 )
@@ -122,3 +126,91 @@ def test_phase_endpoints_matches_d6() -> None:
         "tag_github": ("github",),
         "tag_bitbucket": ("bitbucket",),
     }
+
+
+# ---------------------------------------------------------------------------
+# Protocol-level git probes (ADR-0012): TCP connects lie behind the proxy.
+# ---------------------------------------------------------------------------
+
+
+def test_phase_git_probes_match_each_phase_access_direction() -> None:
+    assert PHASE_GIT_PROBES == {
+        "verify": {"github-api": ("origin", "read")},
+        "publish": {"bitbucket": ("bitbucket", "write")},
+        "deploy": {"bitbucket": ("bitbucket", "read")},
+        "tag_github": {"github": ("origin", "write")},
+        "tag_bitbucket": {"bitbucket": ("bitbucket", "write")},
+    }
+
+
+def test_git_probe_command_write_is_dry_run_force_push() -> None:
+    command = git_probe_command("origin", "write")
+
+    assert command[:3] == ["git", "push", "--dry-run"]
+    assert "--force" in command
+    assert command[-1] == "HEAD:refs/edge-deploy/posture-probe"
+
+
+def test_git_probe_command_read_is_ls_remote_head() -> None:
+    assert git_probe_command("bitbucket", "read") == ["git", "ls-remote", "bitbucket", "HEAD"]
+
+
+def test_git_probe_failures_describe_command_and_exit_code(tmp_path) -> None:
+    ran: list[tuple[list[str], object]] = []
+
+    def failing_runner(command: list[str], repo_root) -> int:
+        ran.append((command, repo_root))
+        return 128
+
+    failures = git_probe_failures("tag_github", tmp_path, runner=failing_runner)
+
+    assert len(ran) == 1
+    assert len(failures) == 1
+    assert failures[0].startswith("github (")
+    assert "exited 128" in failures[0]
+
+
+def test_git_probe_failures_empty_without_repo_root() -> None:
+    def exploding_runner(command: list[str], repo_root) -> int:
+        raise AssertionError("git probes must not run without a checkout")
+
+    assert git_probe_failures("tag_github", None, runner=exploding_runner) == []
+
+
+def test_posture_failures_skips_tcp_for_git_probed_endpoints(tmp_path) -> None:
+    connected_hosts: list[str] = []
+
+    def tracking_connect(address: tuple[str, int], timeout: float) -> object:
+        connected_hosts.append(address[0])
+        return SimpleNamespace(close=lambda: None)
+
+    failures = posture_failures(
+        "publish",
+        None,
+        connect=tracking_connect,
+        repo_root=tmp_path,
+        git_runner=lambda command, repo_root: 0,
+    )
+
+    assert failures == []
+    # bitbucket is protocol-probed, so no TCP connect is made for it.
+    assert connected_hosts == []
+
+
+def test_require_posture_raises_on_git_probe_failure(tmp_path) -> None:
+    def fake_connect(address: tuple[str, int], timeout: float) -> object:
+        return SimpleNamespace(close=lambda: None)
+
+    with pytest.raises(PostureError) as exc_info:
+        require_posture(
+            "tag_github",
+            None,
+            next_command="python -m edge_deploy tag-github --run run-1",
+            connect=fake_connect,
+            repo_root=tmp_path,
+            git_runner=lambda command, repo_root: 128,
+        )
+
+    message = str(exc_info.value)
+    assert "phase 'tag_github' requires posture [github]" in message
+    assert "exited 128" in message

@@ -131,8 +131,8 @@ class RunLedger:
                 "verify": _empty_phase(),
                 "publish": _empty_phase(),
                 "deploy": {node: _empty_phase() for node in nodes},
-                "tag_github": _empty_phase(),
                 "tag_bitbucket": _empty_phase(),
+                "tag_github": _empty_phase(),
             },
         }
         _write_json_atomic(run_dir / "state.json", state)

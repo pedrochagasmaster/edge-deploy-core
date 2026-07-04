@@ -25,6 +25,20 @@ from edge_deploy.tmux_driver import AuthenticationError
 # Sibling Tool repos live next to edge-deploy-core (…/Projects/{autobench,robocop}).
 PROJECTS_ROOT = Path(__file__).resolve().parents[2]
 
+@pytest.fixture(autouse=True)
+def _no_real_git_posture_probes(monkeypatch):
+    """Posture git probes (ADR-0012) must never run real git in tests.
+
+    The default probe runner is replaced with an always-passing stub; tests
+    that exercise probe failures inject their own ``runner=`` / ``git_runner=``
+    or patch ``git_probe_failures`` directly.
+    """
+    monkeypatch.setattr(
+        "edge_deploy.posture._default_git_probe_runner",
+        lambda command, repo_root: 0,
+    )
+
+
 # A permission payload where every gate passes (used as the rollout default).
 OK_PERMISSIONS: dict[str, Any] = {
     "root_traversable": True,
