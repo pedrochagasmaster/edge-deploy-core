@@ -1,0 +1,1083 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>edge-deploy-core — Architecture &amp; Workflow</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg2: #161b22;
+    --bg3: #1c2129;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --amber: #d29922;
+    --red: #f85149;
+    --purple: #bc8cff;
+    --orange: #ffa657;
+    --mono: "Cascadia Code", "SF Mono", Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+  }
+  #progress {
+    position: fixed; top: 0; left: 0; height: 3px; width: 0; z-index: 200;
+    background: linear-gradient(90deg, var(--accent), var(--purple));
+    transition: width .1s linear;
+  }
+  nav {
+    position: sticky; top: 0; z-index: 100;
+    background: rgba(13,17,23,.92); backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 4px;
+    padding: 10px 24px; flex-wrap: wrap;
+  }
+  nav .brand { font-weight: 700; margin-right: 16px; font-family: var(--mono); font-size: 14px; }
+  nav .brand span { color: var(--accent); }
+  nav a {
+    color: var(--muted); text-decoration: none; font-size: 13px;
+    padding: 4px 10px; border-radius: 6px;
+  }
+  nav a:hover { color: var(--text); background: var(--bg3); }
+  nav a.active { color: var(--accent); background: rgba(88,166,255,.1); }
+  main { max-width: 1060px; margin: 0 auto; padding: 24px; }
+  section { margin: 56px 0; scroll-margin-top: 64px; }
+  section.fade { opacity: 0; transform: translateY(16px); transition: opacity .6s ease, transform .6s ease; }
+  section.fade.in { opacity: 1; transform: none; }
+  h1 { font-size: 34px; line-height: 1.2; }
+  h2 { font-size: 24px; margin-bottom: 6px; }
+  h2 .num { color: var(--accent); font-family: var(--mono); font-size: 16px; margin-right: 8px; }
+  .sub { color: var(--muted); margin-bottom: 20px; max-width: 760px; }
+  .hero { padding: 48px 0 8px; }
+  .hero .tagline { color: var(--muted); font-size: 18px; max-width: 780px; margin: 14px 0 20px; }
+  .pill-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .pill {
+    font-family: var(--mono); font-size: 12px; padding: 4px 12px;
+    border: 1px solid var(--border); border-radius: 999px; color: var(--muted);
+  }
+  .pill b { color: var(--text); font-weight: 600; }
+  code, .mono { font-family: var(--mono); font-size: .92em; }
+  code { background: var(--bg3); padding: 1px 6px; border-radius: 4px; }
+  .card {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 10px; padding: 18px 20px;
+  }
+  .terminal {
+    background: #0a0d12; border: 1px solid var(--border); border-radius: 8px;
+    font-family: var(--mono); font-size: 12.5px; padding: 14px 16px;
+    white-space: pre-wrap; word-break: break-word; line-height: 1.55;
+    overflow-y: auto; max-height: 420px;
+  }
+  .terminal .ok { color: var(--green); }
+  .terminal .err { color: var(--red); }
+  .terminal .warn { color: var(--amber); }
+  .terminal .dim { color: var(--muted); }
+  .terminal .cmd { color: var(--accent); }
+  button {
+    font-family: inherit; font-size: 13px; cursor: pointer;
+    background: var(--bg3); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 7px 14px;
+    transition: all .15s;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  button.primary:hover:not(:disabled) { background: #388bfd; color: #fff; }
+  button.danger:hover:not(:disabled) { border-color: var(--red); color: var(--red); }
+  button.enter { border-color: var(--amber); color: var(--amber); animation: pulse-a 1.6s infinite; }
+  @keyframes pulse-a { 0%,100% { box-shadow: 0 0 0 0 rgba(210,153,34,.35); } 50% { box-shadow: 0 0 0 6px rgba(210,153,34,0); } }
+
+  /* ── big picture flow ── */
+  .actor-flow { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; align-items: stretch; }
+  .actor {
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px; position: relative; margin-right: 28px;
+  }
+  .actor:last-child { margin-right: 0; }
+  .actor:not(:last-child)::after {
+    content: "→"; position: absolute; right: -22px; top: 50%;
+    transform: translateY(-50%); color: var(--muted); font-size: 18px;
+  }
+  .actor .role { font-weight: 700; font-size: 14px; margin-bottom: 4px; }
+  .actor .role.c { color: var(--green); } .actor .role.m { color: var(--accent); }
+  .actor .role.o { color: var(--orange); } .actor .role.n { color: var(--purple); }
+  .actor p { font-size: 12.5px; color: var(--muted); }
+  .callout {
+    border-left: 3px solid var(--accent); background: var(--bg2);
+    padding: 12px 16px; border-radius: 0 8px 8px 0; margin-top: 18px;
+    font-size: 14px; color: var(--muted);
+  }
+  .callout b { color: var(--text); }
+  .callout.warn { border-left-color: var(--amber); }
+
+  /* ── topology ── */
+  .topo-wrap { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px 4px; margin-bottom: 18px; }
+  .topo-wrap svg { width: 100%; height: auto; display: block; }
+  .tbox { fill: var(--bg3); stroke: var(--border); rx: 8; }
+  .tbox.up { stroke: var(--green); }
+  .tlabel { fill: var(--text); font-family: var(--mono); font-size: 12px; }
+  .tsub { fill: var(--muted); font-family: var(--mono); font-size: 9.5px; }
+  .link { stroke: #333c46; stroke-width: 2; fill: none; }
+  .link.up { stroke: var(--green); opacity: .75; }
+  .link.flow { stroke: var(--accent); stroke-width: 2.5; stroke-dasharray: 7 5; animation: dashmove 0.7s linear infinite; }
+  @keyframes dashmove { to { stroke-dashoffset: -12; } }
+  .wallline { stroke: var(--amber); stroke-width: 1.5; stroke-dasharray: 4 6; opacity: .6; }
+
+  /* ── posture / simulator ── */
+  .sim-grid { display: grid; grid-template-columns: 300px 1fr; gap: 18px; align-items: start; }
+  @media (max-width: 820px) { .sim-grid, .actor-flow { grid-template-columns: 1fr; } .actor { margin-right: 0; margin-bottom: 24px; } .actor:not(:last-child)::after { content: "↓"; right: 50%; top: auto; bottom: -22px; transform: translateX(50%); } }
+  .posture-box h3, .ledger-box h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: 10px; }
+  .posture-btn {
+    display: flex; align-items: center; gap: 10px; width: 100%;
+    text-align: left; padding: 10px 12px; margin-bottom: 8px; border-radius: 8px;
+  }
+  .posture-btn .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--border); flex-shrink: 0; }
+  .posture-btn.active { border-color: var(--amber); background: rgba(210,153,34,.08); }
+  .posture-btn.active .dot { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
+  .endpoints { margin-top: 14px; font-family: var(--mono); font-size: 11.5px; }
+  .endpoints div { display: flex; align-items: center; gap: 8px; padding: 3px 0; color: var(--muted); }
+  .endpoints .lamp { width: 8px; height: 8px; border-radius: 50%; background: #444; flex-shrink: 0; }
+  .endpoints .lamp.up { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .probe-note { font-size: 11px; color: var(--muted); margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px; }
+  .phase-track { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
+  .phase-chip {
+    flex: 1; min-width: 108px; text-align: center; padding: 8px 6px;
+    border: 1px solid var(--border); border-radius: 8px;
+    font-family: var(--mono); font-size: 12px; color: var(--muted);
+    position: relative; transition: all .2s;
+  }
+  .phase-chip .st { display: block; font-size: 10px; margin-top: 2px; }
+  .phase-chip.passed { border-color: var(--green); color: var(--green); background: rgba(63,185,80,.07); }
+  .phase-chip.failed { border-color: var(--red); color: var(--red); background: rgba(248,81,73,.07); }
+  .phase-chip.next { border-color: var(--accent); color: var(--accent); animation: pulse 1.6s infinite; }
+  @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(88,166,255,.35); } 50% { box-shadow: 0 0 0 5px rgba(88,166,255,0); } }
+  .node-row { display: flex; gap: 8px; margin: 10px 0 14px; }
+  .node-chip {
+    font-family: var(--mono); font-size: 11.5px; padding: 4px 10px;
+    border: 1px solid var(--border); border-radius: 6px; color: var(--muted);
+  }
+  .node-chip.passed { border-color: var(--green); color: var(--green); }
+  .node-chip.failed { border-color: var(--red); color: var(--red); }
+  .sim-controls { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+
+  /* ── deploy sequence ── */
+  .seq { list-style: none; counter-reset: step; }
+  .seq li {
+    counter-increment: step; position: relative;
+    padding: 10px 14px 10px 52px; margin-bottom: 8px;
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 8px;
+    cursor: pointer; transition: border-color .15s;
+  }
+  .seq li:hover { border-color: var(--accent); }
+  .seq li.hl { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .seq li::before {
+    content: counter(step); position: absolute; left: 14px; top: 12px;
+    width: 24px; height: 24px; border-radius: 50%; background: var(--bg3);
+    border: 1px solid var(--border); color: var(--accent);
+    font-family: var(--mono); font-size: 12px; display: flex;
+    align-items: center; justify-content: center;
+  }
+  .seq li .t { font-weight: 600; font-size: 14px; }
+  .seq li .d { font-size: 13px; color: var(--muted); display: none; margin-top: 4px; }
+  .seq li.open .d { display: block; }
+  .seq li .hint { float: right; color: var(--muted); font-size: 11px; font-family: var(--mono); }
+
+  /* ── pane demo ── */
+  .tabbar { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
+  .tabbar button.active { border-color: var(--accent); color: var(--accent); background: rgba(88,166,255,.08); }
+  .pane-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 820px) { .pane-cols { grid-template-columns: 1fr; } }
+  .pane-cols h4 { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 6px; }
+
+  /* ── modules ── */
+  .mod-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
+  .mod {
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px 14px; cursor: pointer; transition: all .15s;
+  }
+  .mod:hover, .mod.sel { border-color: var(--accent); }
+  .mod .name { font-family: var(--mono); font-size: 13px; color: var(--accent); }
+  .mod .one { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .mod-detail { margin-top: 14px; display: none; }
+  .mod-detail.show { display: block; }
+
+  /* ── ADRs ── */
+  .adr { border-left: 2px solid var(--border); margin-left: 8px; padding-left: 22px; position: relative; padding-bottom: 18px; }
+  .adr::before {
+    content: ""; position: absolute; left: -6px; top: 6px;
+    width: 10px; height: 10px; border-radius: 50%; background: var(--accent);
+  }
+  .adr.new::before { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
+  .adr .id { font-family: var(--mono); font-size: 12px; color: var(--accent); }
+  .adr .tag-new { font-family: var(--mono); font-size: 10px; color: var(--amber); border: 1px solid var(--amber); border-radius: 999px; padding: 1px 8px; margin-left: 6px; }
+  .adr .t { font-weight: 600; cursor: pointer; }
+  .adr .t:hover { color: var(--accent); }
+  .adr .body { font-size: 13.5px; color: var(--muted); display: none; margin-top: 4px; max-width: 720px; }
+  .adr.open .body { display: block; }
+
+  /* ── glossary ── */
+  .glos-search {
+    width: 100%; max-width: 380px; margin-bottom: 14px;
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 8px;
+    color: var(--text); font-family: inherit; font-size: 13.5px; padding: 8px 14px;
+  }
+  .glos-search:focus { outline: none; border-color: var(--accent); }
+  .glos { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; }
+  .glos .g {
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px;
+  }
+  .glos .g b { color: var(--orange); }
+  .glos .g p { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+  footer { border-top: 1px solid var(--border); margin-top: 60px; padding: 24px; text-align: center; color: var(--muted); font-size: 12.5px; }
+  .invariant {
+    text-align: center; font-family: var(--mono); font-size: 14px;
+    border: 1px dashed var(--amber); color: var(--amber);
+    border-radius: 10px; padding: 14px; margin: 24px auto; max-width: 720px;
+  }
+</style>
+</head>
+<body>
+<div id="progress"></div>
+
+<nav id="topnav">
+  <div class="brand">edge-deploy-<span>core</span></div>
+  <a href="#overview">Overview</a>
+  <a href="#lifecycle">Lifecycle</a>
+  <a href="#simulator">Release simulator</a>
+  <a href="#deploy">Deploy sequence</a>
+  <a href="#pane">Pane-safe transport</a>
+  <a href="#modules">Modules</a>
+  <a href="#adrs">ADRs</a>
+  <a href="#glossary">Glossary</a>
+</nav>
+
+<main>
+
+<div class="hero" id="overview">
+  <h1>Publishing reviewed code across an air gap, one firewall posture at a time.</h1>
+  <p class="tagline">
+    <strong>edge-deploy-core</strong> is an operator-only Python package that publishes reviewed
+    Autobench and Dispatch commits from GitHub to corporate Bitbucket, and deploys them to
+    Hadoop Edge Nodes — through exclusive firewall postures, interactive RSA authentication,
+    and a lossy screen-scraped terminal channel. Every release is a durable, resumable
+    <strong>run-ledger state machine</strong>.
+  </p>
+  <div class="pill-row">
+    <div class="pill"><b>v1.3.0</b> · Python 3.10 / 3.12</div>
+    <div class="pill"><b>Runs on</b> operator workstation only</div>
+    <div class="pill"><b>Nodes</b> never import this package</div>
+    <div class="pill"><b>12</b> ADRs</div>
+    <div class="pill"><b>2</b> posture switches per release</div>
+  </div>
+  <div class="invariant">
+    GitHub main == Bitbucket main == release tag == deployed Edge state<br>
+    <span style="color:var(--muted)">— all four must identify the same full source SHA</span>
+  </div>
+</div>
+
+<section id="lifecycle">
+  <h2><span class="num">01</span>Code lifecycle: who touches what</h2>
+  <p class="sub">Development is normal GitHub flow — contributors never need Bitbucket, Edge access, SSH,
+  Kerberos, or RSA credentials. Only the Release Operator crosses the boundary.</p>
+  <div class="actor-flow">
+    <div class="actor">
+      <div class="role c">Contributor</div>
+      <p>Develops locally or through Cursor. Opens a GitHub pull request. Needs nothing beyond GitHub.</p>
+    </div>
+    <div class="actor">
+      <div class="role m">Maintainer</div>
+      <p>Reviews and <b>squash-merges</b> the PR after CI and human approval. GitHub <code>main</code> is the single source of truth.</p>
+    </div>
+    <div class="actor">
+      <div class="role o">Release Operator</div>
+      <p>Explicitly releases merged <code>main</code>: <b>Publish</b> fast-forwards the exact reviewed commit to Bitbucket, then <b>Deploy</b> applies it to Edge Nodes.</p>
+    </div>
+    <div class="actor">
+      <div class="role n">Edge Nodes</div>
+      <p>Run each Tool's own <code>update.sh</code> / <code>install.sh</code>. Verified for final commit, drift, permissions, and smoke checks.</p>
+    </div>
+  </div>
+  <div class="callout">
+    <b>Why the split?</b> The workstation's firewall posture is <em>exclusive</em>: at any moment at most one of
+    GitHub <em>or</em> Bitbucket-plus-Edge is writable — never both. Switching posture is a human act outside
+    the engine's control, takes up to a minute to propagate, and everything crosses a corporate proxy that
+    <em>accepts TCP connects in every posture</em> and only fails at the HTTP layer. The whole architecture
+    flows from these constraints.
+  </div>
+</section>
+
+<section id="simulator">
+  <h2><span class="num">02</span>Interactive release simulator</h2>
+  <p class="sub">A Release is a run-ledger state machine advanced by short, idempotent, <em>posture-scoped</em>
+  phase commands (ADR-0008). Since ADR-0012 the tag order is <b>tag-bitbucket before tag-github</b>, so a release
+  needs only <b>two</b> posture switches: github → bitbucket+edge → github. Switch the firewall on the left, then
+  run phases — or try <b>guided mode</b>, which absorbs the posture transients for you.</p>
+
+  <div class="topo-wrap">
+    <svg viewBox="0 0 680 300" xmlns="http://www.w3.org/2000/svg" aria-label="network topology">
+      <!-- links (drawn first, under boxes) -->
+      <path id="lk-gh" class="link" d="M 200 150 C 300 150 340 62 450 62"/>
+      <path id="lk-bb" class="link" d="M 200 150 L 450 150"/>
+      <path id="lk-n3" class="link" d="M 200 150 C 300 150 330 246 450 246"/>
+      <path id="lk-n4" class="link" d="M 200 160 C 310 165 350 276 452 276"/>
+      <path id="lk-bn" class="link" d="M 540 182 L 540 232" stroke-dasharray="3 4"/>
+      <!-- firewall wall -->
+      <line class="wallline" x1="325" y1="14" x2="325" y2="286"/>
+      <text x="325" y="10" text-anchor="middle" class="tsub" fill="#d29922">🔥 corporate proxy · exclusive posture: <tspan id="topo-posture" fill="#d29922">none</tspan></text>
+      <!-- workstation -->
+      <rect class="tbox" x="20" y="112" width="180" height="76" rx="8"/>
+      <text class="tlabel" x="110" y="140" text-anchor="middle">operator workstation</text>
+      <text class="tsub" x="110" y="158" text-anchor="middle">edge-deploy-core · run ledger</text>
+      <text class="tsub" x="110" y="172" text-anchor="middle">psmux panes · RSA</text>
+      <!-- github -->
+      <rect id="bx-gh" class="tbox" x="450" y="34" width="200" height="56" rx="8"/>
+      <text class="tlabel" x="550" y="58" text-anchor="middle">GitHub</text>
+      <text class="tsub" x="550" y="74" text-anchor="middle">origin · PRs · CI · release tags</text>
+      <!-- bitbucket -->
+      <rect id="bx-bb" class="tbox" x="450" y="122" width="200" height="56" rx="8"/>
+      <text class="tlabel" x="550" y="146" text-anchor="middle">Bitbucket</text>
+      <text class="tsub" x="550" y="162" text-anchor="middle">mirror main · tags · release-log</text>
+      <!-- nodes -->
+      <rect id="bx-n3" class="tbox" x="450" y="226" width="96" height="42" rx="8"/>
+      <text class="tlabel" x="498" y="245" text-anchor="middle">node03</text>
+      <text class="tsub" x="498" y="259" text-anchor="middle">ssh :22</text>
+      <rect id="bx-n4" class="tbox" x="554" y="226" width="96" height="42" rx="8"/>
+      <text class="tlabel" x="602" y="245" text-anchor="middle">node04</text>
+      <text class="tsub" x="602" y="259" text-anchor="middle">ssh :22</text>
+      <text class="tsub" x="110" y="288">green link = writable in current posture · blue dashes = phase traffic</text>
+    </svg>
+  </div>
+
+  <div class="sim-grid">
+    <div class="card posture-box">
+      <h3>🔥 Firewall posture <span style="text-transform:none;color:var(--muted)">(you switch this by hand)</span></h3>
+      <button class="posture-btn" data-posture="github" onclick="setPosture('github')">
+        <span class="dot"></span><span><b>github</b><br><span style="font-size:11px;color:var(--muted)">GitHub API + origin writable</span></span>
+      </button>
+      <button class="posture-btn" data-posture="bbedge" onclick="setPosture('bbedge')">
+        <span class="dot"></span><span><b>bitbucket + edge</b><br><span style="font-size:11px;color:var(--muted)">Bitbucket + Edge Nodes writable</span></span>
+      </button>
+      <button class="posture-btn" data-posture="none" onclick="setPosture('none')">
+        <span class="dot"></span><span><b>none / switching…</b><br><span style="font-size:11px;color:var(--muted)">endpoints failing transiently</span></span>
+      </button>
+      <div class="endpoints">
+        <div><span class="lamp" id="ep-gh"></span> origin — git read/write probe</div>
+        <div><span class="lamp" id="ep-bb"></span> bitbucket — git write probe</div>
+        <div><span class="lamp" id="ep-e1"></span> edge-node03:22 — tcp</div>
+        <div><span class="lamp" id="ep-e2"></span> edge-node04:22 — tcp</div>
+      </div>
+      <div class="probe-note"><b style="color:var(--text)">TCP probes lie here</b> — the proxy accepts TCP
+      connects in <em>every</em> posture. Git endpoints are probed at protocol level:
+      <code>git ls-remote</code> for reads, <code>git push --dry-run</code> against
+      <code>refs/edge-deploy/posture-probe</code> for writes (ADR-0012). Only Edge SSH stays TCP-probed.</div>
+    </div>
+
+    <div class="card ledger-box">
+      <h3>📒 Run ledger — <span class="mono" style="text-transform:none" id="run-id">no open run</span></h3>
+      <div class="phase-track" id="phase-track">
+        <div class="phase-chip" data-phase="verify">verify<span class="st">pending</span></div>
+        <div class="phase-chip" data-phase="publish">publish<span class="st">pending</span></div>
+        <div class="phase-chip" data-phase="deploy">deploy<span class="st">pending</span></div>
+        <div class="phase-chip" data-phase="tag_bitbucket">tag-bitbucket<span class="st">pending</span></div>
+        <div class="phase-chip" data-phase="tag_github">tag-github<span class="st">pending</span></div>
+      </div>
+      <div class="node-row" id="node-row" style="display:none">
+        <span style="font-size:11px;color:var(--muted);align-self:center">nodes:</span>
+        <span class="node-chip" id="nd-3">node03</span>
+        <span class="node-chip" id="nd-4">node04</span>
+      </div>
+      <div class="sim-controls">
+        <button class="primary" id="btn-create" onclick="simCreate()">release --tool autobench</button>
+        <button id="btn-guided" onclick="simGuided()">release --guided</button>
+        <button id="btn-phase" onclick="simRunPhase()" disabled>run next phase</button>
+        <button id="btn-enter" class="enter" onclick="guidedEnter()" style="display:none">⏎ press Enter (switched)</button>
+        <button id="btn-status" onclick="simStatus()" disabled>status</button>
+        <button id="btn-rollback" onclick="simRollback()" style="display:none">rollback --tag …</button>
+        <button id="btn-abandon" class="danger" onclick="simAbandon()" disabled>abandon</button>
+        <button id="btn-reset" onclick="simReset()">reset</button>
+      </div>
+      <div class="terminal" id="sim-term"><span class="dim"># python -m edge_deploy …
+# Create a run to begin. The ledger is written to disk BEFORE any remote mutation.
+# Tip: try "release --guided" and follow the prompts — Enter also works on your keyboard.</span></div>
+    </div>
+  </div>
+
+  <div class="callout" style="margin-top:16px">
+    <b>Durability rules:</b> at most one open Run per Tool — starting a new release while one is open is
+    <em>refused</em> with the legal options (continue, abandon, scoped deploy). <code>run.lock</code> (PID + hostname)
+    blocks concurrent controllers. Every phase entry compares the ledger's <b>Engine Identity</b>
+    (<code>engine.content_sha256</code>) to the running process and refuses skew. A failed node retries with
+    <code>deploy --nodes node04</code> without re-running verify or publish.
+  </div>
+  <div class="callout warn">
+    <b>Guided mode (ADR-0010 + ADR-0012):</b> after you confirm a posture switch, the engine polls the probes for
+    up to ~90 s while the switch propagates, then continues. If a phase still hits a transient remote error right
+    after a switch (an HTTP 503 from the proxy, <code>git ls-remote</code> exit 128), guided mode retries the phase
+    with 10/20/30 s backoff — safe because phases are idempotent and ledger-guarded. Ctrl+C pauses cleanly: the run
+    stays open and the resume command is printed. Unguided invocations still fail fast.
+  </div>
+</section>
+
+<section id="deploy">
+  <h2><span class="num">03</span>Inside the deploy phase — per node</h2>
+  <p class="sub">Deploy fans out per node and <b>continues-and-reports</b> on failure (ADR-0003) — there is no
+  auto-rollback; rollback is an explicit operator act that replays a recorded release tag through the same
+  phase chain. Click a step to expand it, or
+  <button style="font-size:12px;padding:3px 10px" onclick="playDeploySeq()">▶ play the sequence</button></p>
+  <ol class="seq" id="deploy-seq">
+    <li><span class="hint">auth.py</span><span class="t">AuthBroker — interactive secret boundary</span>
+      <div class="d">Deploy is the only phase that authenticates. The operator types the RSA passcode into the controller
+      tmux pane when prompted; the progress heartbeat shows <code>&gt;&gt;&gt; WAITING FOR OPERATOR — …</code>.
+      Credentials are never persisted (ADR-0002).</div></li>
+    <li><span class="hint">dependencies.py</span><span class="t">Dependency bundle delivery</span>
+      <div class="d">Dependencies are first-class (ADR-0006, contract v1.1.0): content-addressed bundles built locally,
+      delivered to the node, never committed. A rollout is <em>refused outright</em> if dependencies changed
+      relative to what the snapshot expects (ADR-0005) — no silent partial upgrades.</div></li>
+    <li><span class="hint">runner.py</span><span class="t">Checkout update to the exact Snapshot</span>
+      <div class="d">The node's checkout is moved to the exact published commit. Every judgement afterwards compares
+      against the <b>Snapshot's tree</b> — never the operator's working tree, which may have moved on.</div></li>
+    <li><span class="hint">tool's install.sh</span><span class="t">Install trigger</span>
+      <div class="d">The engine invokes the Tool's own <code>install.sh</code> per the standard on-node deploy interface
+      (ADR-0004). Nodes never import edge-deploy-core; the contract is files and exit codes.</div></li>
+    <li><span class="hint">tool profile</span><span class="t">Smoke checks</span>
+      <div class="d">Smoke commands come from the committed <code>edge_deploy.yaml</code> Tool Profile — node-independent
+      release metadata, no operator paths or credentials.</div></li>
+    <li><span class="hint">drift.py</span><span class="t">Drift detection</span>
+      <div class="d">Drift = any difference between runtime-critical files in the released commit and files on the node.
+      Paths are enumerated from the <em>snapshot tree</em>, not the working tree. Evidence is written to files on the
+      node and read back verbatim (ADR-0009) — no parsing of scrolled terminal output.</div></li>
+  </ol>
+</section>
+
+<section id="pane">
+  <h2><span class="num">04</span>Pane-safe transport: the hostile channel</h2>
+  <p class="sub">Kerberos/RSA policy rules out scp, sftp, and SSH multiplexing. The <b>only</b> channel to a node is the
+  Authenticated Pane — a psmux (Windows tmux) pane holding an RSA-authenticated SSH session. It is a lossy,
+  screen-scraped <em>text</em> channel, not a byte pipe. Each corruption below caused a real production failure
+  masquerading as a later-stage error (ADR-0011). Toggle the failure modes:</p>
+
+  <div class="tabbar" id="pane-tabs">
+    <button class="active" onclick="paneTab(0,this)">newline truncation</button>
+    <button onclick="paneTab(1,this)">quote stripping</button>
+    <button onclick="paneTab(2,this)">screen wrap</button>
+    <button onclick="paneTab(3,this)">CRLF poisoning</button>
+  </div>
+  <div class="pane-cols">
+    <div>
+      <h4>What you send</h4>
+      <div class="terminal" id="pane-in"></div>
+    </div>
+    <div>
+      <h4>What the pane delivers</h4>
+      <div class="terminal" id="pane-out"></div>
+    </div>
+  </div>
+  <div class="callout" id="pane-note"></div>
+
+  <div class="card" style="margin-top:18px">
+    <h3 style="font-size:14px;margin-bottom:8px">The protocol (tmux_driver.py + runner.py)</h3>
+    <ul style="font-size:13.5px;color:var(--muted);padding-left:20px">
+      <li><b style="color:var(--text)">Single-line commands only</b> — payloads travel as base64, decoded on the node, never raw source.</li>
+      <li><b style="color:var(--text)">Files move as chunked base64</b> (bounded line length) appended to a staging file, decoded by a Python one-liner that is <em>itself</em> base64-piped — so no quoting survives or matters.</li>
+      <li><b style="color:var(--text)">Interpreter resolved, not assumed</b> — tries <code>python3.11</code> → <code>python3.10</code> → <code>python3</code> → known sys_apps path.</li>
+      <li><b style="color:var(--text)">Reads between unique sentinels with digest verification</b> — <code>__EDGE_RESULT_START__</code> / SHA-256 / <code>__EDGE_RESULT_END__</code>; wrap-whitespace stripped before decode; the digest matched bottom-up as an exact 64-hex line.</li>
+      <li><b style="color:var(--text)">Everything staged locally is written LF-only</b>, and runner invocations check exit codes immediately — a broken script fails at the invocation with the screen attached, not two calls later.</li>
+    </ul>
+  </div>
+</section>
+
+<section id="modules">
+  <h2><span class="num">05</span>Module boundaries</h2>
+  <p class="sub">One responsibility per module. Click a module for its contract.</p>
+  <div class="mod-grid" id="mod-grid"></div>
+  <div class="card mod-detail" id="mod-detail"></div>
+</section>
+
+<section id="adrs">
+  <h2><span class="num">06</span>Architecture decisions</h2>
+  <p class="sub">Twelve ADRs, each earned the hard way. Click to expand, or
+  <button style="font-size:12px;padding:3px 10px" onclick="toggleAllAdrs()" id="adr-all">expand all</button></p>
+  <div id="adr-list"></div>
+</section>
+
+<section id="glossary">
+  <h2><span class="num">07</span>Domain language</h2>
+  <p class="sub">The project keeps a strict shared vocabulary in <code>CONTEXT.md</code>.</p>
+  <input class="glos-search" id="glos-search" type="search" placeholder="Filter terms… (e.g. posture, drift, pane)">
+  <div class="glos" id="glos"></div>
+</section>
+
+</main>
+
+<footer>
+  Generated from CONTEXT.md, docs/DESIGN.md, docs/release-workflow.md and docs/adr/ ·
+  edge-deploy-core v1.3.0 · single-file, dependency-free HTML
+</footer>
+
+<script>
+/* ───────────── shared helpers ───────────── */
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+/* ───────────── posture + topology ───────────── */
+const POSTURES = {
+  github: { eps: { gh:true, bb:false, e1:false, e2:false }, label: "github" },
+  bbedge: { eps: { gh:false, bb:true, e1:true, e2:true }, label: "bitbucket+edge" },
+  none:   { eps: { gh:false, bb:false, e1:false, e2:false }, label: "none" },
+};
+/* ADR-0012 order: tag_bitbucket before tag_github — two posture switches */
+const PHASES = [
+  { key:"verify",        cmd:"verify",        posture:"github", need:"github",
+    probes:[["gh","git ls-remote origin HEAD"]],
+    un:"origin (git ls-remote: exit 128)", flow:["gh"] },
+  { key:"publish",       cmd:"publish-phase", posture:"bbedge", need:"bitbucket",
+    probes:[["bb","git push --dry-run --force bitbucket HEAD:refs/edge-deploy/posture-probe"]],
+    un:"bitbucket (git push --dry-run: HTTP 503)", flow:["bb"] },
+  { key:"deploy",        cmd:"deploy",        posture:"bbedge", need:"bitbucket+edge",
+    probes:[["bb","git push --dry-run --force bitbucket HEAD:refs/edge-deploy/posture-probe"],["e1","tcp edge-node03:22"],["e2","tcp edge-node04:22"]],
+    un:"bitbucket (git push --dry-run: HTTP 503), edge-node03:22, edge-node04:22", flow:["bb","n3","n4","bn"] },
+  { key:"tag_bitbucket", cmd:"tag-bitbucket", posture:"bbedge", need:"bitbucket",
+    probes:[["bb","git push --dry-run --force bitbucket HEAD:refs/edge-deploy/posture-probe"]],
+    un:"bitbucket (git push --dry-run: HTTP 503)", flow:["bb"] },
+  { key:"tag_github",    cmd:"tag-github",    posture:"github", need:"github",
+    probes:[["gh","git push --dry-run --force origin HEAD:refs/edge-deploy/posture-probe"]],
+    un:"origin (git push --dry-run: HTTP 503)", flow:["gh"] },
+];
+let posture = "none";
+let sim = null; /* { runId, kind, idx, deployRetried, guided, guidedWaiting, justSwitched, complete } */
+let lastTag = null;
+let busy = false;
+
+function setPosture(p) {
+  posture = p;
+  document.querySelectorAll(".posture-btn").forEach(b =>
+    b.classList.toggle("active", b.dataset.posture === p));
+  const eps = POSTURES[p].eps;
+  $("ep-gh").className = "lamp" + (eps.gh ? " up":"");
+  $("ep-bb").className = "lamp" + (eps.bb ? " up":"");
+  $("ep-e1").className = "lamp" + (eps.e1 ? " up":"");
+  $("ep-e2").className = "lamp" + (eps.e2 ? " up":"");
+  /* topology */
+  $("topo-posture").textContent = POSTURES[p].label;
+  $("lk-gh").classList.toggle("up", eps.gh);
+  $("lk-bb").classList.toggle("up", eps.bb);
+  $("lk-n3").classList.toggle("up", eps.e1);
+  $("lk-n4").classList.toggle("up", eps.e2);
+  $("lk-bn").classList.toggle("up", eps.bb && eps.e1);
+  $("bx-gh").classList.toggle("up", eps.gh);
+  $("bx-bb").classList.toggle("up", eps.bb);
+  $("bx-n3").classList.toggle("up", eps.e1);
+  $("bx-n4").classList.toggle("up", eps.e2);
+  refreshChips();
+}
+function setFlow(keys) {
+  ["gh","bb","n3","n4","bn"].forEach(k =>
+    $("lk-"+k).classList.toggle("flow", keys.includes(k)));
+}
+
+/* ───────────── terminal ───────────── */
+function termAppend(html) {
+  const t = $("sim-term");
+  t.innerHTML += html;
+  t.scrollTop = t.scrollHeight;
+}
+async function print(lines, gap) {
+  for (const ln of lines) {
+    termAppend((($("sim-term").innerHTML) ? "\n" : "") + ln);
+    await sleep(gap === undefined ? 110 : gap);
+  }
+}
+function termClear(html) { $("sim-term").innerHTML = html || ""; }
+
+/* ───────────── ledger UI ───────────── */
+function refreshChips() {
+  document.querySelectorAll(".phase-chip").forEach((c, i) => {
+    c.classList.remove("passed","failed","next");
+    const st = c.querySelector(".st");
+    if (!sim) { st.textContent = "pending"; return; }
+    if (i < sim.idx) { c.classList.add("passed"); st.textContent = "passed"; }
+    else if (i === sim.idx && !sim.complete) { c.classList.add("next"); st.textContent = "next"; }
+    else st.textContent = "pending";
+  });
+  if (sim && sim.idx === 2 && sim.deployRetried === "partial") {
+    const c = document.querySelectorAll(".phase-chip")[2];
+    c.classList.remove("next"); c.classList.add("failed");
+    c.querySelector(".st").textContent = "node04 failed";
+  }
+  const open = sim && !sim.complete;
+  $("btn-phase").disabled = busy || !open;
+  $("btn-status").disabled = busy || !sim;
+  $("btn-abandon").disabled = busy || !open;
+  $("btn-create").disabled = busy;
+  $("btn-guided").disabled = busy || (sim && sim.guidedWaiting);
+  $("btn-rollback").style.display = (sim && sim.complete && sim.kind === "release" && !busy) ? "" : "none";
+  $("btn-enter").style.display = (sim && sim.guidedWaiting && !busy) ? "" : "none";
+  const next = sim && PHASES[sim.idx];
+  $("btn-phase").textContent = !open ? "run next phase"
+    : (sim.deployRetried === "partial" && sim.idx === 2) ? "deploy --nodes node04"
+    : "run: " + next.cmd;
+}
+
+/* ───────────── probes ───────────── */
+function probeLines(ph, ok) {
+  return ph.probes.map(([ep, cmd]) => {
+    const up = POSTURES[posture].eps[ep === "bb" ? "bb" : ep === "gh" ? "gh" : ep];
+    return '<span class="dim">probe: ' + cmd + ' … </span>' +
+      (up ? '<span class="ok">ok</span>' : '<span class="err">FAIL</span>');
+  });
+}
+
+/* ───────────── create / phases ───────────── */
+function newRunId(kind) {
+  return (kind === "rollback" ? "run-20260703T1530Z-rb-" : "run-20260703T120000Z-") + "aa6d9a5";
+}
+function createRun(kind, guided) {
+  sim = { runId: newRunId(kind), kind: kind, idx: 0, deployRetried: null,
+          guided: !!guided, guidedWaiting: false, justSwitched: false, complete: false };
+  $("run-id").textContent = sim.runId + (kind === "rollback" ? " (rollback)" : "");
+  $("node-row").style.display = "none";
+  $("nd-3").className = "node-chip"; $("nd-4").className = "node-chip";
+}
+async function simCreate() {
+  if (busy) return;
+  if (sim && !sim.complete) {
+    await print(['',
+      '<span class="err">release refused: unresolved run ' + sim.runId + ' for autobench (source aa6d9a5) exists.</span>',
+      'Choose one:',
+      '  1. continue it:   <span class="cmd">python -m edge_deploy release --run ' + sim.runId + '</span>',
+      '  2. abandon it:    <span class="cmd">python -m edge_deploy abandon --run ' + sim.runId + ' --reason "&lt;why&gt;"</span>']);
+    return;
+  }
+  busy = true; refreshChips();
+  createRun("release", false);
+  termClear();
+  await print([
+    '<span class="cmd">$ python -m edge_deploy release --tool autobench</span>',
+    'created <span class="ok">edge-deploy/runs/' + sim.runId + '/</span>',
+    '  state.json      <span class="dim"># tool, source SHA, engine identity, per-phase state</span>',
+    '  events.jsonl    <span class="dim"># append-only event log</span>',
+    '  run.lock        <span class="dim"># PID + hostname — blocks concurrent controllers</span>',
+    '<span class="dim">engine identity recorded: engine.content_sha256=9f2c…e1 — any engine change orphans this run</span>',
+    'next: <span class="cmd">verify</span>   [posture: github]']);
+  busy = false; refreshChips();
+}
+
+async function runPhaseBody(ph) {
+  const retry = (ph.key === "deploy" && sim.deployRetried === "partial");
+  let lines = [];
+  switch (ph.key) {
+    case "verify":
+      lines = sim.kind === "rollback" ? [
+        'source seeded from tag provenance — verifying tag SHA integrity … <span class="ok">ok</span>',
+        '<span class="ok">verify: passed</span>'
+      ] : [
+        'checking clean local main == origin/main … <span class="ok">ok</span>',
+        'GitHub CI for aa6d9a5 … <span class="ok">success</span>',
+        'pytest (recorded once per SHA — skipped on retries unless --reverify) … <span class="ok">passed</span>',
+        '<span class="ok">verify: passed</span>'];
+      break;
+    case "publish":
+      lines = [
+        'fast-forwarding exact ' + (sim.kind === "rollback" ? 'tagged' : 'reviewed') + ' commit aa6d9a5 → bitbucket main',
+        '<span class="dim">never rewrites commits, never force-pushes; tree-equivalent mirror per ADR-0007</span>',
+        '<span class="ok">publish: passed (snapshot bb7c8d1)</span>'];
+      break;
+    case "deploy":
+      $("node-row").style.display = "flex";
+      if (!retry && !sim.guided && sim.kind === "release") {
+        sim.deployRetried = "partial";
+        $("nd-3").className = "node-chip passed";
+        $("nd-4").className = "node-chip failed";
+        await print([
+          'node03: auth ✓ deps ✓ checkout ✓ install ✓ smoke ✓ drift ✓ … <span class="ok">passed</span>',
+          'node04: auth ✓ deps ✓ checkout ✓ install <span class="err">✗ exit 1</span> — <span class="warn">continue-and-report (ADR-0003): no auto-rollback</span>',
+          '<span class="err">deploy: node03=passed node04=failed</span>',
+          'retry just the failed node — verify and publish stay passed in the ledger:',
+          'next: <span class="cmd">python -m edge_deploy deploy --run ' + sim.runId + ' --nodes node04</span>   [posture: bitbucket+edge]'], 160);
+        return false; /* phase not passed */
+      }
+      if (retry) {
+        sim.deployRetried = "done";
+        $("nd-4").className = "node-chip passed";
+        lines = [
+          'node04: auth ✓ deps ✓ checkout ✓ install ✓ smoke ✓ drift ✓ … <span class="ok">passed</span>',
+          '<span class="ok">deploy: node03=passed node04=passed</span>'];
+      } else {
+        $("nd-3").className = "node-chip passed";
+        $("nd-4").className = "node-chip passed";
+        lines = [
+          '<span class="dim">&gt;&gt;&gt; WAITING FOR OPERATOR — enter RSA passcode in the controller pane…</span>',
+          'node03: auth ✓ deps ✓ checkout ✓ install ✓ smoke ✓ drift ✓ … <span class="ok">passed</span>',
+          'node04: auth ✓ deps ✓ checkout ✓ install ✓ smoke ✓ drift ✓ … <span class="ok">passed</span>',
+          '<span class="ok">deploy: node03=passed node04=passed</span>'];
+      }
+      break;
+    case "tag_bitbucket":
+      lastTag = "release-20260703T1200Z-aa6d9a5";
+      lines = [
+        'minting release tag <span class="ok">' + lastTag + '</span> <span class="dim">(first tag phase mints; the other reuses it — ADR-0012)</span>',
+        'pushing immutable tag to bitbucket … <span class="ok">ok</span> <span class="dim">(dereferenced SHA verified against the run ledger)</span>',
+        'appending redacted release bundle to <span class="cmd">release-log</span> branch <span class="dim">(isolated audit worktree, HEAD:refs/heads/release-log)</span>',
+        '<span class="ok">tag-bitbucket: passed</span>'];
+      break;
+    case "tag_github":
+      lines = [
+        'reusing minted tag <span class="ok">' + lastTag + '</span> from run evidence',
+        'pushing immutable tag to origin … <span class="ok">ok</span> <span class="dim">(dereferenced SHA verified against the run ledger)</span>',
+        '<span class="ok">tag-github: passed</span>'];
+      break;
+  }
+  await print(lines, 160);
+  return true;
+}
+
+async function runOnePhase(manual) {
+  const ph = PHASES[sim.idx];
+  const retry = (ph.key === "deploy" && sim.deployRetried === "partial");
+  const cmdShown = retry ? "deploy --run " + sim.runId + " --nodes node04" : ph.cmd + " --run " + sim.runId;
+  await print(['', '<span class="cmd">$ python -m edge_deploy ' + cmdShown + '</span>']);
+  await print(probeLines(ph), 220);
+  if (posture !== ph.posture) {
+    await print([
+      '<span class="err">phase \'' + ph.cmd + '\' requires posture [' + ph.need + ']; unreachable: ' + ph.un + '.</span>',
+      'Switch the firewall posture, then re-run: <span class="cmd">python -m edge_deploy ' + cmdShown + '</span>',
+      '<span class="dim">exit 0 — state saved; the gate proves write capability, not just reachability (ADR-0012)</span>']);
+    return false;
+  }
+  /* guided transient right after a posture switch */
+  if (sim.guided && sim.justSwitched) {
+    sim.justSwitched = false;
+    await print([
+      '<span class="warn">transient: HTTP 503 from proxy during ' + ph.cmd + ' (posture still propagating)</span>',
+      '<span class="dim">guided retry 1/3 in 10 s … (phases are idempotent and ledger-guarded — safe to retry)</span>'], 240);
+    await sleep(500);
+    await print(['<span class="ok">retry succeeded</span>'], 120);
+  }
+  setFlow(ph.flow);
+  const passed = await runPhaseBody(ph);
+  setFlow([]);
+  if (!passed) { refreshChips(); return false; }
+  sim.idx++;
+  if (sim.idx >= PHASES.length) {
+    sim.complete = true;
+    await print(['', '<span class="ok">release complete: ' + sim.runId + '</span> 🎉',
+      '<span class="dim">run marked complete in state.json; lock released. Tag ' + lastTag + ' now exists on GitHub and Bitbucket.</span>']);
+  } else if (manual) {
+    const next = PHASES[sim.idx];
+    const nr = (sim.idx === 2 && sim.deployRetried === "partial") ? null : next;
+    if (nr) await print(['next: <span class="cmd">' + nr.cmd + '</span>   [posture: ' + nr.need + ']']);
+  }
+  refreshChips();
+  return true;
+}
+
+async function simRunPhase() {
+  if (busy || !sim || sim.complete) return;
+  busy = true; refreshChips();
+  await runOnePhase(true);
+  busy = false; refreshChips();
+}
+
+/* ───────────── guided mode ───────────── */
+async function simGuided() {
+  if (busy) return;
+  if (sim && !sim.complete) { sim.guided = true; }
+  else {
+    busy = true; refreshChips();
+    createRun("release", true);
+    termClear();
+    await print([
+      '<span class="cmd">$ python -m edge_deploy release --guided --tool autobench</span>',
+      'created <span class="ok">edge-deploy/runs/' + sim.runId + '/</span> <span class="dim">(state.json, events.jsonl, run.lock)</span>',
+      '<span class="dim">guided mode: the engine will walk you through every posture switch and RSA prompt (ADR-0010)</span>']);
+    busy = false;
+  }
+  await guidedChain();
+}
+async function guidedChain() {
+  busy = true; refreshChips();
+  while (sim && !sim.complete) {
+    const ph = PHASES[sim.idx];
+    if (posture !== ph.posture) {
+      sim.guidedWaiting = true;
+      await print(['',
+        '<span class="warn">Switch firewall posture to [' + ph.need + '], then press Enter to continue...</span>',
+        '<span class="dim">unreachable: ' + ph.un + ' · Ctrl+C pauses — the run stays open and prints:</span>',
+        '<span class="dim">  Paused at posture boundary. Resume with: python -m edge_deploy release --guided --run ' + sim.runId + '</span>']);
+      busy = false; refreshChips();
+      return; /* wait for operator */
+    }
+    const ok = await runOnePhase(false);
+    if (!ok) break; /* deploy node failure in manual path — not reached in guided */
+  }
+  busy = false; refreshChips();
+}
+async function guidedEnter() {
+  if (busy || !sim || !sim.guidedWaiting) return;
+  const ph = PHASES[sim.idx];
+  busy = true; refreshChips();
+  if (posture !== ph.posture) {
+    await print(['',
+      '<span class="dim">re-probing …</span>',
+      '<span class="err">still unreachable: ' + ph.un + '</span>',
+      '<span class="warn">Switch firewall posture to [' + ph.need + '], then press Enter to continue...</span>']);
+    busy = false; refreshChips(); return;
+  }
+  sim.guidedWaiting = false;
+  await print(['',
+    '<span class="dim">polling posture probes while the switch propagates (up to ~90 s) …</span>'], 200);
+  await sleep(600);
+  await print(['<span class="ok">posture settled after 12 s</span>'], 120);
+  sim.justSwitched = true;
+  busy = false;
+  await guidedChain();
+}
+document.addEventListener("keydown", e => {
+  if (e.key === "Enter" && sim && sim.guidedWaiting && !busy) guidedEnter();
+});
+
+/* ───────────── status / rollback / abandon / reset ───────────── */
+async function simStatus() {
+  if (busy || !sim) return;
+  busy = true; refreshChips();
+  const st = i => {
+    if (i === 2) {
+      if (sim.deployRetried === "partial" && sim.idx === 2) return '<span class="err">node03=passed node04=failed</span>';
+      if (i < sim.idx) return '<span class="ok">node03=passed node04=passed</span>';
+    }
+    if (i === 1 && i < sim.idx) return '<span class="ok">passed (snapshot bb7c8d1)</span>';
+    return i < sim.idx ? '<span class="ok">passed</span>' : '<span class="dim">pending</span>';
+  };
+  const next = PHASES[sim.idx];
+  const nextLine = sim.complete
+    ? '<span class="ok">run complete</span>'
+    : (sim.deployRetried === "partial" && sim.idx === 2)
+      ? 'next: <span class="cmd">python -m edge_deploy deploy --run ' + sim.runId + ' --nodes node04</span>   [posture: bitbucket+edge]'
+      : 'next: <span class="cmd">python -m edge_deploy ' + next.cmd + ' --run ' + sim.runId + '</span>   [posture: ' + next.need + ']';
+  await print(['',
+    '<span class="cmd">$ python -m edge_deploy status</span>',
+    'run ' + sim.runId + '  tool=autobench  kind=' + sim.kind + '  source=aa6d9a5',
+    '  verify:        ' + st(0),
+    '  publish:       ' + st(1),
+    '  deploy:        ' + st(2),
+    '  tag_bitbucket: ' + st(3),
+    '  tag_github:    ' + st(4),
+    nextLine], 60);
+  busy = false; refreshChips();
+}
+async function simRollback() {
+  if (busy || !sim || !sim.complete || !lastTag) return;
+  busy = true; refreshChips();
+  createRun("rollback", false);
+  await print(['',
+    '<span class="cmd">$ python -m edge_deploy rollback --tag ' + lastTag + '</span>',
+    'created <span class="ok">edge-deploy/runs/' + sim.runId + '/</span>  kind=<span class="warn">rollback</span>',
+    '<span class="dim">seeded from the tag\'s recorded provenance — Bitbucket main is NEVER rewound</span>',
+    '<span class="dim">same phase chain follows; rollback needs only bitbucket+edge until its final tag-github step (ADR-0012)</span>',
+    'next: <span class="cmd">verify</span>   [posture: github]']);
+  busy = false; refreshChips();
+}
+async function simAbandon() {
+  if (busy || !sim || sim.complete) return;
+  busy = true; refreshChips();
+  await print(['',
+    '<span class="cmd">$ python -m edge_deploy abandon --run ' + sim.runId + ' --reason "simulator demo over"</span>',
+    'run ' + sim.runId + ' marked <span class="warn">abandoned</span> <span class="dim">(recorded in the ledger and audit — a first-class terminal state, ADR-0008)</span>']);
+  sim = null;
+  $("run-id").textContent = "no open run (last abandoned)";
+  $("node-row").style.display = "none";
+  busy = false; refreshChips();
+}
+function simReset() {
+  if (busy) return;
+  sim = null; lastTag = null;
+  $("run-id").textContent = "no open run";
+  $("node-row").style.display = "none";
+  setFlow([]);
+  termClear('<span class="dim"># python -m edge_deploy …\n# Create a run to begin. The ledger is written to disk BEFORE any remote mutation.\n# Tip: try "release --guided" and follow the prompts — Enter also works on your keyboard.</span>');
+  refreshChips();
+}
+setPosture("none");
+
+/* ───────────── deploy sequence ───────────── */
+const seqItems = document.querySelectorAll("#deploy-seq li");
+seqItems.forEach(li => li.addEventListener("click", () => li.classList.toggle("open")));
+let seqPlaying = false;
+async function playDeploySeq() {
+  if (seqPlaying) return;
+  seqPlaying = true;
+  seqItems.forEach(li => li.classList.remove("open","hl"));
+  for (const li of seqItems) {
+    li.classList.add("open","hl");
+    li.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    await sleep(1100);
+    li.classList.remove("hl");
+  }
+  seqPlaying = false;
+}
+
+/* ───────────── pane demo ───────────── */
+const PANE = [
+  {
+    inp: '<span class="cmd">$ send-keys</span> "bash &lt;&lt;\'EOF\'\nset -eu\necho step one\necho step two\nEOF"',
+    out: 'bash &lt;&lt;\'EOF\'<span class="err">▌ truncated at first newline</span>\n<span class="dim">(heredoc body silently lost —\nbash waits forever for EOF)</span>',
+    note: "<b>psmux <code>send-keys</code> truncates multi-line input at the first newline.</b> Heredocs silently lose their bodies and the remote shell hangs waiting for the terminator — which surfaced as a timeout, three layers away from the cause. Fix: commands are single-line; multi-line payloads travel base64-encoded."
+  },
+  {
+    inp: '<span class="cmd">$ send-keys</span> python3 -c "open(p, encoding=<span class="ok">\'ascii\'</span>)"',
+    out: 'python3 -c "open(p, encoding=<span class="err">ascii</span>)"\n<span class="dim">quotes stripped from the whitespace-free\nargument — the string literal \'ascii\' became\nthe Python builtin <code>ascii</code></span>',
+    note: "<b>psmux strips quotes from whitespace-free arguments.</b> <code>encoding='ascii'</code> arrives as <code>encoding=ascii</code> — still valid Python, now referencing the builtin function. It ran without a syntax error and failed semantically. Fix: the decoding one-liner is itself base64-piped to the interpreter, so no quoting survives or matters."
+  },
+  {
+    inp: '<span class="dim"># node emits one long base64 line:</span>\neyJub2RlIjoibm9kZTAzIiwic3RlcHMiOlt7Im5hbWUiOiJpbnN0YWxsIiwicmMiOjB9XX0=',
+    out: '<span class="dim"># screen capture wraps at pane width:</span>\neyJub2RlIjoibm9kZTAzIiwic3RlcHMiOlt7Im5h\nbWUiOiJpbnN0YWxsIiwicmMiOjB9XX0=\n<span class="dim">…interleaved with prompts and echo</span>\n[operator@edge-node03 ~]$',
+    note: "<b>Output is read by capturing the screen</b>, where lines wrap at pane width and interleave with prompts and command echo. Fix: results are emitted between unique sentinels (<code>__EDGE_RESULT_START__</code>/<code>__EDGE_RESULT_END__</code>) with a SHA-256 digest; wrap-whitespace is stripped from the base64 before decode and the digest is matched bottom-up as an exact 64-hex line."
+  },
+  {
+    inp: '<span class="dim"># script staged from Windows temp file:</span>\n#!/bin/bash<span class="err">\\r</span>\nset -eu<span class="err">\\r</span>\necho evidence &gt; /tmp/result<span class="err">\\r</span>',
+    out: 'bash: line 2: <span class="err">set: -eu\\r: invalid option</span>\n<span class="dim">CRLF kills the script before ANY evidence\nis written — and digest verification can\'t\ncatch it: both sides hash the same CRLF bytes</span>',
+    note: "<b>Windows text-mode temp files pick up CRLF endings</b>, which kill <code>set -eu</code> shell scripts on Linux before any evidence exists. Digest verification is blind to it because both sides hash the identical (corrupted) bytes. Fix: anything staged for upload is written LF-only (<code>newline=\"\\n\"</code>), and runner invocations check the exit code immediately so failure surfaces at the call, with the screen attached."
+  },
+];
+function paneTab(i, btn) {
+  document.querySelectorAll("#pane-tabs button").forEach(b => b.classList.remove("active"));
+  btn.classList.add("active");
+  $("pane-in").innerHTML = PANE[i].inp;
+  $("pane-out").innerHTML = PANE[i].out;
+  $("pane-note").innerHTML = PANE[i].note;
+}
+paneTab(0, document.querySelector("#pane-tabs button"));
+
+/* ───────────── modules ───────────── */
+const MODS = [
+  ["ledger.py","Durable run state","Owns edge-deploy/runs/<run-id>/: state.json (tool, source SHA, engine identity, per-phase/per-node status), append-only events.jsonl, and run.lock (PID + hostname). A run is open, complete, or abandoned — nothing else. Since ADR-0012 a run completes when both tag phases have passed, in either order."],
+  ["posture.py","Posture declarations & probes","Each phase declares the endpoints it needs. Git endpoints get protocol-level probes matched to the phase's real access: git ls-remote for reads, git push --dry-run --force against refs/edge-deploy/posture-probe for writes (PHASE_GIT_PROBES, ADR-0012). TCP probing remains for Edge SSH and as fallback when no checkout is available. Probes never prompt (GIT_TERMINAL_PROMPT=0) and time out after 20 s."],
+  ["phases/","Phase subcommands","verify, publish, deploy, tag, status — the short idempotent commands that advance the run ledger. Each is safe to re-run. Tag order: tag-bitbucket directly after deploy, tag-github last (two posture switches)."],
+  ["runner.py","On-node step executor","Executes deploy steps on a node through the pane, using the D8 read protocol: file evidence written on the node, read back between sentinels with digest verification (ADR-0009)."],
+  ["tmux_driver.py","Pane transport","Drives the psmux Authenticated Pane: single-line send-keys, chunked base64 uploads, sentinel-delimited screen reads. The pane-safety layer (ADR-0011)."],
+  ["remote_python.py","Interpreter resolution","REMOTE_PYTHON_EXPR resolves the node-side interpreter: python3.11 → python3.10 → python3 → known sys_apps path. Never assumes PATH."],
+  ["repository.py","Canonical checkout & CI gates","Validates the clean local main checkout equals origin/main and that GitHub CI succeeded for the SHA being released."],
+  ["publish.py","Bitbucket publish","Exact-SHA, fast-forward-only push to Bitbucket main. Never rewrites commits, never force-pushes."],
+  ["auth.py","AuthBroker","The interactive secret boundary — deploy-only (ADR-0002). RSA/Kerberos responses pass through, are never persisted, and no other phase authenticates."],
+  ["release.py","Deploy orchestration","Per-node fan-out inside the deploy phase, with continue-and-report semantics (ADR-0003)."],
+  ["rollout.py","Rollout guard","Applies the rollout on a node; refuses outright when dependencies changed relative to the snapshot's expectation (ADR-0005)."],
+  ["dependencies.py","Dependency bundles","First-class content-addressed dependency delivery per the ADR-0006 contract (v1.1.0). Bundles live in the run directory, never committed."],
+  ["drift.py","Drift detection","Compares runtime-critical files on the node against the Snapshot's tree — enumerated from the snapshot, never the working tree."],
+  ["audit.py","Audit append","Isolated temporary git worktree pushing HEAD:refs/heads/release-log to the bitbucket remote during tag-bitbucket (where that branch is writable). The release-log branch is Bitbucket-only, never pushed to GitHub."],
+  ["mirror.py","Core package mirroring","Mirrors edge-deploy-core tags to Bitbucket; when Bitbucket's own-commits hook rejects a GitHub-authored merge commit, creates an operator-authored commit carrying the identical tree (ADR-0007)."],
+  ["reporting.py","Redacted evidence","Machine-readable, redacted release evidence — publish reports, rollout reports — stored under the run directory. The minted release tag is recorded in tag-phase evidence so the other tag phase reuses it."],
+  ["config.py","Contracts","Two configs, strictly separated: the committed Tool Profile (edge_deploy.yaml — runtime paths, install triggers, smoke commands, no secrets) and private operator config (%APPDATA%\\edge-deploy\\config.yaml — identity, node inventory)."],
+  ["cli.py","Entry point","python -m edge_deploy — wires subcommands to phases, status, rollback, abandon, mirror. Hosts the guided posture loop: prompt, settle-poll up to ~90 s, and 10/20/30 s phase retry backoff (ADR-0012)."],
+];
+const grid = $("mod-grid"), detail = $("mod-detail");
+MODS.forEach(([name, one, body]) => {
+  const d = document.createElement("div");
+  d.className = "mod";
+  d.innerHTML = '<div class="name">' + name + '</div><div class="one">' + one + '</div>';
+  d.onclick = () => {
+    document.querySelectorAll(".mod").forEach(m => m.classList.remove("sel"));
+    d.classList.add("sel");
+    detail.className = "card mod-detail show";
+    detail.innerHTML = '<div class="name mono" style="color:var(--accent);margin-bottom:6px">' + name + ' — ' + one + '</div><div style="font-size:13.5px;color:var(--muted)">' + body + '</div>';
+  };
+  grid.appendChild(d);
+});
+
+/* ───────────── ADRs ───────────── */
+const ADRS = [
+  ["0001","Standalone operator package","edge-deploy-core is its own operator-only package. It runs solely on the Release Operator's machine; Edge Nodes and contributors never depend on it."],
+  ["0002","Operator auth seam","All interactive credentials (RSA, Kerberos) cross one seam: the AuthBroker, owned by the deploy phase only. Preflight no longer authenticates nodes; nothing is ever persisted."],
+  ["0003","Continue-and-report, no auto-rollback","When a node fails mid-deploy, the engine continues to the remaining nodes and reports — it never rolls back automatically. Rollback is an explicit, operator-initiated run seeded from a recorded release tag."],
+  ["0004","Standard on-node deploy interface","Every Tool exposes the same on-node contract: update.sh and install.sh. The engine drives files and exit codes; nodes never import Python from this package."],
+  ["0005","Refuse rollout on dependency change","If the dependencies on a node differ from what the snapshot expects, the rollout is refused outright rather than partially upgrading — no silent drift into unknown states."],
+  ["0006","First-class dependency delivery","Dependencies are delivered as content-addressed bundles under an explicit contract (v1.1.0), built locally and shipped with the release — never committed, never fetched by the node."],
+  ["0007","Tree-equivalent Bitbucket mirroring","Publish pushes the exact reviewed commit when Bitbucket accepts it. When Bitbucket's own-commits hook rejects a GitHub-authored merge commit, an operator-authored mirror commit carries the identical tree — same content SHA guarantees, different committer."],
+  ["0008","Run ledger and posture-scoped phases","Born from three failed release sessions: half-succeeded cross-posture pushes, silent getpass() waits, stale-report resumes deploying the wrong snapshot, colliding controllers, and 4-minute test suites on every retry. Answer: durable per-run ledger written before any remote mutation, explicit resume only, posture-scoped fail-fast phases, engine-identity checks, and a status command that always prints the exact next command."],
+  ["0009","On-node runner file evidence","Remote steps write their evidence to files on the node; the controller reads files back verbatim through the D8 protocol instead of parsing scrolled terminal output. Evidence survives disconnects and screen history limits."],
+  ["0010","Guided posture loop","release --guided walks the operator through every posture switch and RSA prompt in a single invocation: print required posture, prompt, re-probe, continue. Ctrl+C pauses cleanly — the run stays open with a printed resume command, and resume works across postures without repeating verify."],
+  ["0011","Pane-safe remote transport","The Authenticated Pane is a lossy screen-scraped text channel: newline truncation, quote stripping, line-length limits, screen wrap, CRLF poisoning. After three iterations of fixing symptoms, the decision: treat the pane as hostile and route every byte through one protocol — single-line commands, chunked base64, resolved interpreters, sentinel-and-digest reads, LF-only staging."],
+  ["0012","Posture-aware release flow","The 2026-07-03 validations exposed three failure modes: TCP probes lie (the proxy accepts TCP connects in every posture and only fails at the HTTP layer, so the gate waved phases through and git blew up mid-phase); the first operations after a genuine switch can still flake while it propagates; and the old phase order needed three posture switches per release. Answer: protocol-level git probes matched to the phase's real access (ls-remote for reads, push --dry-run --force to refs/edge-deploy/posture-probe for writes — proving write capability, not reachability); guided mode polls up to ~90 s after a confirmed switch and retries transient phase errors with 10/20/30 s backoff; and tag-bitbucket moved before tag-github, cutting a release to two switches. The release tag is minted by whichever tag phase runs first and reused by the other; runs opened under the old order still resolve.", true],
+];
+const adrList = $("adr-list");
+ADRS.forEach(([id, title, body, isNew]) => {
+  const d = document.createElement("div");
+  d.className = "adr" + (isNew ? " new" : "");
+  d.innerHTML = '<span class="id">ADR-' + id + '</span> <span class="t">' + title + '</span>' +
+    (isNew ? '<span class="tag-new">NEW in 1.3.0</span>' : '') +
+    '<div class="body">' + body + '</div>';
+  d.querySelector(".t").onclick = () => d.classList.toggle("open");
+  adrList.appendChild(d);
+});
+let allOpen = false;
+function toggleAllAdrs() {
+  allOpen = !allOpen;
+  document.querySelectorAll(".adr").forEach(a => a.classList.toggle("open", allOpen));
+  $("adr-all").textContent = allOpen ? "collapse all" : "expand all";
+}
+
+/* ───────────── glossary ───────────── */
+const GLOS = [
+  ["Tool","One deployable product: Autobench or Robocop/Dispatch."],
+  ["Tool Profile","The tool's committed edge_deploy.yaml — node-independent release metadata; no operator paths or credentials."],
+  ["Publish","Fast-forwards the exact reviewed GitHub commit to Bitbucket."],
+  ["Deploy","Applies the published commit to each selected Edge Node and verifies final commit, drift, permissions, and smoke checks."],
+  ["Release","One operator-controlled Publish-and-Deploy run for the Tool in the current checkout."],
+  ["Rollback","Explicitly restores a previously recorded successful release tag. Never rewinds Bitbucket main."],
+  ["Snapshot","The exact source tree a Release or Rollback delivers. Every check — including Drift — is judged against the Snapshot's tree, never the operator's working tree."],
+  ["Posture","The workstation's exclusive firewall state: at most one of GitHub or Bitbucket-plus-Edge is writable. Switching is a human act, not instantaneous — it takes up to about a minute to propagate."],
+  ["Posture Probe","A protocol-level check that a phase's real access works: git ls-remote for reads, git push --dry-run to refs/edge-deploy/posture-probe for writes. Proves write capability, not TCP reachability (ADR-0012)."],
+  ["Run","One durable release attempt, from creation to complete or abandoned. At most one open Run per Tool."],
+  ["Run Ledger","The durable, append-audited record of a Run: source SHA, per-phase and per-node state, and the Engine Identity that created it."],
+  ["Engine Identity","The exact content of the installed release engine. Any engine code change orphans open Runs, which must be abandoned and recreated."],
+  ["Guided Release","A Release in which the engine walks the operator through every posture switch and RSA prompt in a single invocation, absorbing post-switch transients with settle-polling and phase retries."],
+  ["Authenticated Pane","The local tmux/psmux session holding an authenticated SSH connection to one Edge Node — a lossy, screen-scraped text channel, not a byte pipe."],
+  ["Pane-Safe","A remote command or payload that survives the pane's known corruptions: single-line, quote-strip-proof, length-bounded, wrap-tolerant. Arbitrary content crosses base64-encoded with sentinel-and-digest reads."],
+  ["Drift","A difference between runtime-critical files in the released commit and files present on an Edge Node."],
+];
+const glos = $("glos");
+GLOS.forEach(([t, b]) => {
+  const d = document.createElement("div");
+  d.className = "g";
+  d.innerHTML = '<b>' + t + '</b><p>' + b + '</p>';
+  glos.appendChild(d);
+});
+$("glos-search").addEventListener("input", e => {
+  const q = e.target.value.toLowerCase();
+  document.querySelectorAll("#glos .g").forEach(g => {
+    g.style.display = g.textContent.toLowerCase().includes(q) ? "" : "none";
+  });
+});
+
+/* ───────────── scroll progress + spy + reveal ───────────── */
+window.addEventListener("scroll", () => {
+  const h = document.documentElement;
+  const pct = h.scrollTop / (h.scrollHeight - h.clientHeight) * 100;
+  $("progress").style.width = pct + "%";
+}, { passive: true });
+
+const navLinks = document.querySelectorAll("#topnav a");
+const sections = [...document.querySelectorAll("section, .hero")];
+const spy = new IntersectionObserver(entries => {
+  entries.forEach(en => {
+    if (en.isIntersecting) {
+      navLinks.forEach(a => a.classList.toggle("active", a.getAttribute("href") === "#" + en.target.id));
+    }
+  });
+}, { rootMargin: "-30% 0px -60% 0px" });
+sections.forEach(s => spy.observe(s));
+
+const reveal = new IntersectionObserver(entries => {
+  entries.forEach(en => { if (en.isIntersecting) { en.target.classList.add("in"); reveal.unobserve(en.target); } });
+}, { threshold: 0.08 });
+document.querySelectorAll("section").forEach(s => { s.classList.add("fade"); reveal.observe(s); });
+</script>
+</body>
+</html>

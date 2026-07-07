@@ -15,11 +15,16 @@ uv run prototype_paramiko_transport.py --node node03
 
 ## Implementation
 
-- Add two clearly marked, untracked scratch files:
+- Add two clearly marked, untracked scratch files, both **outside**
+  `edge_deploy/`:
   - `prototype_paramiko_transport.py`: PEP 723 entry script pinning
     `paramiko==5.0.0`.
-  - `edge_deploy/_prototype_paramiko_transport.py`: reusable transport
-    experiment.
+  - `prototype_paramiko_transport_lib.py`: reusable transport experiment.
+  - Never place prototype `.py` files inside `edge_deploy/`: Engine Identity
+    (`ledger._content_sha256`) hashes every `*.py` under the package
+    directory, tracked or not, so creating the file would orphan any open
+    Run and deleting it would orphan any Run created while it existed
+    (ADR-0008 identity skew is refused at every phase entry).
 - Load the existing private operator configuration and parse `user@host`, port,
   and keepalive settings.
 - Verify the server key strictly against `~/.ssh/known_hosts`; never auto-accept
@@ -54,8 +59,35 @@ uv run prototype_paramiko_transport.py --node node03
   keepalive intervals.
 - Close the connection explicitly and confirm remote scratch cleanup.
 
+## Risks and Open Questions
+
+- **Policy vs. tooling.** ADR-0011 rejected scp/sftp as "not permitted through
+  the RSA-authenticated interactive channel" and ControlMaster as broken on the
+  Windows OpenSSH stack. Paramiko bypasses the tooling problem entirely, but a
+  fully green probe run proves *capability*, not *permission*: if policy
+  mandates human-interactive sessions only, a programmatic transport may be a
+  compliance problem no probe detects. Confirm with the policy owner in
+  parallel before designing the production transport.
+- **Key negotiation is the likely first failure.** Strict `known_hosts`
+  verification is required, but the operator's file was written by Windows
+  OpenSSH; Paramiko can be picky about key types (rsa-sha2 negotiation, hashed
+  entries). An auth-probe failure here means "config work", not "hypothesis
+  dead" — record it as such.
+- **Dependency surface.** Production adoption adds `paramiko` (and its binary
+  `cryptography` wheel) to the operator `[release]` extra on a corporate-managed
+  Windows workstation — an approval question, not a technical one.
+- **What survives regardless of outcome:** `remote_python.py` interpreter
+  resolution (node heterogeneity is transport-independent), LF-only staging
+  (SFTP preserves bytes, so CRLF risk moves back to file-creation time on
+  Windows), and ADR-0009 file evidence (its scrolled-screen rationale
+  evaporates, but files still buy durability across disconnects and post-hoc
+  audit — keep the contract, read the files over the new channel).
+
 ## Acceptance and Lifecycle
 
+- Before the live run, confirm no open Runs exist for the target tool (or
+  explicitly accept abandoning them) — belt-and-braces even with the scratch
+  files outside the package.
 - The hypothesis passes if node03 authenticates through one prompt, all channel
   probes preserve exact data, the transfer hash matches, and the connection
   survives the keepalive probe.
@@ -68,3 +100,11 @@ uv run prototype_paramiko_transport.py --node node03
 - After the live run, capture the verdict in the conversation, then either
   delete the scratch files or use the findings to design the production
   transport.
+- If the hypothesis passes, the production design introduces a `Transport`
+  seam behind `runner.py` with the pane retained as fallback, keeps the
+  AuthBroker boundary (ADR-0002) as the keyboard-interactive callback, and is
+  recorded as ADR-0013 superseding the transport-mechanics half of ADR-0011
+  while keeping its lesson: treat whatever channel you are given as hostile
+  until proven byte-clean. The connection is persistent per phase invocation,
+  not per Run — phases are separate short processes, so RSA re-auth per deploy
+  command remains, matching current behavior.
