@@ -157,3 +157,28 @@ Stop and report back if:
   is visible in every run.
 - Plan 012 adds a mypy step next to the ruff step.
 - Reviewer focus: confirm the matrix (3.10/3.12) is untouched and `fail-fast: false` retained.
+
+---
+
+## Addendum (2026-07-07, commit `d8ec786`) — from the deep re-audit
+
+This plan remains valid: `git diff --stat 4ad2b28..d8ec786 -- .github/workflows/ci.yml`
+is empty (CI still runs plain `python -m pytest`, no ruff, no parallelism).
+Two additions for the executor:
+
+1. **Fix the pre-existing lint failure first.** `python -m ruff check .`
+   currently fails on one E501 at `edge_deploy/runner.py:44` (a 143-char shell
+   line inside `RUNNER_SCRIPT` that resolves the Edge Node interpreter).
+   The ruff CI gate cannot land red. Split the line inside the shell string
+   (e.g. break the `command -v` chain across two lines with a shell
+   line-continuation `\` or an intermediate variable) — **the script must stay
+   valid POSIX sh and its behavior must not change**; `tests/test_runner.py`
+   and the runner digest tests must still pass. Note: this edit changes
+   `runner_sha256()` and therefore the engine identity — open runs are
+   orphaned by design; say so in the PR.
+2. **Add pip caching while touching the workflow**: add `cache: 'pip'` to the
+   `actions/setup-python@v5` step. Saves ~30–60s per job across the two-version
+   matrix.
+
+Done-criteria additions: `python -m ruff check .` exits 0; ci.yml contains
+`cache: 'pip'`.
