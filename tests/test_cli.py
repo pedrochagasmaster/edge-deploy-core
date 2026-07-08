@@ -583,7 +583,7 @@ def test_release_posture_failure_mid_chain_exits_zero(tmp_path, monkeypatch, cap
     assert rc == 0
     out = capsys.readouterr().out
     expected = (
-        f"phase 'publish' requires posture [bitbucket]; unreachable: scm.mastercard.int:443.\n"
+        f"phase 'publish' requires posture [bitbucket-vpn or both-vpns]; unreachable: scm.mastercard.int:443.\n"
         f"Switch the firewall posture, then re-run: python -m edge_deploy release --run {run_id}\n"
     )
     assert out == expected
@@ -717,7 +717,7 @@ def test_release_guided_crosses_posture_boundary_after_enter(tmp_path, monkeypat
 
     assert rc == 0
     out = capsys.readouterr().out
-    assert "Phase 'publish' requires posture [bitbucket]." in out
+    assert "Phase 'publish' requires posture [bitbucket-vpn or both-vpns]." in out
     assert "Unreachable: scm.mastercard.int:443." in out
     assert f"release complete: {run_id}" in out
     assert "next: none (complete)" in out
@@ -780,7 +780,7 @@ def test_release_guided_reprompts_while_probe_still_fails(tmp_path, monkeypatch,
     assert rc == 0
     assert input_calls == 2
     out = capsys.readouterr().out
-    assert out.count("Phase 'publish' requires posture [bitbucket].") >= 2
+    assert out.count("Phase 'publish' requires posture [bitbucket-vpn or both-vpns].") >= 2
     assert out.count("Unreachable: scm.mastercard.int:443.") >= 2
 
 

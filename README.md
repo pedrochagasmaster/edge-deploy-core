@@ -59,4 +59,5 @@ See [docs/release-workflow.md](docs/release-workflow.md) for the operator
 procedure and [docs/DESIGN.md](docs/DESIGN.md) for engine internals. Architecture
 decisions: [ADR-0008](docs/adr/0008-run-ledger-and-posture-phases.md) (run
 ledger and phases), [ADR-0009](docs/adr/0009-on-node-runner-file-evidence.md)
-(runner and file evidence).
+(runner and file evidence), [ADR-0013](docs/adr/0013-five-posture-capability-model.md)
+(five-posture capability model).

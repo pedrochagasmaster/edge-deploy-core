@@ -1,4 +1,24 @@
-"""Network posture probes for release phases (D6/D7, protocol probes per ADR-0012)."""
+"""Workstation postures and the network probes that gate release phases.
+
+Five postures (ADR-0013). GitHub *read* (pull/fetch) works in every posture;
+GitHub *write* requires the firewall off, which drops both VPNs. The
+Bitbucket and Edge VPNs are independent and may be held together:
+
+===============  ===========  ============  =========  ====
+Posture          github read  github write  bitbucket  edge
+===============  ===========  ============  =========  ====
+baseline         yes          no            no         no
+edge-vpn         yes          no            no         yes
+bitbucket-vpn    yes          no            yes        no
+both-vpns        yes          no            yes        yes
+firewall-off     yes          yes           no         no
+===============  ===========  ============  =========  ====
+
+Phases declare required *capabilities*; the satisfying postures are derived.
+Probing stays capability-level (protocol git probes per ADR-0012, TCP for
+Edge SSH) because no probe can name the posture directly — the corporate
+proxy accepts TCP connects in every posture.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +31,40 @@ from typing import Callable
 
 from edge_deploy.config import OperatorConfig
 from edge_deploy.preflight import endpoint_from_node
+
+# Capability names: "github-read", "github-write", "bitbucket", "edge".
+# Bitbucket and Edge need no read/write split: a posture grants all their
+# actions or none.
+POSTURES: dict[str, frozenset[str]] = {
+    "baseline": frozenset({"github-read"}),
+    "edge-vpn": frozenset({"github-read", "edge"}),
+    "bitbucket-vpn": frozenset({"github-read", "bitbucket"}),
+    "both-vpns": frozenset({"github-read", "bitbucket", "edge"}),
+    "firewall-off": frozenset({"github-read", "github-write"}),
+}
+
+PHASE_CAPABILITIES: dict[str, frozenset[str]] = {
+    "verify": frozenset({"github-read"}),
+    "publish": frozenset({"bitbucket"}),
+    "deploy": frozenset({"bitbucket", "edge"}),
+    "tag_github": frozenset({"github-write"}),
+    "tag_bitbucket": frozenset({"bitbucket"}),
+}
+
+
+def postures_satisfying(phase: str) -> tuple[str, ...]:
+    """Posture names (in POSTURES order) whose capabilities cover ``phase``."""
+    required = PHASE_CAPABILITIES[phase]
+    return tuple(name for name, granted in POSTURES.items() if required <= granted)
+
+
+def describe_phase_posture(phase: str) -> str:
+    """Human posture requirement for ``phase``: 'any', one name, or 'a or b'."""
+    names = postures_satisfying(phase)
+    if len(names) == len(POSTURES):
+        return "any"
+    return " or ".join(names)
+
 
 _STATIC_ENDPOINTS: dict[str, tuple[str, int]] = {
     "github": ("github.com", 443),
@@ -186,7 +240,6 @@ def require_posture(
     repo_root: Path | str | None = None,
     git_runner: GitProbeRunner | None = None,
 ) -> None:
-    keys = PHASE_ENDPOINTS[phase]
     failures = posture_failures(
         phase,
         operator,
@@ -196,8 +249,8 @@ def require_posture(
     )
     if not failures:
         return
-    posture_keys = ", ".join(keys)
     raise PostureError(
-        f"phase '{phase}' requires posture [{posture_keys}]; unreachable: {', '.join(failures)}.\n"
+        f"phase '{phase}' requires posture [{describe_phase_posture(phase)}]; "
+        f"unreachable: {', '.join(failures)}.\n"
         f"Switch the firewall posture, then re-run: {next_command}"
     )

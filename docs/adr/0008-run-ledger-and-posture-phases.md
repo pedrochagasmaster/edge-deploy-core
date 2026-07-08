@@ -1,5 +1,10 @@
 # Run ledger and posture-scoped release phases
 
+> Posture model refined by
+> [ADR-0013](0013-five-posture-capability-model.md): the firewall has five
+> states, not two exclusive ones. The run ledger and phase decisions here
+> stand unchanged.
+
 ## Context
 
 Three codex release sessions (2026-07-01 → 2026-07-03) attempted full end-to-end

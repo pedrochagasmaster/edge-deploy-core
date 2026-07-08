@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "edge-deploy-core"
-version = "1.3.0"
+version = "1.4.0"
 description = "Shared deployment toolkit that rolls a reviewed build of a Tool (autobench, robocop/Dispatch) out to the Hadoop Edge Nodes."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -26,3 +26,7 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# The console embeds its whole page (CSS/JS) in one string; long lines are the page's.
+"edge_console.py" = ["E501"]

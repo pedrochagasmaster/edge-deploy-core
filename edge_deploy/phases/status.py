@@ -8,10 +8,10 @@ from pathlib import Path
 
 from edge_deploy.config import OperatorConfig
 from edge_deploy.ledger import RunLedger
-from edge_deploy.posture import PHASE_ENDPOINTS
+from edge_deploy.posture import describe_phase_posture
 
-# tag_bitbucket precedes tag_github (ADR-0012): it shares deploy's
-# bitbucket+edge posture, leaving one final switch to GitHub per release.
+# tag_bitbucket precedes tag_github (ADR-0012/0013): it shares deploy's
+# both-vpns posture, leaving one final switch (to firewall-off) per release.
 _PHASE_ORDER: tuple[str, ...] = (
     "verify",
     "publish",
@@ -84,7 +84,7 @@ def _resolve_next_line(ledger: RunLedger) -> str:
     for phase in _PHASE_ORDER:
         if not _phase_passed(ledger, phase):
             command = _next_command_for_phase(ledger, phase)
-            posture = "+".join(PHASE_ENDPOINTS[phase])
+            posture = describe_phase_posture(phase)
             return f"next: {command}   [posture: {posture}]"
     return "next: none (complete)"
 

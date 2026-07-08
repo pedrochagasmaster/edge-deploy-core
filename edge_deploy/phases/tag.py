@@ -15,8 +15,8 @@ from edge_deploy.ledger import RunLedger
 from edge_deploy.phases import PHASE_REGISTRY, PhaseSpec, enter_phase, load_run, run_repo_root
 from edge_deploy.posture import PHASE_ENDPOINTS
 
-# ADR-0012: tag_bitbucket runs before tag_github so it shares the deploy
-# posture (bitbucket+edge); tag_github is then the single final posture switch.
+# ADR-0012/0013: tag_bitbucket runs before tag_github so it shares the deploy
+# posture (both-vpns); tag_github (firewall-off) is the single final switch.
 TAG_BITBUCKET_SPEC = PhaseSpec(
     name="tag_bitbucket",
     order=40,

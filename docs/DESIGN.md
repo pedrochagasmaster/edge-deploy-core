@@ -37,7 +37,7 @@ until continued (`--run`), abandoned, or completed.
 ## Boundaries
 
 - `ledger.py`: durable run state, lock, engine identity
-- `posture.py`: phase endpoint declarations and TCP probes
+- `posture.py`: five-posture capability model (ADR-0013), phase endpoints, probes
 - `phases/`: verify, publish, deploy, tag, status subcommands
 - `runner.py`: on-node step executor and D8 read protocol
 - `repository.py`: canonical checkout and GitHub CI gates

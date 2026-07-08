@@ -79,17 +79,28 @@ run run-20260703T120000Z-aa6d9a5  tool=autobench  kind=release  source=aa6d9a5  
   deploy:        node03=passed node04=failed
   tag_bitbucket: pending
   tag_github:    pending
-next: python -m edge_deploy deploy --run run-20260703T120000Z-aa6d9a5 --nodes node04   [posture: bitbucket+edge]
+next: python -m edge_deploy deploy --run run-20260703T120000Z-aa6d9a5 --nodes node04   [posture: both-vpns]
 ```
 
 ### 3. Run phases (posture-scoped)
 
-Network postures are exclusive: **github** or **bitbucket + edge**. Switch the
-firewall manually before each phase. If the wrong posture is active, the phase
-exits immediately with exactly:
+The workstation has five postures (ADR-0013). GitHub *read* works in every
+posture; GitHub *write* requires the firewall off, which drops both VPNs; the
+Bitbucket and Edge VPNs are independent and may be held together:
+
+| Posture | GitHub read | GitHub write | Bitbucket | Edge |
+|---------|-------------|--------------|-----------|------|
+| baseline | yes | no | no | no |
+| edge-vpn | yes | no | no | yes |
+| bitbucket-vpn | yes | no | yes | no |
+| both-vpns | yes | no | yes | yes |
+| firewall-off | yes | yes | no | no |
+
+Switch the firewall manually before each phase. If the current posture does
+not satisfy a phase, it exits immediately with exactly:
 
 ```text
-phase '<phase>' requires posture [<keys, comma-joined>]; unreachable: <failures, comma-joined>.
+phase '<phase>' requires posture [<satisfying postures>]; unreachable: <failures, comma-joined>.
 Switch the firewall posture, then re-run: <next command>
 ```
 
@@ -99,14 +110,15 @@ connects in every posture. Edge SSH endpoints are still TCP-probed.
 
 | Phase | Command | Posture |
 |-------|---------|---------|
-| Verify | `python -m edge_deploy verify --run <run_id>` | local + GitHub API |
-| Publish | `python -m edge_deploy publish-phase --run <run_id>` | bitbucket |
-| Deploy | `python -m edge_deploy deploy --run <run_id> [--nodes …]` | bitbucket + edge |
-| Tag Bitbucket | `python -m edge_deploy tag-bitbucket --run <run_id>` | bitbucket |
-| Tag GitHub | `python -m edge_deploy tag-github --run <run_id>` | github |
+| Verify | `python -m edge_deploy verify --run <run_id>` | any (GitHub read) |
+| Publish | `python -m edge_deploy publish-phase --run <run_id>` | bitbucket-vpn or both-vpns |
+| Deploy | `python -m edge_deploy deploy --run <run_id> [--nodes …]` | both-vpns |
+| Tag Bitbucket | `python -m edge_deploy tag-bitbucket --run <run_id>` | bitbucket-vpn or both-vpns |
+| Tag GitHub | `python -m edge_deploy tag-github --run <run_id>` | firewall-off |
 
-Tag Bitbucket runs before Tag GitHub (ADR-0012) so a release needs only two
-posture switches: github → bitbucket+edge → github.
+Tag Bitbucket runs before Tag GitHub (ADR-0012/0013), and Verify runs in any
+posture, so a release started in both-vpns needs exactly one posture switch:
+both-vpns → firewall-off for the final Tag GitHub.
 
 The `release` wrapper chains phases until the first posture boundary, saves
 state, prints the posture message above, and exits 0. Re-run `release --run
@@ -121,11 +133,11 @@ To walk through all posture switches in one invocation, use `--guided`:
 python -m edge_deploy release --guided --tool autobench
 ```
 
-At each posture boundary the engine prints the required posture keys and any
+At each posture boundary the engine prints the satisfying posture names and any
 unreachable endpoints, then prompts:
 
 ```text
-Switch firewall posture to [bitbucket+edge], then press Enter to continue...
+Switch firewall posture to [both-vpns], then press Enter to continue...
 ```
 
 Switch the firewall, press Enter, and the engine polls the probes for up to
@@ -142,7 +154,7 @@ Paused at posture boundary. Resume with: python -m edge_deploy release --guided 
 
 Resume works across postures: when `verify` is already `passed` or `skipped`,
 `release --run <id>` does not fetch from GitHub, so you can continue from
-Bitbucket-only posture without repeating verify.
+bitbucket-vpn or both-vpns without repeating verify.
 
 On completion, guided mode prints `release complete: <run_id>` followed by the
 same status summary as `python -m edge_deploy status --run <run_id>`.

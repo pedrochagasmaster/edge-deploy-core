@@ -8,14 +8,18 @@ import pytest
 
 from edge_deploy.config import NodeConfig, OperatorConfig
 from edge_deploy.posture import (
+    PHASE_CAPABILITIES,
     PHASE_ENDPOINTS,
     PHASE_GIT_PROBES,
+    POSTURES,
     Endpoint,
     PostureError,
+    describe_phase_posture,
     endpoints_for,
     git_probe_command,
     git_probe_failures,
     posture_failures,
+    postures_satisfying,
     probe,
     require_posture,
 )
@@ -38,6 +42,64 @@ def _operator_with_two_nodes() -> OperatorConfig:
             ),
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# The five-posture capability model (ADR-0013).
+# ---------------------------------------------------------------------------
+
+
+def test_postures_match_the_five_firewall_states() -> None:
+    assert POSTURES == {
+        "baseline": {"github-read"},
+        "edge-vpn": {"github-read", "edge"},
+        "bitbucket-vpn": {"github-read", "bitbucket"},
+        "both-vpns": {"github-read", "bitbucket", "edge"},
+        "firewall-off": {"github-read", "github-write"},
+    }
+
+
+def test_github_read_is_available_in_every_posture() -> None:
+    assert all("github-read" in granted for granted in POSTURES.values())
+
+
+def test_no_posture_grants_github_write_and_any_vpn() -> None:
+    for granted in POSTURES.values():
+        if "github-write" in granted:
+            assert "bitbucket" not in granted
+            assert "edge" not in granted
+
+
+def test_phase_capabilities_match_what_each_phase_does() -> None:
+    assert PHASE_CAPABILITIES == {
+        "verify": {"github-read"},
+        "publish": {"bitbucket"},
+        "deploy": {"bitbucket", "edge"},
+        "tag_github": {"github-write"},
+        "tag_bitbucket": {"bitbucket"},
+    }
+
+
+def test_postures_satisfying_each_phase() -> None:
+    assert postures_satisfying("verify") == (
+        "baseline",
+        "edge-vpn",
+        "bitbucket-vpn",
+        "both-vpns",
+        "firewall-off",
+    )
+    assert postures_satisfying("publish") == ("bitbucket-vpn", "both-vpns")
+    assert postures_satisfying("deploy") == ("both-vpns",)
+    assert postures_satisfying("tag_bitbucket") == ("bitbucket-vpn", "both-vpns")
+    assert postures_satisfying("tag_github") == ("firewall-off",)
+
+
+def test_describe_phase_posture_names_or_any() -> None:
+    assert describe_phase_posture("verify") == "any"
+    assert describe_phase_posture("publish") == "bitbucket-vpn or both-vpns"
+    assert describe_phase_posture("deploy") == "both-vpns"
+    assert describe_phase_posture("tag_bitbucket") == "bitbucket-vpn or both-vpns"
+    assert describe_phase_posture("tag_github") == "firewall-off"
 
 
 def test_endpoints_for_unknown_phase_raises_key_error() -> None:
@@ -111,7 +173,7 @@ def test_require_posture_unreachable_edge_node_matches_d7_message() -> None:
         )
 
     expected = (
-        "phase 'deploy' requires posture [bitbucket, edge]; "
+        "phase 'deploy' requires posture [both-vpns]; "
         "unreachable: hde2stl020004.mastercard.int:2222.\n"
         f"Switch the firewall posture, then re-run: {next_command}"
     )
@@ -212,5 +274,5 @@ def test_require_posture_raises_on_git_probe_failure(tmp_path) -> None:
         )
 
     message = str(exc_info.value)
-    assert "phase 'tag_github' requires posture [github]" in message
+    assert "phase 'tag_github' requires posture [firewall-off]" in message
     assert "exited 128" in message

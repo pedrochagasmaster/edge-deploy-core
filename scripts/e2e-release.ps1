@@ -166,12 +166,12 @@ function Assert-EngineVersion {
     $engineVersion = (& py -c 'import edge_deploy; print(edge_deploy.__version__)').Trim()
     Assert-CommandPassed 'Inspect loaded edge-deploy-core version'
 
-    if ($engineVersion -ne '1.3.0') {
+    if ($engineVersion -ne '1.4.0') {
         throw @"
-Expected edge-deploy-core version 1.3.0; loaded $engineVersion.
+Expected edge-deploy-core version 1.4.0; loaded $engineVersion.
 
 Install the tagged release engine (not editable):
-  py -m pip install "git+https://github.com/pedrochagasmaster/edge-deploy-core.git@v1.3.0"
+  py -m pip install "git+https://github.com/pedrochagasmaster/edge-deploy-core.git@v1.4.0"
 "@
     }
 }
@@ -186,54 +186,61 @@ function Ensure-BbToken {
     Remove-Variable secureToken
 }
 
-function Test-PostureEndpoint {
+function Test-PostureCapability {
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('github', 'bitbucket')]
-        [string]$Posture
+        [ValidateSet('github-read', 'github-write', 'bitbucket')]
+        [string]$Capability
     )
 
-    # Protocol-level probes only. TCP connects lie behind the corporate proxy
-    # (it accepts the connection, then 503s at the HTTP layer), and GitHub
-    # *reads* can succeed in postures where pushes fail — so the GitHub probe
-    # exercises the push path (dry-run negotiates git-receive-pack without
-    # updating any ref).
-    if ($Posture -eq 'github') {
-        cmd /c 'git push --dry-run origin HEAD >NUL 2>&1' | Out-Null
-    }
-    else {
-        cmd /c 'git ls-remote bitbucket HEAD >NUL 2>&1' | Out-Null
+    # Protocol-level probes only (ADR-0012/0013). TCP connects lie behind the
+    # corporate proxy (it accepts the connection, then 503s at the HTTP
+    # layer), and GitHub *reads* succeed in every posture while pushes need
+    # the firewall off — so the write probe exercises the push path (dry-run
+    # negotiates git-receive-pack without updating any ref).
+    switch ($Capability) {
+        'github-write' { cmd /c 'git push --dry-run origin HEAD >NUL 2>&1' | Out-Null }
+        'github-read'  { cmd /c 'git ls-remote origin HEAD >NUL 2>&1' | Out-Null }
+        'bitbucket'    { cmd /c 'git ls-remote bitbucket HEAD >NUL 2>&1' | Out-Null }
     }
 
     return ($LASTEXITCODE -eq 0)
 }
 
+# Which firewall postures (ADR-0013) grant each capability, for operator prompts.
+$script:CapabilityPostures = @{
+    'github-read'  = 'any posture'
+    'github-write' = 'firewall-off'
+    'bitbucket'    = 'bitbucket-vpn or both-vpns'
+}
+
 function Wait-PostureGate {
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('github', 'bitbucket')]
-        [string]$Posture,
+        [ValidateSet('github-read', 'github-write', 'bitbucket')]
+        [string]$Capability,
 
         [Parameter(Mandatory)][string]$Reason
     )
 
-    # Already in the right posture: continue silently, no prompt.
-    if (Test-PostureEndpoint -Posture $Posture) {
+    # Capability already available in the current posture: continue silently.
+    if (Test-PostureCapability -Capability $Capability) {
         return
     }
 
+    $postures = $script:CapabilityPostures[$Capability]
     while ($true) {
         Write-Host ''
-        Write-Host "==> $Posture posture required" -ForegroundColor Yellow
+        Write-Host "==> $Capability required (posture: $postures)" -ForegroundColor Yellow
         Write-Host $Reason
-        Read-Host "Switch firewall posture to [$Posture], then press Enter"
+        Read-Host "Switch firewall posture to [$postures], then press Enter"
 
         # Posture switches propagate over roughly a minute; the first requests
         # after a switch flake (503s / exit 128), so poll instead of trusting
         # one attempt.
-        Write-Host "Verifying $Posture reachability" -NoNewline
+        Write-Host "Verifying $Capability" -NoNewline
         for ($attempt = 0; $attempt -lt 18; $attempt++) {
-            if (Test-PostureEndpoint -Posture $Posture) {
+            if (Test-PostureCapability -Capability $Capability) {
                 Write-Host ' ok' -ForegroundColor Green
                 return
             }
@@ -242,7 +249,7 @@ function Wait-PostureGate {
         }
 
         Write-Host ''
-        Write-Host "$Posture endpoints still unreachable after 90s; posture switch may not have taken effect." -ForegroundColor Yellow
+        Write-Host "$Capability still unavailable after 90s; posture switch may not have taken effect." -ForegroundColor Yellow
     }
 }
 
@@ -295,7 +302,7 @@ function Update-ReleaseEnginePin {
     # Replace whatever engine version is currently pinned; no-op when the pin
     # already matches, so a pre-bumped checkout does not break the deps flow.
     $pinPattern = 'edge-deploy-core @ git\+https://github\.com/pedrochagasmaster/edge-deploy-core\.git@v\d+\.\d+\.\d+'
-    $pinNew = 'edge-deploy-core @ git+https://github.com/pedrochagasmaster/edge-deploy-core.git@v1.3.0'
+    $pinNew = 'edge-deploy-core @ git+https://github.com/pedrochagasmaster/edge-deploy-core.git@v1.4.0'
     $pyprojectPath = Join-Path $ToolPath 'pyproject.toml'
     $content = Get-Content $pyprojectPath -Raw
 
@@ -324,10 +331,10 @@ Cosmetic Python comment only. No runtime or dependency behavior changes.
 ## Validation
 - powershell -NoProfile -File tools/dev/local_check.ps1
 - Effective non-comment requirements compared before and after
-- Pins edge-deploy-core release extra to v1.3.0
+- Pins edge-deploy-core release extra to v1.4.0
 
 ## Release risk
-Comment-only requirements.txt change plus release-engine pin bump to v1.3.0.
+Comment-only requirements.txt change plus release-engine pin bump to v1.4.0.
 Dependency resolution is intentionally unchanged, but the dependency delivery
 path will run.
 "@
@@ -432,7 +439,7 @@ try {
 
     Set-Location $ToolPath
 
-    Wait-PostureGate -Posture github -Reason 'Preparation reads GitHub origin/main before creating the release exercise branch.'
+    Wait-PostureGate -Capability github-read -Reason 'Preparation reads GitHub origin/main before creating the release exercise branch.'
 
     git switch main
     Assert-CommandPassed "Switch $Tool to main"
@@ -490,7 +497,7 @@ try {
     git commit -m $commitMessage
     Assert-CommandPassed 'Commit cosmetic change'
 
-    Wait-PostureGate -Posture github -Reason 'The PR workflow now pushes the branch, creates the GitHub PR, and watches GitHub checks.'
+    Wait-PostureGate -Capability github-write -Reason 'The PR workflow now pushes the branch, creates the GitHub PR, and watches GitHub checks.'
 
     git push -u origin HEAD
     Assert-CommandPassed 'Push branch'
@@ -529,7 +536,7 @@ try {
     Write-Host ''
     Write-Host '==> Merge and post-merge CI' -ForegroundColor Cyan
 
-    Wait-PostureGate -Posture github -Reason 'Merging the PR and waiting for post-merge CI require GitHub access.'
+    Wait-PostureGate -Capability github-write -Reason 'Merging the PR and waiting for post-merge CI require GitHub write access.'
 
     gh pr merge $prNumber --squash --delete-branch
     Assert-CommandPassed 'Squash-merge pull request'
@@ -549,7 +556,7 @@ try {
     Write-Host '==> Guided release' -ForegroundColor Cyan
     Write-Host 'Running: py -m edge_deploy release --guided'
     Write-Host 'Switch firewall posture when prompted and enter RSA passcodes at each node prompt.'
-    Write-Host 'Expected switches: github (verify) -> bitbucket (publish/deploy/tag-bitbucket) -> github (tag-github).'
+    Write-Host 'Expected: verify runs in any posture; publish/deploy/tag-bitbucket need both-vpns; tag-github needs firewall-off (one switch when starting in both-vpns).'
     Write-Host ''
 
     # Posture switches make transient failures normal (the first pushes after a

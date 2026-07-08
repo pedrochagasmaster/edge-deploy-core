@@ -1,5 +1,11 @@
 # Posture-aware release flow
 
+> Posture model refined by
+> [ADR-0013](0013-five-posture-capability-model.md): GitHub read works in
+> every posture and the VPNs are independent, so the "two switches" here is
+> now one mandatory switch when starting in both-vpns. The probe mechanics,
+> settle loop, retries, and tag ordering decided here stand unchanged.
+
 ## Context
 
 The workstation firewall enforces an exclusive Posture: at most one of GitHub

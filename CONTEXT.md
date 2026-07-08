@@ -29,11 +29,22 @@ Nodes. Every check that judges deployed state — including Drift — is judged
 against the Snapshot's tree, never against the operator's working tree, which
 may have moved on (or behind) since the Snapshot.
 
-**Posture** is the workstation's exclusive firewall state. At any moment at
-most one of GitHub or Bitbucket-plus-Edge is writable; no posture allows
-writing to both. Switching posture is a human act outside the engine's
-control, and a switch is not instantaneous: endpoints can fail transiently
-while the new posture propagates.
+**Posture** is the workstation's firewall state, one of five (ADR-0013):
+
+| Posture           | GitHub read | GitHub write | Bitbucket | Edge Nodes |
+|-------------------|-------------|--------------|-----------|------------|
+| **Baseline**      | yes         | no           | no        | no         |
+| **Edge VPN**      | yes         | no           | no        | yes        |
+| **Bitbucket VPN** | yes         | no           | yes       | no         |
+| **Both VPNs**     | yes         | no           | yes       | yes        |
+| **Firewall Off**  | yes         | yes          | no        | no         |
+
+GitHub *read* (pull/fetch) works in every posture. GitHub *write* requires
+the firewall off, which drops both VPNs — so GitHub write and Bitbucket/Edge
+access are never held together. The Bitbucket and Edge VPNs are independent
+and may be held at once. Switching posture is a human act outside the
+engine's control, and a switch is not instantaneous: endpoints can fail
+transiently while the new posture propagates.
 
 **Run** is one durable release attempt, from creation to `complete` or
 `abandoned`. At most one Run may be open per Tool, and an open Run must be

@@ -30,11 +30,11 @@ from edge_deploy.phases.status import format_run_status, register_status
 from edge_deploy.phases.tag import _cmd_tag_bitbucket, _cmd_tag_github
 from edge_deploy.phases.verify import VERIFY_SPEC, ensure_verified
 from edge_deploy.posture import (
-    PHASE_ENDPOINTS,
     PHASE_GIT_PROBES,
     GitProbeRunner,
     PostureError,
     SocketConnector,
+    describe_phase_posture,
     endpoints_for,
     git_probe_failures,
     probe,
@@ -46,8 +46,10 @@ from edge_deploy.repository import RepositoryError, RepositoryState, inspect_rep
 from edge_deploy.tmux_driver import AuthenticationError, SessionGoneError, TmuxDriver
 
 TOOL_CHOICES = ("autobench", "robocop")
-# tag_bitbucket precedes tag_github (ADR-0012): it shares deploy's
-# bitbucket+edge posture, leaving one final switch to GitHub per release.
+# tag_bitbucket precedes tag_github (ADR-0012/0013): it shares deploy's
+# both-vpns posture, and verify (github read) runs in any posture — so a
+# release started in both-vpns needs exactly one switch, to firewall-off
+# for tag_github.
 RELEASE_PHASES = ("verify", "publish", "deploy", "tag_bitbucket", "tag_github")
 
 # Guided-mode retry backoff for transient remote failures right after a
@@ -201,13 +203,13 @@ def _phase_already_passed(ledger: RunLedger, phase: str, requested_nodes: list[s
     if phase == "deploy":
         return all(ledger.phase_state("deploy", node=node) == "passed" for node in requested_nodes)
     # "skipped" is a satisfied terminal state (e.g. verify on a rollback run):
-    # re-invoking the phase would be a no-op, but probing its posture first
-    # would wrongly demand GitHub reachability during a Bitbucket/Edge rollback.
+    # re-invoking the phase would be a no-op, and probing its endpoints first
+    # would gate the operator on connectivity the phase no longer needs.
     return ledger.phase_state(phase) in ("passed", "skipped")
 
 
 def _posture_display_keys(phase: str) -> str:
-    return "+".join(PHASE_ENDPOINTS[phase])
+    return describe_phase_posture(phase)
 
 
 def _resume_release_command(run_id: str, *, guided: bool) -> str:
@@ -268,9 +270,8 @@ def _wait_for_posture(
             return True
 
         if not guided:
-            posture_keys_csv = ", ".join(PHASE_ENDPOINTS[phase])
             print(
-                f"phase '{phase}' requires posture [{posture_keys_csv}]; "
+                f"phase '{phase}' requires posture [{posture_keys}]; "
                 f"unreachable: {', '.join(failures)}.\n"
                 f"Switch the firewall posture, then re-run: {resume_command}"
             )

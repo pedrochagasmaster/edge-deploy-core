@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "edge-console-demo",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["edge_console.py", "--demo", "--no-browser", "--port", "7643"],
+      "port": 7643
+    }
+  ]
+}
