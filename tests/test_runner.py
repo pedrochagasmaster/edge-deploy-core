@@ -232,7 +232,10 @@ def test_runner_script_never_invokes_bare_python3() -> None:
     """Regression: bare ``python3`` is not on PATH on the Edge Nodes; the runner
     must resolve a concrete interpreter before its JSON-summary step."""
     assert "\npython3" not in RUNNER_SCRIPT
-    assert 'edge_python="$(command -v python3.11 || command -v python3.10' in RUNNER_SCRIPT
+    assert 'edge_python="$(' in RUNNER_SCRIPT
+    assert "command -v python3.11 ||" in RUNNER_SCRIPT
+    assert "command -v python3.10 ||" in RUNNER_SCRIPT
+    assert "command -v python3 ||" in RUNNER_SCRIPT
     assert '"$edge_python" <<PY' in RUNNER_SCRIPT
     assert "/sys_apps_01/python/python310/bin/python3.10" in RUNNER_SCRIPT
 

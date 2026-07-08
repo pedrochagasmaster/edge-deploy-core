@@ -41,7 +41,12 @@ sh -c "$cmd" >"$out_file" 2>&1 || exit_code=$?
 finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 # Bare python3 is not on PATH on the Edge Nodes; resolve a concrete interpreter.
-edge_python="$(command -v python3.11 || command -v python3.10 || command -v python3 || printf %s /sys_apps_01/python/python310/bin/python3.10)"
+edge_python="$(
+  command -v python3.11 ||
+    command -v python3.10 ||
+    command -v python3 ||
+    printf %s /sys_apps_01/python/python310/bin/python3.10
+)"
 
 "$edge_python" <<PY
 import json
