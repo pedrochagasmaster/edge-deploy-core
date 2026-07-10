@@ -3,3 +3,10 @@
 *.sh text eol=lf
 *.yaml text eol=lf
 *.yml text eol=lf
+
+# engine_identity() (edge_deploy/ledger.py) hashes every edge_deploy/**/*.py
+# file's raw bytes to pin a run to the engine that started it. Without a
+# forced eol, core.autocrlf drift (or a stale pre-.gitattributes checkout)
+# changes that hash without changing any git-visible content, and a run can
+# get stranded: EngineMismatchError even though the source is unchanged.
+*.py text eol=lf
