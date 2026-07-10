@@ -14,12 +14,14 @@ included in a ``repr()``.
 
 from __future__ import annotations
 
+import hashlib
 import queue
 import re
 import shlex
 import socket
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable
@@ -28,12 +30,16 @@ import paramiko
 
 from edge_deploy.config import NodeConfig
 from edge_deploy.preflight import endpoint_from_node
+from edge_deploy.remote_paths import resolve_home_path
 from edge_deploy.transport import (
     AuthenticationError,
     ConnectionLostError,
     HostKeyError,
     InteractiveChannelError,
     RemoteCommandTimeout,
+    TransferError,
+    TransferProgress,
+    TransferProgressCallback,
     TransportUnavailable,
 )
 
@@ -41,6 +47,14 @@ DEFAULT_KEEPALIVE_SECONDS = 5
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 15.0
 _AUTH_COMPLETION_TIMEOUT_SECONDS = 15.0
 _PTY_TRANSCRIPT_LIMIT = 65536
+_TRANSFER_TIMEOUT_SECONDS = 120.0
+_TRANSFER_HASH_CHUNK_BYTES = 1024 * 1024
+_PROGRESS_MIN_INTERVAL_S = 1.0
+
+
+class SftpUnavailable(TransferError):
+    """The authenticated transport rejected the ``sftp`` subsystem; fall back to a
+    binary exec-channel transfer instead."""
 
 
 @dataclass(frozen=True)
@@ -158,12 +172,14 @@ class ParamikoSshTransport:
         session: str,
         socket_factory: Callable[..., socket.socket] = socket.create_connection,
         transport_factory: Callable[[socket.socket], paramiko.Transport] = paramiko.Transport,
+        sftp_client_factory: Callable[[paramiko.Channel], object] = paramiko.SFTPClient,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._settings = settings
         self.session = session
         self._socket_factory = socket_factory
         self._transport_factory = transport_factory
+        self._sftp_client_factory = sftp_client_factory
         self._clock = clock
         self._socket: socket.socket | None = None
         self._transport: paramiko.Transport | None = None
@@ -602,3 +618,244 @@ class ParamikoSshTransport:
         except BaseException as exc:
             self._close_interactive_channel()
             raise InteractiveChannelError("Could not send the secret to the interactive channel") from exc
+
+    # ------------------------------------------------------------------
+    # Verified binary transfer
+    # ------------------------------------------------------------------
+
+    def _resolve_remote_home(self, deadline: float) -> PurePosixPath:
+        if self._remote_home is not None:
+            return self._remote_home
+        text, exit_status = self.run_remote('printf "%s" "$HOME"', timeout=max(deadline - self._clock(), 0.001))
+        if exit_status != 0 or not text:
+            raise TransferError("Could not resolve the remote home directory")
+        if not text.startswith("/") or "\n" in text or "\r" in text:
+            raise TransferError("Remote home directory was not an absolute single-line POSIX path")
+        self._remote_home = PurePosixPath(text)
+        return self._remote_home
+
+    def _remote_sha256(self, remote_path: str, deadline: float) -> str | None:
+        quoted = shlex.quote(remote_path)
+        text, exit_status = self.run_remote(
+            f"sha256sum -- {quoted} 2>/dev/null | awk '{{print $1}}'",
+            timeout=max(deadline - self._clock(), 0.001),
+        )
+        digest = text.strip()
+        if exit_status != 0 or len(digest) != 64:
+            return None
+        return digest
+
+    def _atomic_mv(self, source: str, dest: str, deadline: float) -> None:
+        quoted_source = shlex.quote(source)
+        quoted_dest = shlex.quote(dest)
+        _text, exit_status = self.run_remote(
+            f"mv -f -- {quoted_source} {quoted_dest}",
+            timeout=max(deadline - self._clock(), 0.001),
+        )
+        if exit_status != 0:
+            raise TransferError("Could not atomically replace the destination file")
+
+    def _remove_remote_best_effort(self, remote_path: str, deadline: float) -> None:
+        quoted = shlex.quote(remote_path)
+        try:
+            self.run_remote(f"rm -f -- {quoted}", timeout=max(deadline - self._clock(), 1.0))
+        except BaseException:
+            pass
+
+    def _verify_remote_size_and_digest(
+        self, remote_path: str, *, expected_size: int, expected_digest: str, deadline: float
+    ) -> None:
+        quoted = shlex.quote(remote_path)
+        text, exit_status = self.run_remote(
+            f'stat -c "%s" -- {quoted}',
+            timeout=max(deadline - self._clock(), 0.001),
+        )
+        if exit_status != 0 or text.strip() != str(expected_size):
+            raise TransferError("Uploaded part file size verification failed")
+        digest = self._remote_sha256(remote_path, deadline)
+        if digest != expected_digest:
+            raise TransferError("Uploaded part file digest verification failed")
+
+    def upload_file(
+        self,
+        source: str | Path,
+        remote_path: str,
+        *,
+        progress: TransferProgressCallback | None = None,
+    ) -> str:
+        """Stream ``source`` to ``remote_path`` over SFTP (falling back to a binary exec
+        channel when the SFTP subsystem is unavailable), verifying the uploaded part
+        file's size and SHA-256 digest before atomically replacing the destination.
+
+        Reuses an existing destination whose remote digest already matches the local
+        file's digest without transferring any bytes. Never reads the local file twice:
+        it is hashed in 1 MiB chunks and then re-opened for the transfer itself.
+        """
+        source_path = Path(source)
+        deadline = self._clock() + _TRANSFER_TIMEOUT_SECONDS
+        home = self._resolve_remote_home(deadline)
+        final_path = resolve_home_path(remote_path, str(home))
+
+        local_digest = _sha256_file(source_path)
+        total_bytes = source_path.stat().st_size
+        started = self._clock()
+
+        def emit(bytes_sent: int) -> None:
+            if progress is not None:
+                progress(
+                    TransferProgress(
+                        bytes_sent=bytes_sent,
+                        total_bytes=total_bytes,
+                        elapsed_s=self._clock() - started,
+                    )
+                )
+
+        remote_digest = self._remote_sha256(final_path, deadline)
+        if remote_digest == local_digest:
+            emit(0)
+            emit(total_bytes)
+            return local_digest
+
+        part_path = f"{final_path}.edge-deploy-{uuid.uuid4().hex}.part"
+        emit(0)
+        try:
+            try:
+                self._sftp_upload(source_path, part_path, total_bytes=total_bytes, deadline=deadline, emit=emit)
+            except SftpUnavailable:
+                self._stream_upload(source_path, part_path, total_bytes=total_bytes, deadline=deadline, emit=emit)
+            self._verify_remote_size_and_digest(
+                part_path, expected_size=total_bytes, expected_digest=local_digest, deadline=deadline
+            )
+            self._atomic_mv(part_path, final_path, deadline)
+        except SftpUnavailable as exc:
+            self._remove_remote_best_effort(part_path, deadline)
+            raise TransferError("Binary transfer failed") from exc
+        except TransferError:
+            self._remove_remote_best_effort(part_path, deadline)
+            raise
+        except BaseException as exc:
+            self._remove_remote_best_effort(part_path, deadline)
+            raise TransferError("Binary transfer failed") from exc
+        emit(total_bytes)
+        return local_digest
+
+    def _open_sftp_client(self, deadline: float) -> tuple[paramiko.SFTPClient, paramiko.Channel]:
+        transport = self._require_active_transport()
+        channel = self._open_session_channel(transport, deadline)
+        try:
+            try:
+                self._channel_call_with_deadline(channel, deadline, lambda: channel.invoke_subsystem("sftp"))
+            except paramiko.SSHException as exc:
+                raise SftpUnavailable("The SFTP subsystem was rejected by the server") from exc
+            try:
+                sftp = self._channel_call_with_deadline(
+                    channel, deadline, lambda: self._sftp_client_factory(channel)
+                )
+            except paramiko.SSHException as exc:
+                raise SftpUnavailable("The SFTP subsystem was rejected by the server") from exc
+            if sftp is None:
+                raise TransferError("SFTP protocol construction returned no client")
+            return sftp, channel
+        except BaseException:
+            if not self._poisoned:
+                try:
+                    channel.close()
+                except BaseException:
+                    pass
+            raise
+
+    def _sftp_upload(
+        self,
+        source_path: Path,
+        part_path: str,
+        *,
+        total_bytes: int,
+        deadline: float,
+        emit: Callable[[int], None],
+    ) -> None:
+        sftp, channel = self._open_sftp_client(deadline)
+        last_emit = self._clock()
+        try:
+            with source_path.open("rb") as handle:
+
+                def on_sftp_progress(bytes_sent: int, _total: int) -> None:
+                    nonlocal last_emit
+                    now = self._clock()
+                    if bytes_sent >= total_bytes or now - last_emit >= _PROGRESS_MIN_INTERVAL_S:
+                        last_emit = now
+                        emit(bytes_sent)
+
+                self._channel_call_with_deadline(
+                    channel,
+                    deadline,
+                    lambda: sftp.putfo(handle, part_path, file_size=total_bytes, callback=on_sftp_progress),
+                )
+            self._channel_call_with_deadline(channel, deadline, lambda: sftp.chmod(part_path, 0o600))
+        finally:
+            try:
+                sftp.close()
+            except BaseException:
+                pass
+            if not self._poisoned:
+                try:
+                    channel.close()
+                except BaseException:
+                    pass
+
+    def _stream_upload(
+        self,
+        source_path: Path,
+        part_path: str,
+        *,
+        total_bytes: int,
+        deadline: float,
+        emit: Callable[[int], None],
+    ) -> None:
+        """Upload over a binary exec channel by streaming raw chunks into ``cat``.
+
+        No base64 encoding is used: the payload is sent as exact raw bytes via
+        ``sendall()``, then the write side is closed so the remote ``cat`` sees EOF.
+        """
+        transport = self._require_active_transport()
+        channel = self._open_session_channel(transport, deadline)
+        quoted_part = shlex.quote(part_path)
+        try:
+            self._channel_call_with_deadline(
+                channel,
+                deadline,
+                lambda: channel.exec_command(f"umask 077; cat > {quoted_part}"),
+            )
+            sent = 0
+            last_emit = self._clock()
+            with source_path.open("rb") as handle:
+                while True:
+                    chunk = handle.read(65536)
+                    if not chunk:
+                        break
+                    self._channel_call_with_deadline(channel, deadline, lambda c=chunk: channel.sendall(c))
+                    sent += len(chunk)
+                    now = self._clock()
+                    if sent >= total_bytes or now - last_emit >= _PROGRESS_MIN_INTERVAL_S:
+                        last_emit = now
+                        emit(sent)
+            self._channel_call_with_deadline(channel, deadline, channel.shutdown_write)
+            _transcript, exit_status = self._drain_channel(channel, deadline=deadline)
+        finally:
+            if not self._poisoned:
+                try:
+                    channel.close()
+                except BaseException:
+                    pass
+        if exit_status != 0:
+            raise TransferError("Binary exec-channel upload failed")
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(_TRANSFER_HASH_CHUNK_BYTES)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()

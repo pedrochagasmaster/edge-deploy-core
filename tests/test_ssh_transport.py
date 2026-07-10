@@ -8,6 +8,8 @@ because that verification logic is exactly what these tests must exercise.
 
 from __future__ import annotations
 
+import hashlib
+import stat
 import threading
 from pathlib import Path
 
@@ -21,6 +23,8 @@ from edge_deploy.transport import (
     HostKeyError,
     InteractiveChannelError,
     RemoteCommandTimeout,
+    TransferError,
+    TransferProgress,
 )
 
 # ---------------------------------------------------------------------------
@@ -634,3 +638,344 @@ def test_stop_session_is_idempotent(authenticated_transport) -> None:
     driver = authenticated_transport.driver
     driver.stop_session()
     driver.stop_session()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# SFTP / binary transfer fakes
+# ---------------------------------------------------------------------------
+
+
+class FakeRemoteFile:
+    """A remote file's tracked contents, mode, and existence for the fake filesystem."""
+
+    def __init__(self, data: bytes, *, mode: int = 0o600) -> None:
+        self.data = data
+        self.mode = mode
+
+
+class FakeSftpAttr:
+    def __init__(self, size: int, mode: int) -> None:
+        self.st_size = size
+        self.st_mode = mode
+
+
+class FakeSftpClient:
+    """Stands in for ``paramiko.SFTPClient`` against an in-memory remote filesystem."""
+
+    def __init__(self, files: dict[str, FakeRemoteFile], *, put_calls: list[str], atomic_renames: list[int]) -> None:
+        self._files = files
+        self._put_calls = put_calls
+        self._atomic_renames = atomic_renames
+        self.closed = False
+
+    def putfo(self, source_handle, remote_path: str, *, file_size: int = 0, callback=None) -> None:  # noqa: ARG002
+        self._put_calls.append(remote_path)
+        data = source_handle.read()
+        if callback is not None:
+            callback(len(data), len(data))
+        self._files[remote_path] = FakeRemoteFile(data, mode=0o644)
+
+    def chmod(self, remote_path: str, mode: int) -> None:
+        self._files[remote_path].mode = mode
+
+    def stat(self, remote_path: str) -> FakeSftpAttr:
+        if remote_path not in self._files:
+            raise FileNotFoundError(remote_path)
+        entry = self._files[remote_path]
+        return FakeSftpAttr(len(entry.data), stat.S_IFREG | entry.mode)
+
+    def posix_rename(self, source: str, dest: str) -> None:
+        self._atomic_renames.append(1)
+        self._files[dest] = self._files.pop(source)
+
+    def remove(self, remote_path: str) -> None:
+        self._files.pop(remote_path, None)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class SftpSessionTransport(ScriptedSessionTransport):
+    """An authenticated fake transport whose command channel answers ``$HOME``,
+    ``sha256sum``, and ``stat``/``mv`` probes against an in-memory remote filesystem,
+    and whose SFTP subsystem is backed by :class:`FakeSftpClient`."""
+
+    def __init__(
+        self,
+        _sock: object,
+        *,
+        server_key: paramiko.PKey,
+        home: str = "/home/operator",
+        sftp_available: bool = True,
+        files: dict[str, FakeRemoteFile] | None = None,
+        digest_mismatch: bool = False,
+    ) -> None:
+        super().__init__(_sock, server_key=server_key)
+        self.home = home
+        self.sftp_available = sftp_available
+        self.files: dict[str, FakeRemoteFile] = files if files is not None else {}
+        self.digest_mismatch = digest_mismatch
+        self.sftp_put_calls: list[str] = []
+        self.atomic_renames: list[int] = []
+        self.part_files_removed: list[str] = []
+        self.binary_stream_uploads = 0
+        self.base64_commands: list[str] = []
+
+    def open_session(self, timeout: float | None = None) -> "FakeCommandOrSftpChannel":  # noqa: ARG002
+        channel = FakeCommandOrSftpChannel(self)
+        self.opened_channels.append(channel)
+        return channel
+
+    def _part_files(self) -> list[str]:
+        return [name for name in self.files if ".edge-deploy-" in name and name.endswith(".part")]
+
+
+class FakeCommandOrSftpChannel(FakeChannel):
+    """A session channel that answers either shell commands (``$HOME``, ``sha256sum``,
+    atomic ``mv``, cleanup) or an ``sftp`` subsystem request, mirroring how one Paramiko
+    session channel can become either kind of conversation."""
+
+    def __init__(self, backing: SftpSessionTransport) -> None:
+        super().__init__()
+        self._backing = backing
+        self._reply = b""
+        self._exit_status_value = 0
+        self._is_sftp = False
+
+    def invoke_subsystem(self, name: str) -> None:
+        if name != "sftp":
+            raise ValueError(f"unsupported subsystem {name!r}")
+        if not self._backing.sftp_available:
+            self.closed = True
+            raise paramiko.SSHException("Channel closed.")
+        self._is_sftp = True
+
+    def exec_command(self, command: str) -> None:
+        self.exec_command_calls.append(command)
+        backing = self._backing
+        if "base64" in command:
+            backing.base64_commands.append(command)
+        if command == 'printf "%s" "$HOME"' or command == "printf '%s' \"$HOME\"":
+            self._reply = backing.home.encode("utf-8")
+            self._exit_status_value = 0
+        elif command.startswith("sha256sum"):
+            target = _extract_quoted_path(command)
+            entry = backing.files.get(target)
+            if entry is None:
+                self._exit_status_value = 1
+            else:
+                digest = hashlib.sha256(entry.data).hexdigest()
+                if backing.digest_mismatch:
+                    digest = "0" * 64
+                # Mirrors "sha256sum -- path | awk '{print $1}'": only the digest field.
+                self._reply = f"{digest}\n".encode()
+                self._exit_status_value = 0
+        elif command.startswith("stat -c"):
+            target = _extract_quoted_path(command)
+            entry = backing.files.get(target)
+            if entry is None:
+                self._exit_status_value = 1
+            else:
+                self._reply = f"{len(entry.data)}\n".encode()
+                self._exit_status_value = 0
+        elif command.startswith("mv "):
+            parts = command.split()
+            source, dest = parts[-2], parts[-1]
+            source = source.strip("'")
+            dest = dest.strip("'")
+            if source in backing.files:
+                backing.files[dest] = backing.files.pop(source)
+                backing.atomic_renames.append(1)
+                self._exit_status_value = 0
+            else:
+                self._exit_status_value = 1
+        elif command.startswith("rm -f"):
+            target = _extract_quoted_path(command)
+            if target in backing.files:
+                backing.files.pop(target)
+                backing.part_files_removed.append(target)
+            self._exit_status_value = 0
+        elif "cat >" in command:
+            backing.binary_stream_uploads += 1
+            target = command.split("cat >", 1)[1].strip().strip("'")
+            self._pending_stream_target = target
+            self._exit_status_value = 0
+        else:
+            self._exit_status_value = 0
+
+    def sendall(self, data: bytes) -> None:
+        super().sendall(data)
+        target = getattr(self, "_pending_stream_target", None)
+        if target is not None:
+            existing = self._backing.files.get(target)
+            merged = (existing.data if existing else b"") + bytes(self.sent)
+            self._backing.files[target] = FakeRemoteFile(merged)
+
+    def shutdown_write(self) -> None:
+        self.shutdown_write_called = True
+
+    def recv_ready(self) -> bool:
+        return bool(self._reply)
+
+    def recv(self, _n: int) -> bytes:
+        data, self._reply = self._reply, b""
+        return data
+
+    def recv_stderr_ready(self) -> bool:
+        return False
+
+    def recv_stderr(self, _n: int) -> bytes:
+        return b""
+
+    def exit_status_ready(self) -> bool:
+        return True
+
+    def recv_exit_status(self) -> int:
+        return self._exit_status_value
+
+
+def _extract_quoted_path(command: str) -> str:
+    """Return the path token immediately following a lone ``--`` argument separator."""
+    tokens = command.split()
+    for index, token in enumerate(tokens):
+        if token == "--" and index + 1 < len(tokens):
+            return tokens[index + 1].strip("'\"")
+    raise ValueError(f"could not find a path token in fake command {command!r}")
+
+
+def _sftp_transport(
+    tmp_path: Path,
+    server_key: paramiko.RSAKey,
+    *,
+    home: str = "/home/operator",
+    sftp_available: bool = True,
+    files: dict[str, FakeRemoteFile] | None = None,
+    digest_mismatch: bool = False,
+) -> tuple[ParamikoSshTransport, SftpSessionTransport]:
+    settings = _settings(tmp_path)
+    _write_known_hosts(settings.known_hosts_path, settings.hostname, settings.port, server_key)
+
+    backing_holder: dict[str, SftpSessionTransport] = {}
+
+    def transport_factory(sock: object) -> SftpSessionTransport:
+        backing = SftpSessionTransport(
+            sock,
+            server_key=server_key,
+            home=home,
+            sftp_available=sftp_available,
+            files=files,
+            digest_mismatch=digest_mismatch,
+        )
+        backing_holder["transport"] = backing
+        return backing
+
+    def sftp_client_factory(channel: object) -> FakeSftpClient:
+        backing = backing_holder["transport"]
+        if not backing.sftp_available:
+            raise paramiko.SSHException("Channel closed.")
+        return FakeSftpClient(backing.files, put_calls=backing.sftp_put_calls, atomic_renames=backing.atomic_renames)
+
+    transport = ParamikoSshTransport(
+        settings,
+        session="edge-node03",
+        socket_factory=fake_socket_factory,
+        transport_factory=transport_factory,
+        sftp_client_factory=sftp_client_factory,
+    )
+    transport.start_session(connect_timeout=1.0)
+    transport.submit_secret("one-time-code")
+    transport.await_authenticated(timeout=1.0)
+    return transport, backing_holder["transport"]
+
+
+class _SftpDriver:
+    """Small holder exposing the transport under test plus fake-filesystem test hooks."""
+
+    def __init__(self, driver: ParamikoSshTransport, backing: SftpSessionTransport) -> None:
+        self.driver = driver
+        self._backing = backing
+
+    def remote_file(self, name: str, data: bytes) -> None:
+        self._backing.files[f"{self._backing.home}/{name}"] = FakeRemoteFile(data)
+
+    def upload_file(self, source: Path, remote_path: str, *, progress=None) -> str:
+        return self.driver.upload_file(source, remote_path, progress=progress)
+
+    @property
+    def sftp_put_calls(self) -> list[str]:
+        return self._backing.sftp_put_calls
+
+    @property
+    def atomic_renames(self) -> int:
+        return len(self._backing.atomic_renames)
+
+    @property
+    def part_files(self) -> list[str]:
+        return self._backing._part_files()
+
+
+@pytest.fixture
+def authenticated_sftp_transport(tmp_path: Path, server_key: paramiko.RSAKey) -> _SftpDriver:
+    driver, backing = _sftp_transport(tmp_path, server_key)
+    return _SftpDriver(driver, backing)
+
+
+@pytest.fixture
+def mismatch_sftp_transport(tmp_path: Path, server_key: paramiko.RSAKey) -> _SftpDriver:
+    files = {"/home/operator/.edge-deploy/bundle.zip": FakeRemoteFile(b"previous-verified-bundle")}
+    driver, backing = _sftp_transport(tmp_path, server_key, files=files, digest_mismatch=True)
+    return _SftpDriver(driver, backing)
+
+
+@pytest.fixture
+def no_sftp_transport(tmp_path: Path, server_key: paramiko.RSAKey) -> _SftpDriver:
+    driver, backing = _sftp_transport(tmp_path, server_key, sftp_available=False)
+    return _SftpDriver(driver, backing)
+
+
+# ---------------------------------------------------------------------------
+# Verified binary transfer tests
+# ---------------------------------------------------------------------------
+
+
+def test_upload_reuses_matching_remote_digest(authenticated_sftp_transport, tmp_path: Path) -> None:
+    source = tmp_path / "bundle.zip"
+    source.write_bytes(b"already-present")
+    authenticated_sftp_transport.remote_file(source.name, source.read_bytes())
+    digest = authenticated_sftp_transport.upload_file(source, f"~/{source.name}")
+    assert digest == hashlib.sha256(source.read_bytes()).hexdigest()
+    assert authenticated_sftp_transport.sftp_put_calls == []
+
+
+def test_upload_verifies_part_then_atomically_replaces(authenticated_sftp_transport, tmp_path: Path) -> None:
+    source = tmp_path / "bundle.zip"
+    source.write_bytes(b"new-bundle")
+    snapshots: list[TransferProgress] = []
+    digest = authenticated_sftp_transport.upload_file(
+        source,
+        "~/.edge-deploy/bundle.zip",
+        progress=snapshots.append,
+    )
+    assert digest == hashlib.sha256(b"new-bundle").hexdigest()
+    assert snapshots[0].bytes_sent == 0
+    assert snapshots[-1].bytes_sent == len(b"new-bundle")
+    assert authenticated_sftp_transport.atomic_renames == 1
+    assert authenticated_sftp_transport.part_files == []
+
+
+def test_digest_mismatch_removes_part_and_preserves_final(mismatch_sftp_transport, tmp_path: Path) -> None:
+    source = tmp_path / "bundle.zip"
+    source.write_bytes(b"corrupt-in-transit")
+    with pytest.raises(TransferError, match="digest verification failed"):
+        mismatch_sftp_transport.upload_file(source, "~/.edge-deploy/bundle.zip")
+    final = mismatch_sftp_transport._backing.files["/home/operator/.edge-deploy/bundle.zip"]
+    assert final.data == b"previous-verified-bundle"
+    assert mismatch_sftp_transport.part_files == []
+
+
+def test_sftp_unavailable_uses_binary_exec_channel(no_sftp_transport, tmp_path: Path) -> None:
+    source = tmp_path / "bundle.zip"
+    source.write_bytes(b"binary\x00payload")
+    no_sftp_transport.upload_file(source, "~/.edge-deploy/bundle.zip")
+    assert no_sftp_transport._backing.binary_stream_uploads == 1
+    assert no_sftp_transport._backing.base64_commands == []
