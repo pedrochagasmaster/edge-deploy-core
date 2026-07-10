@@ -168,6 +168,7 @@ class FakeTmuxDriver:
         self.sent_secrets: list[str] = []
         self.sent_keys: list[str] = []
         self.uploads: list[tuple[Path, str]] = []
+        self.uploaded_contents: list[tuple[Path, str, str]] = []
         self.start_session_calls: list[dict[str, Any]] = []
         self.await_timeouts: list[float | None] = []
         # Attributes the CLI/engine read directly off a driver.
@@ -198,6 +199,7 @@ class FakeTmuxDriver:
     ) -> str:
         self.uploads.append((Path(source), remote_path))
         data = Path(source).read_bytes()
+        self.uploaded_contents.append((Path(source), remote_path, data.decode("utf-8", "replace")))
         total_bytes = len(data)
         if progress is not None:
             progress(TransferProgress(bytes_sent=0, total_bytes=total_bytes, elapsed_s=0.0))

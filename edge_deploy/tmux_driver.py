@@ -32,6 +32,7 @@ import time
 import uuid
 from pathlib import Path
 
+from edge_deploy.remote_paths import shell_remote_path
 from edge_deploy.remote_python import REMOTE_PYTHON_EXPR
 from edge_deploy.transport import (
     AuthenticationError,
@@ -64,14 +65,6 @@ DASHBOARD_TOP_RE = r"running first|n New Job\b"
 _AUTH_RE = r"PASSCODE:|[Pp]assword:|PIN:"
 
 
-def _shell_remote_path(remote_path: str) -> str:
-    """Return a shell path expression safe for unquoted ``$HOME`` tilde expansion."""
-    if remote_path.startswith("~/"):
-        remainder = remote_path[2:]
-        if remainder:
-            return f"$HOME/{shlex.quote(remainder)}"
-        return "$HOME"
-    return shlex.quote(remote_path)
 _PROMPT_RE = r"[\$#]\s*$"
 
 
@@ -355,7 +348,7 @@ class TmuxDriver:
         start_time = time.monotonic()
         if progress is not None:
             progress(TransferProgress(bytes_sent=0, total_bytes=total_bytes, elapsed_s=0.0))
-        shell_path = _shell_remote_path(remote_path)
+        shell_path = shell_remote_path(remote_path)
         precheck_cmd = (
             f"test -f {shell_path} && "
             f"sha256sum {shell_path} | cut -d' ' -f1 || echo MISSING"
@@ -376,8 +369,8 @@ class TmuxDriver:
         remote_dir = posixpath.dirname(remote_path) or "."
         upload_id = uuid.uuid4().hex[:12]
         remote_b64 = f"{remote_path}.edge-deploy-{upload_id}.b64"
-        shell_b64 = _shell_remote_path(remote_b64)
-        mkdir_cmd = f"mkdir -p {_shell_remote_path(remote_dir)} && rm -f {shell_b64}"
+        shell_b64 = shell_remote_path(remote_b64)
+        mkdir_cmd = f"mkdir -p {shell_remote_path(remote_dir)} && rm -f {shell_b64}"
         _screen, rc = self.run_remote(mkdir_cmd, timeout=60.0)
         if rc:
             raise RuntimeError(f"authenticated bundle transfer failed: could not prepare {remote_dir}")

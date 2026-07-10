@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 from edge_deploy.config import DependencyBundleConfig, ToolProfile
+from edge_deploy.remote_paths import edge_deploy_path, shell_remote_path
 from edge_deploy.runner import bootstrap_runner, read_remote_json, run_step
 
 BUNDLE_SCHEMA = "edge-deploy/dependency-bundle/1"
@@ -257,8 +258,8 @@ def _stage_script(
 import hashlib, json, os, shutil, subprocess, sys, tempfile, zipfile
 from pathlib import Path
 
-archive = Path(os.path.expandvars({remote_archive!r}))
-root = Path("/ads_storage") / os.environ["USER"] / ".edge-deploy" / "bundles" / {bundle.tool!r}
+archive = Path(os.path.expanduser({remote_archive!r}))
+root = Path(os.path.expanduser({edge_deploy_path("bundles", bundle.tool)!r}))
 final = root / {bundle.digest!r}
 expected_source = {bundle.source_sha!r}
 expected_digest = {bundle.digest!r}
@@ -353,17 +354,12 @@ def deliver_dependency_bundle(
     config = profile.dependency_bundle
     if config is None:
         raise BundleError(f"{profile.tool} has no dependency bundle configuration")
-    remote_archive = (
-        f"/ads_storage/$USER/.edge-deploy/bundles/{profile.tool}/"
-        f".incoming/{bundle.digest}.zip"
-    )
-    stage_script_remote = (
-        f"/ads_storage/$USER/.edge-deploy/bundles/{profile.tool}/"
-        f".incoming/stage-{bundle.digest}.py"
-    )
+    incoming = edge_deploy_path("bundles", profile.tool, ".incoming")
+    remote_archive = f"{incoming}/{bundle.digest}.zip"
+    stage_script_remote = f"{incoming}/stage-{bundle.digest}.py"
     runner_path = bootstrap_runner(driver, run_id)  # type: ignore[arg-type]
     screen, code = driver.run_remote(  # type: ignore[attr-defined]
-        f"mkdir -p /ads_storage/$USER/.edge-deploy/bundles/{profile.tool}/.incoming",
+        f"mkdir -p {shell_remote_path(incoming)}",
         timeout=30,
     )
     if code:

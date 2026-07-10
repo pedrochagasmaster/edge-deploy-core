@@ -159,7 +159,7 @@ def test_delivery_transfers_then_records_verified_remote_stage(tmp_path: Path) -
     )
 
     assert any(
-        remote == f"/ads_storage/$USER/.edge-deploy/bundles/demo/.incoming/{bundle.digest}.zip"
+        remote == f"~/.edge-deploy/bundles/demo/.incoming/{bundle.digest}.zip"
         for _, remote in driver.uploads
     )
     assert any("stage-" in remote and remote.endswith(".py") for _, remote in driver.uploads)
@@ -214,3 +214,59 @@ def test_delivery_reuse_path_unchanged(tmp_path: Path) -> None:
     assert delivered.reused is True
     assert delivered.remote_dir.endswith(bundle.digest)
     assert set(delivered.evidence.keys()) >= {"remote_dir", "reused", "bundle_digest"}
+
+
+def test_delivery_paths_are_variable_free_and_stage_script_expands_user_home(
+    tmp_path: Path,
+) -> None:
+    wheel = tmp_path / "demo-1.0-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+    bundle = create_dependency_bundle(
+        tool="demo",
+        source_sha="e" * 40,
+        dependency_files={"requirements.txt": b"demo==1.0\n"},
+        wheels=[wheel],
+        config=_config(),
+        output_dir=tmp_path / "bundle",
+    )
+    remote_dir = f"/ads_storage/test/.edge-deploy/bundles/demo/{bundle.digest}"
+    evidence = {
+        "remote_dir": remote_dir,
+        "reused": False,
+        "bundle_digest": bundle.digest,
+    }
+    driver = FakeTmuxDriver(
+        runner_step_results={
+            "dependency-stage": {
+                "schema": "edge-deploy/step/1",
+                "step": "dependency-stage",
+                "exit_code": 0,
+                "started_at": "2026-07-03T12:00:00Z",
+                "finished_at": "2026-07-03T12:00:01Z",
+                "stdout_tail": "",
+            },
+            "dependency-stage-evidence": evidence,
+        }
+    )
+
+    deliver_dependency_bundle(
+        driver,
+        ToolProfile(tool="demo", dependency_bundle=_config()),
+        bundle,
+        run_id="run-variable-free",
+    )
+
+    for _, remote in driver.uploads:
+        assert "/ads_storage/$USER" not in remote
+        assert "$USER" not in remote
+    for command in driver.commands:
+        assert "/ads_storage/$USER" not in command
+        assert "$USER" not in command
+
+    stage_script = next(
+        content for _, remote, content in driver.uploaded_contents if "stage-" in remote
+    )
+    assert "Path(os.path.expanduser(" in stage_script
+    assert "os.path.expandvars(" not in stage_script
+    assert "/ads_storage/$USER" not in stage_script
+    assert "$USER" not in stage_script

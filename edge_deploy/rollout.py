@@ -24,6 +24,7 @@ from typing import Callable
 
 from edge_deploy.config import ToolProfile
 from edge_deploy.dependencies import BundleError, DependencyBundle, deliver_dependency_bundle
+from edge_deploy.remote_paths import edge_deploy_path, shell_remote_path
 from edge_deploy.remote_python import REMOTE_PYTHON_EXPR
 from edge_deploy.reporting import OperationReport, ReportCheck, report_node_name
 from edge_deploy.runner import bootstrap_runner, read_remote_json, read_remote_text, run_step
@@ -639,9 +640,9 @@ def run_rollout(
 
     install = decide_install_action(profile, mode=install_mode, changed_paths=changed_paths)
     if not bundle_dir and install.action == "run" and profile.dependency_bundle is not None:
-        current_bundle = f"/ads_storage/$USER/.edge-deploy/bundles/{profile.tool}/current"
+        current_bundle = edge_deploy_path("bundles", profile.tool, "current")
         _screen, current_code = driver.run_remote(
-            f"test -f {current_bundle}/manifest.json",
+            f"test -f {shell_remote_path(current_bundle)}/manifest.json",
             timeout=30,
         )
         if current_code == 0:
@@ -771,10 +772,12 @@ def run_rollout(
                 )
             )
             if install_code == 0 and bundle_dir and dependency_evidence is not None:
+                bundles_dir = edge_deploy_path("bundles", profile.tool)
+                current_link = edge_deploy_path("bundles", profile.tool, "current")
                 _activate_screen, activate_code = driver.run_remote(
-                    f"mkdir -p /ads_storage/$USER/.edge-deploy/bundles/{profile.tool} && "
+                    f"mkdir -p {shell_remote_path(bundles_dir)} && "
                     f"ln -sfn {bundle_dir} "
-                    f"/ads_storage/$USER/.edge-deploy/bundles/{profile.tool}/current",
+                    f"{shell_remote_path(current_link)}",
                     timeout=30,
                 )
                 checks.append(

@@ -641,6 +641,6 @@ def test_run_rollout_exit_code_only_commands_still_use_run_remote(
 
     run_rollout(driver, profile, sample_node, target_commit=TARGET, install_mode="always", run_id=RUN_ID)
 
-    assert driver.ran("test -f /ads_storage/$USER/.edge-deploy/bundles/autobench/current/manifest.json")
+    assert driver.ran("test -f $HOME/.edge-deploy/bundles/autobench/current/manifest.json")
     assert any(step == "install" for _, _, step in driver.runner_step_commands)
     assert not any("ln -sfn" in command for command in driver.commands)
