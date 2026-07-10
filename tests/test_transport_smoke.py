@@ -27,6 +27,7 @@ class FakeSmokeTransport:
         self.stop_count = 0
         self._authenticated = False
         self._remote_files: dict[str, bytes] = {}
+        self._remote_dirs: set[str] = set()
         self._pty_open = False
         self._pty_secret: str | None = None
         self._pty_command = ""
@@ -83,6 +84,11 @@ class FakeSmokeTransport:
             self._remote_files = {
                 key: value for key, value in self._remote_files.items() if not key.startswith(path)
             }
+            self._remote_dirs = {directory for directory in self._remote_dirs if not directory.startswith(path)}
+            return "", 0
+        if command.startswith("mkdir -p --"):
+            path = self._canonical(command.split("--", 1)[1].strip())
+            self._remote_dirs.add(path)
             return "", 0
         if command.startswith("printf '"):
             # command shape: printf '<text>\n' — mimic a real shell echoing the literal text.
@@ -94,6 +100,9 @@ class FakeSmokeTransport:
 
     # -- transfer ----------------------------------------------------------
     def upload_file(self, source, remote_path: str, *, progress=None) -> str:
+        parent = remote_path.rsplit("/", 1)[0]
+        if parent not in self._remote_dirs:
+            raise TransferError("Binary transfer failed")
         data = Path(source).read_bytes()
         self.uploads.append(remote_path)
         self._remote_files[remote_path] = data

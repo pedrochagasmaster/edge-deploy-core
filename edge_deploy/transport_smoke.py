@@ -80,6 +80,12 @@ def _probe_transfer(driver: RemoteTransport, scratch_dir: str, payload_bytes: in
     payload = secrets.token_bytes(payload_bytes)
     local_digest = hashlib.sha256(payload).hexdigest()
     remote_path = f"{scratch_dir}/payload"
+    quoted_scratch = shell_remote_path(scratch_dir)
+    _text, mkdir_code = driver.run_remote(
+        f"mkdir -p -- {quoted_scratch}", timeout=COMMAND_TIMEOUT_S
+    )
+    if mkdir_code != 0:
+        return SmokeCheck("transfer", False, "remote scratch directory creation failed")
 
     tmp_file = NamedTemporaryFile(delete=False)
     try:
