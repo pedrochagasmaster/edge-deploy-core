@@ -33,6 +33,7 @@ from edge_deploy.reporting import (
 )
 from edge_deploy.rollout import run_rollout
 from edge_deploy.tmux_driver import AuthenticationError, SessionGoneError, TmuxDriver
+from edge_deploy.transport import RemoteTransport
 from edge_deploy.verify import verify_after_rollout
 
 
@@ -308,7 +309,7 @@ def _log_successful_preflight_repair(
         return
 
 
-def _safe_stop(driver: TmuxDriver) -> None:
+def _safe_stop(driver: RemoteTransport) -> None:
     try:
         driver.stop_session()
     except Exception:  # noqa: BLE001 - teardown must never mask the real outcome
@@ -316,13 +317,13 @@ def _safe_stop(driver: TmuxDriver) -> None:
 
 
 def _driver_factory_with_pane_log(
-    driver_factory: Callable[..., TmuxDriver],
+    driver_factory: Callable[..., RemoteTransport],
     pane_log_dir: Path | None,
-) -> Callable[..., TmuxDriver]:
+) -> Callable[..., RemoteTransport]:
     if pane_log_dir is None:
         return driver_factory
 
-    def factory(node: object, profile: object, **kwargs: Any) -> TmuxDriver:
+    def factory(node: object, profile: object, **kwargs: Any) -> RemoteTransport:
         node_name = getattr(node, "name", "node")
         return driver_factory(
             node,
@@ -345,7 +346,7 @@ def run_release(
     *,
     report_dir: str | Path,
     publish_fn: Callable[..., PublishResult] = publish_snapshot,
-    driver_factory: Callable[..., TmuxDriver] = TmuxDriver.from_node_and_profile,
+    driver_factory: Callable[..., RemoteTransport] = TmuxDriver.from_node_and_profile,
     clock: Callable[[], datetime] = _utc_now,
     remote: str = "bitbucket",
     max_auth_attempts: int = 3,
@@ -504,7 +505,7 @@ def run_release(
             _log_local_check_output(tracker, tool, result.local_check_output_tail)
             progress(f"published {tool}: {result.snapshot}")
 
-    # ---- ROLLOUT fan-out: nodes outer, tools inner (one reused pane per node) ----
+    # ---- ROLLOUT fan-out: nodes outer, tools inner (one reused transport per node) ----
     if snapshots and not stop:
         for node_name in node_names:
             if stop:

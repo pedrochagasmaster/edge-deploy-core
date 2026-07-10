@@ -1,8 +1,8 @@
 """The Operator auth seam (ADR-0002): turn the documented ``start_session() -> False`` RSA
-prompt into an authenticated pane, and acquire Kerberos only when deep smoke needs it.
+prompt into an authenticated transport, and acquire Kerberos only when deep smoke needs it.
 
 Secrets are read from the operator terminal (injectable for tests), held only transiently
-in a local, and forwarded through :meth:`TmuxDriver.submit_secret` (literal ``send_keys``)
+in a local, and forwarded through :meth:`RemoteTransport.submit_secret` (never echoed)
 — never through :meth:`run_remote`, which is echoed and captured into reports. RSA SecurID
 tokencodes are single-use and rotate ~every 60s, so a stale/rejected code makes ``sshd``
 re-display ``Enter PASSCODE:``; the seam re-prompts for a *fresh* code on rejection.
@@ -11,11 +11,14 @@ re-display ``Enter PASSCODE:``; the seam re-prompts for a *fresh* code on reject
 from __future__ import annotations
 
 import sys
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from edge_deploy.progress import ReleaseProgressTracker
 from edge_deploy.reporting import ReportCheck
-from edge_deploy.tmux_driver import AuthenticationError, TmuxDriver
+from edge_deploy.transport import AuthenticationError
+
+if TYPE_CHECKING:
+    from edge_deploy.transport import RemoteTransport
 
 
 def _prompt_for_secret(prompt: str) -> str:
@@ -40,7 +43,7 @@ class AuthBroker:
         self._wait_seconds = wait_seconds
         self._max_attempts = max_attempts
 
-    def ensure_authenticated(self, driver: TmuxDriver, node_name: str) -> None:
+    def ensure_authenticated(self, driver: RemoteTransport, node_name: str) -> None:
         try:
             if driver.session_exists() and driver.at_shell_prompt():
                 return
@@ -54,7 +57,7 @@ class AuthBroker:
         else:
             self._authenticate_via_prompt(driver, node_name)
 
-    def _authenticate_via_prompt(self, driver: TmuxDriver, label: str) -> None:
+    def _authenticate_via_prompt(self, driver: RemoteTransport, label: str) -> None:
         if driver.start_session(connect_timeout=None):
             return
 
@@ -72,7 +75,7 @@ class AuthBroker:
                 if attempt == self._max_attempts:
                     raise
 
-    def _authenticate_via_pane(self, driver: TmuxDriver, label: str) -> None:
+    def _authenticate_via_pane(self, driver: RemoteTransport, label: str) -> None:
         try:
             session_exists = driver.session_exists()
         except Exception:
@@ -113,7 +116,7 @@ class AuthBroker:
 
 
 def ensure_kerberos(
-    driver: TmuxDriver,
+    driver: RemoteTransport,
     label: str,
     *,
     prompt_fn: Callable[[str], str] | None = None,

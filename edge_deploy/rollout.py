@@ -20,7 +20,7 @@ from __future__ import annotations
 import fnmatch
 import re
 from dataclasses import dataclass
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from edge_deploy.config import ToolProfile
 from edge_deploy.dependencies import BundleError, DependencyBundle, deliver_dependency_bundle
@@ -28,7 +28,9 @@ from edge_deploy.remote_paths import edge_deploy_path, shell_remote_path
 from edge_deploy.remote_python import REMOTE_PYTHON_EXPR
 from edge_deploy.reporting import OperationReport, ReportCheck, report_node_name
 from edge_deploy.runner import bootstrap_runner, read_remote_json, read_remote_text, run_step
-from edge_deploy.tmux_driver import TmuxDriver
+
+if TYPE_CHECKING:
+    from edge_deploy.transport import RemoteTransport
 
 # The status values a single Rollout can report.
 ROLLOUT_STATUSES = ("rolled_out", "failed", "skipped", "refused")
@@ -197,7 +199,7 @@ def _step_data_path(run_id: str, step_name: str) -> str:
 
 
 def _run_repo_step(
-    driver: TmuxDriver,
+    driver: RemoteTransport,
     runner_path: str,
     run_id: str,
     step_name: str,
@@ -256,7 +258,7 @@ def _suggested_action_for_step(step: str, *, transient: bool) -> str:
 
 
 def _remote_git_preflight(
-    driver: TmuxDriver,
+    driver: RemoteTransport,
     repo_path: str,
     previous: str,
     target: str,
@@ -405,7 +407,7 @@ def _output_tail(text: str, *, limit: int = 20) -> str:
 
 
 def _remote_rev_parse(
-    driver: TmuxDriver,
+    driver: RemoteTransport,
     repo_path: str,
     ref: str,
     *,
@@ -428,7 +430,7 @@ def _remote_rev_parse(
 
 
 def remote_changed_paths(
-    driver: TmuxDriver,
+    driver: RemoteTransport,
     repo_path: str,
     previous: str,
     target: str,
@@ -452,7 +454,7 @@ def remote_changed_paths(
 
 
 def _permission_evidence(
-    driver: TmuxDriver,
+    driver: RemoteTransport,
     profile: ToolProfile,
     *,
     runner_path: str,
@@ -510,7 +512,7 @@ out.write_text(json.dumps(payload, sort_keys=True))
 
 
 def run_rollout(
-    driver: TmuxDriver,
+    driver: RemoteTransport,
     profile: ToolProfile,
     node: "object",
     *,
@@ -524,7 +526,7 @@ def run_rollout(
 ) -> OperationReport:
     """Roll one Edge Node to ``target_commit`` and return an :class:`OperationReport`.
 
-    The driver is expected to already hold an authenticated pane for ``node``.
+    The driver is expected to already hold an authenticated transport for ``node``.
     """
     repo_path = profile.repo_path
     branch = profile.release_branch or "main"

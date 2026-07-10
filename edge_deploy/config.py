@@ -24,7 +24,8 @@ DEFAULT_OPERATOR_CONFIG_PATH = (
 )
 TOOL_PROFILE_FILENAME = "edge_deploy.yaml"
 
-# Valid ``tui_exit`` strategies understood by :class:`~edge_deploy.tmux_driver.TmuxDriver`.
+# Valid ``tui_exit`` strategies understood by the pane transport adapter
+# (:mod:`edge_deploy.tmux_driver`).
 VALID_TUI_EXIT = ("ctrl_c", "dispatch_dynamic", "none")
 DEFAULT_TUI_EXIT = "ctrl_c"
 

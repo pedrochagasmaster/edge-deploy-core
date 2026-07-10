@@ -350,7 +350,7 @@ def deliver_dependency_bundle(
     *,
     run_id: str,
 ) -> DeliveredBundle:
-    """Transfer and verify one bundle through an authenticated TmuxDriver."""
+    """Transfer and verify one bundle through an authenticated transport."""
     config = profile.dependency_bundle
     if config is None:
         raise BundleError(f"{profile.tool} has no dependency bundle configuration")

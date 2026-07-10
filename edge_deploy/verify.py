@@ -1,7 +1,7 @@
 """Verify: the DESIGN §6 VERIFY work that runs *after* a Rollout, beyond what
 ``run_rollout`` already does (it already verifies the final commit and permissions).
 
-Adds two things over the authenticated pane:
+Adds two things over the authenticated transport:
 
 * **Drift == 0** over the Tool's ``runtime_paths`` — reuses :func:`edge_deploy.drift.check_drift`
   unchanged (its single ``runtime_drift`` check).
@@ -16,18 +16,22 @@ kinit seam is only paid when a *selected* tool actually has deep commands.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from edge_deploy.config import ToolProfile
 from edge_deploy.drift import check_drift
 from edge_deploy.reporting import ReportCheck
-from edge_deploy.tmux_driver import TmuxDriver
+
+if TYPE_CHECKING:
+    from edge_deploy.transport import RemoteTransport
 
 
-def run_smoke(driver: TmuxDriver, profile: ToolProfile, *, level: str) -> list[ReportCheck]:
-    """Run the profile's smoke commands at ``level`` over the pane; one check per command.
+def run_smoke(driver: RemoteTransport, profile: ToolProfile, *, level: str) -> list[ReportCheck]:
+    """Run the profile's smoke commands at ``level`` over the transport; one check per command.
 
     ``level`` is ``"deep"`` (uses ``smoke.deep``) or anything else (uses ``smoke.standard``).
     Every command is run with an explicit ``cd <repo_path>`` so the landing dir is cosmetic
-    even when the pane is reused across tools (Plan §1.4 / Risk #7).
+    even when the transport is reused across tools (Plan §1.4 / Risk #7).
     """
     commands = profile.smoke.deep if level == "deep" else profile.smoke.standard
     checks: list[ReportCheck] = []
@@ -38,7 +42,7 @@ def run_smoke(driver: TmuxDriver, profile: ToolProfile, *, level: str) -> list[R
 
 
 def verify_after_rollout(
-    driver: TmuxDriver,
+    driver: RemoteTransport,
     profile: ToolProfile,
     node: object,
     *,

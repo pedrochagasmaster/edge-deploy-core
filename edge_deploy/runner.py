@@ -11,7 +11,7 @@ import tempfile
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from edge_deploy.tmux_driver import TmuxDriver
+    from edge_deploy.transport import RemoteTransport
 
 RUNNER_VERSION = "2"
 
@@ -84,7 +84,7 @@ def runner_sha256() -> str:
     return hashlib.sha256(RUNNER_SCRIPT.encode()).hexdigest()
 
 
-def bootstrap_runner(driver: TmuxDriver, run_id: str) -> str:
+def bootstrap_runner(driver: RemoteTransport, run_id: str) -> str:
     digest = runner_sha256()
     remote_path = f"~/.edge-deploy/runner-{RUNNER_VERSION}-{digest[:8]}.sh"
     # newline="\n" is load-bearing: Windows text mode would write CRLF, and a
@@ -103,7 +103,7 @@ def bootstrap_runner(driver: TmuxDriver, run_id: str) -> str:
     return remote_path
 
 
-def _read_remote_bytes(driver: TmuxDriver, remote_path: str) -> bytes:
+def _read_remote_bytes(driver: RemoteTransport, remote_path: str) -> bytes:
     command = (
         "printf '\\n__EDGE_RESULT_START__\\n'; "
         f"base64 -w0 {remote_path}; "
@@ -141,14 +141,14 @@ def _read_remote_bytes(driver: TmuxDriver, remote_path: str) -> bytes:
     return decoded
 
 
-def read_remote_text(driver: TmuxDriver, remote_path: str) -> str:
+def read_remote_text(driver: RemoteTransport, remote_path: str) -> str:
     try:
         return _read_remote_bytes(driver, remote_path).decode("utf-8")
     except UnicodeDecodeError as exc:
         raise RunnerProtocolError(f"invalid UTF-8 in remote read for {remote_path}") from exc
 
 
-def read_remote_json(driver: TmuxDriver, remote_path: str) -> dict:
+def read_remote_json(driver: RemoteTransport, remote_path: str) -> dict:
     decoded = _read_remote_bytes(driver, remote_path)
     try:
         payload = json.loads(decoded.decode("utf-8"))
@@ -160,7 +160,7 @@ def read_remote_json(driver: TmuxDriver, remote_path: str) -> dict:
 
 
 def run_step(
-    driver: TmuxDriver,
+    driver: RemoteTransport,
     runner_path: str,
     run_id: str,
     step_name: str,
