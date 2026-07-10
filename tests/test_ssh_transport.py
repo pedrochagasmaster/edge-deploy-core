@@ -963,6 +963,14 @@ def test_upload_verifies_part_then_atomically_replaces(authenticated_sftp_transp
     assert authenticated_sftp_transport.part_files == []
 
 
+def test_upload_over_sftp_sets_final_file_mode_0600(authenticated_sftp_transport, tmp_path: Path) -> None:
+    source = tmp_path / "bundle.zip"
+    source.write_bytes(b"new-bundle")
+    authenticated_sftp_transport.upload_file(source, "~/.edge-deploy/bundle.zip")
+    final = authenticated_sftp_transport._backing.files["/home/operator/.edge-deploy/bundle.zip"]
+    assert final.mode == 0o600
+
+
 def test_digest_mismatch_removes_part_and_preserves_final(mismatch_sftp_transport, tmp_path: Path) -> None:
     source = tmp_path / "bundle.zip"
     source.write_bytes(b"corrupt-in-transit")
@@ -979,3 +987,17 @@ def test_sftp_unavailable_uses_binary_exec_channel(no_sftp_transport, tmp_path: 
     no_sftp_transport.upload_file(source, "~/.edge-deploy/bundle.zip")
     assert no_sftp_transport._backing.binary_stream_uploads == 1
     assert no_sftp_transport._backing.base64_commands == []
+
+
+def test_binary_exec_channel_upload_restricts_part_file_mode(no_sftp_transport, tmp_path: Path) -> None:
+    source = tmp_path / "bundle.zip"
+    source.write_bytes(b"binary\x00payload")
+    no_sftp_transport.upload_file(source, "~/.edge-deploy/bundle.zip")
+    cat_commands = [
+        command
+        for channel in no_sftp_transport._backing.opened_channels
+        for command in channel.exec_command_calls
+        if "cat >" in command
+    ]
+    assert cat_commands, "expected a 'cat >' exec command for the binary-fallback upload"
+    assert all(command.startswith("umask 077;") for command in cat_commands)
