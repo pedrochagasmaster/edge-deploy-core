@@ -19,6 +19,7 @@ import queue
 import re
 import shlex
 import socket
+import stat
 import threading
 import time
 import uuid
@@ -47,7 +48,7 @@ DEFAULT_KEEPALIVE_SECONDS = 5
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 15.0
 _AUTH_COMPLETION_TIMEOUT_SECONDS = 15.0
 _PTY_TRANSCRIPT_LIMIT = 65536
-_TRANSFER_TIMEOUT_SECONDS = 120.0
+DEFAULT_TRANSFER_TIMEOUT_SECONDS = 900.0
 _TRANSFER_HASH_CHUNK_BYTES = 1024 * 1024
 _PROGRESS_MIN_INTERVAL_S = 1.0
 
@@ -174,13 +175,17 @@ class ParamikoSshTransport:
         transport_factory: Callable[[socket.socket], paramiko.Transport] = paramiko.Transport,
         sftp_client_factory: Callable[[paramiko.Channel], object] = paramiko.SFTPClient,
         clock: Callable[[], float] = time.monotonic,
+        transfer_timeout_s: float = DEFAULT_TRANSFER_TIMEOUT_SECONDS,
     ) -> None:
+        if transfer_timeout_s <= 0:
+            raise ValueError("transfer_timeout_s must be positive")
         self._settings = settings
         self.session = session
         self._socket_factory = socket_factory
         self._transport_factory = transport_factory
         self._sftp_client_factory = sftp_client_factory
         self._clock = clock
+        self._transfer_timeout_s = transfer_timeout_s
         self._socket: socket.socket | None = None
         self._transport: paramiko.Transport | None = None
         self._remote_home: PurePosixPath | None = None
@@ -667,10 +672,28 @@ class ParamikoSshTransport:
     ) -> None:
         quoted = shlex.quote(remote_path)
         text, exit_status = self.run_remote(
-            f'stat -c "%s" -- {quoted}',
+            f'stat -c "%f|%u|%a|%s" -- {quoted} && id -u',
             timeout=max(deadline - self._clock(), 0.001),
         )
-        if exit_status != 0 or text.strip() != str(expected_size):
+        lines = text.strip().splitlines()
+        if exit_status != 0 or len(lines) != 2:
+            raise TransferError("Uploaded part file security metadata verification failed")
+        metadata = lines[0].split("|")
+        if len(metadata) != 4:
+            raise TransferError("Uploaded part file security metadata verification failed")
+        raw_mode_hex, owner_uid, mode, size = metadata
+        effective_uid = lines[1]
+        try:
+            raw_mode = int(raw_mode_hex, 16)
+        except ValueError as exc:
+            raise TransferError("Uploaded part file security metadata verification failed") from exc
+        if not stat.S_ISREG(raw_mode):
+            raise TransferError("Uploaded part path was not a regular file")
+        if owner_uid != effective_uid:
+            raise TransferError("Uploaded part file owner verification failed")
+        if mode != "600":
+            raise TransferError("Uploaded part file mode verification failed")
+        if size != str(expected_size):
             raise TransferError("Uploaded part file size verification failed")
         digest = self._remote_sha256(remote_path, deadline)
         if digest != expected_digest:
@@ -692,7 +715,7 @@ class ParamikoSshTransport:
         it is hashed in 1 MiB chunks and then re-opened for the transfer itself.
         """
         source_path = Path(source)
-        deadline = self._clock() + _TRANSFER_TIMEOUT_SECONDS
+        deadline = self._clock() + self._transfer_timeout_s
         home = self._resolve_remote_home(deadline)
         final_path = resolve_home_path(remote_path, str(home))
 

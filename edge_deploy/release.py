@@ -196,13 +196,19 @@ def _compact_rollout(
 
 
 def _synthetic_report(
-    status: str, node: object, repo_path: str, *, deployment_commit: str, check: ReportCheck
+    status: str,
+    node: object,
+    repo_path: str,
+    *,
+    deployment_commit: str,
+    check: ReportCheck,
+    host: str | None = None,
 ) -> OperationReport:
     return OperationReport(
         operation="rollout",
         status=status,
         node=report_node_name(node),
-        host=getattr(node, "host", ""),
+        host=getattr(node, "host", "") if host is None else host,
         repo_path=repo_path,
         deployment_commit=deployment_commit,
         checks=[check],
@@ -338,6 +344,7 @@ def _transport_failure_report(
         profile.repo_path,
         deployment_commit=snapshot,
         check=ReportCheck("transport", False, f"transport failed: {_redact_transport_message(exc)}"),
+        host="",
     )
 
 
@@ -543,7 +550,28 @@ def run_release(
             if stop:
                 break
             node = operator.node(node_name)
-            driver = effective_driver_factory(node, profiles[tools[0]])  # chrome/tui_exit from the first tool (Risk #7)
+            try:
+                driver = effective_driver_factory(
+                    node, profiles[tools[0]]
+                )  # chrome/tui_exit from the first tool (Risk #7)
+            except TransportError as exc:
+                exc_message = _redact_transport_message(exc)
+                for tool in tools:
+                    if (node_name, tool) in recorded or tool not in snapshots:
+                        continue
+                    synthetic = _transport_failure_report(exc, node, profiles[tool], snapshots[tool])
+                    path = write_report(report_dir / f"rollout-{tool}-{node_name}.json", synthetic)
+                    recorded[(node_name, tool)] = _compact_rollout(
+                        tool=tool,
+                        node=node_name,
+                        status="failed",
+                        state_left=f"transport: {exc_message}",
+                        deployment_commit=snapshots[tool],
+                        report_path=path,
+                    )
+                if selection.fail_fast:
+                    stop = True
+                continue
 
             try:
                 if auth_mode == "prompt":
@@ -570,6 +598,7 @@ def run_release(
                             profiles[tool].repo_path,
                             deployment_commit=snapshots.get(tool, "not_applicable"),
                             check=ReportCheck("auth", False, f"authentication failed: {exc_message}"),
+                            host="" if isinstance(exc, TransportError) else None,
                         )
                         path = write_report(report_dir / f"rollout-{tool}-{node_name}.json", synthetic)
                         recorded[(node_name, tool)] = _compact_rollout(

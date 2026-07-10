@@ -36,6 +36,9 @@ PTY_TIMEOUT_S = 30.0
 CLEANUP_TIMEOUT_S = 15.0
 
 _COMMAND_STDOUT_TOKEN = "transport-smoke-stdout-ok"
+_PTY_READY_TOKEN = "transport-smoke-pty-ready"
+_PTY_SUCCESS_TOKEN = "transport-smoke-pty-success"
+_KEEPALIVE_TOKEN = "keepalive-ok"
 
 
 @dataclass(frozen=True)
@@ -103,22 +106,34 @@ def _probe_transfer(driver: RemoteTransport, scratch_dir: str, payload_bytes: in
 
 def _probe_pty(driver: RemoteTransport) -> SmokeCheck:
     dummy_secret = secrets.token_urlsafe(32)
-    driver.send_text("read -r smoke_secret")
-    driver.wait_for(r".*", timeout=PTY_TIMEOUT_S)
+    expected_digest = hashlib.sha256(dummy_secret.encode("utf-8")).hexdigest()
+    driver.send_text(
+        f"printf '{_PTY_READY_TOKEN}\\n'; "
+        "stty -echo; IFS= read -r smoke_secret; stty echo; "
+        "smoke_digest=$(printf '%s' \"$smoke_secret\" | sha256sum | awk '{print $1}'); "
+        "unset smoke_secret; "
+        f"if [ \"$smoke_digest\" = '{expected_digest}' ]; then "
+        f"printf '{_PTY_SUCCESS_TOKEN}\\n'; "
+        "else printf 'transport-smoke-pty-failure\\n'; fi; unset smoke_digest"
+    )
+    ready = driver.wait_for(_PTY_READY_TOKEN, timeout=PTY_TIMEOUT_S)
+    if _PTY_READY_TOKEN not in ready:
+        return SmokeCheck("pty", False, "PTY dialogue did not become ready for generated input")
     driver.submit_secret(dummy_secret)
-    # The dummy secret never appears in the check message; only success/failure is reported.
+    validated = driver.wait_for(_PTY_SUCCESS_TOKEN, timeout=PTY_TIMEOUT_S)
+    if _PTY_SUCCESS_TOKEN not in validated:
+        return SmokeCheck("pty", False, "PTY dialogue did not validate the generated input")
     return SmokeCheck("pty", True, "PTY dialogue accepted a generated dummy secret")
 
 
 def _probe_keepalive(driver: RemoteTransport, keepalive_wait_s: float) -> SmokeCheck:
     started = time.monotonic()
     text, code = driver.run_remote(
-        "printf 'keepalive-ok\\n'", timeout=max(COMMAND_TIMEOUT_S, keepalive_wait_s + 10.0)
+        f"sleep {keepalive_wait_s:.3f}; printf '{_KEEPALIVE_TOKEN}\\n'",
+        timeout=max(COMMAND_TIMEOUT_S, keepalive_wait_s + 10.0),
     )
-    if keepalive_wait_s > 0:
-        time.sleep(keepalive_wait_s)
     elapsed = time.monotonic() - started
-    if code != 0 or text.strip() != "keepalive-ok":
+    if code != 0 or text.strip() != _KEEPALIVE_TOKEN:
         return SmokeCheck("keepalive", False, "command did not survive the keepalive interval")
     return SmokeCheck("keepalive", True, f"connection survived {elapsed:.1f}s across keepalive intervals")
 
@@ -159,7 +174,11 @@ def run_transport_smoke(
         checks.append(_probe_transfer(driver, scratch_dir, payload_bytes))
         checks.append(_probe_pty(driver))
         checks.append(_probe_keepalive(driver, keepalive_wait_s))
-        checks.append(_cleanup_scratch(driver, scratch_dir))
     finally:
-        driver.stop_session()
+        try:
+            checks.append(_cleanup_scratch(driver, scratch_dir))
+        except Exception:
+            checks.append(SmokeCheck("cleanup", False, "remote scratch directory removal raised an error"))
+        finally:
+            driver.stop_session()
     return SmokeResult(node_label=node_label, checks=checks)

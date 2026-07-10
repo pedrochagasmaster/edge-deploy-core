@@ -12,7 +12,7 @@ from edge_deploy import auth, drift, release
 from edge_deploy.config import NodeConfig, OperatorConfig
 from edge_deploy.ledger import RunLedger
 from edge_deploy.phases.deploy import run_deploy
-from edge_deploy.transport import TransferError
+from edge_deploy.transport import TransferError, TransportUnavailable
 
 PREV = "0" * 40
 SNAP = "5" * 40
@@ -318,3 +318,33 @@ def test_deploy_transport_failure_marks_node_failed_not_pending(
     reloaded = RunLedger.load(ledger.run_dir)
     assert reloaded.phase_state("deploy", node="node03") == "failed"
     assert reloaded.phase_state("deploy", node="node03") != "pending"
+
+
+def test_deploy_transport_construction_failure_marks_node_failed_not_pending(
+    tmp_path, fake_tmux, patched_deploy_env, monkeypatch
+) -> None:
+    repo_root = _write_tool_profile(tmp_path)
+    ledger = _create_run(repo_root, publish_passed=True)
+    _write_publish_report(ledger.run_dir)
+    operator = _operator(repo_root)
+
+    def failing_factory(node, profile, **kwargs):
+        raise TransportUnavailable(f"transport unavailable for {node.host}")
+
+    monkeypatch.setattr(
+        "edge_deploy.phases.deploy.run_release",
+        lambda op, selection, **kwargs: release.run_release(
+            op,
+            selection,
+            driver_factory=failing_factory,
+            heartbeat_interval_s=3600.0,
+            stall_threshold_s=7200.0,
+            **kwargs,
+        ),
+    )
+
+    code = run_deploy(_deploy_args(ledger.state["run_id"], nodes="node03"), operator)
+
+    assert code == 1
+    reloaded = RunLedger.load(ledger.run_dir)
+    assert reloaded.phase_state("deploy", node="node03") == "failed"

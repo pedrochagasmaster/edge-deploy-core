@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import stat
 import threading
+import time
 from pathlib import Path
 
 import paramiko
@@ -648,9 +649,18 @@ def test_stop_session_is_idempotent(authenticated_transport) -> None:
 class FakeRemoteFile:
     """A remote file's tracked contents, mode, and existence for the fake filesystem."""
 
-    def __init__(self, data: bytes, *, mode: int = 0o600) -> None:
+    def __init__(
+        self,
+        data: bytes,
+        *,
+        mode: int = 0o600,
+        owner_uid: int = 1000,
+        file_type: str = "regular file",
+    ) -> None:
         self.data = data
         self.mode = mode
+        self.owner_uid = owner_uid
+        self.file_type = file_type
 
 
 class FakeSftpAttr:
@@ -662,21 +672,43 @@ class FakeSftpAttr:
 class FakeSftpClient:
     """Stands in for ``paramiko.SFTPClient`` against an in-memory remote filesystem."""
 
-    def __init__(self, files: dict[str, FakeRemoteFile], *, put_calls: list[str], atomic_renames: list[int]) -> None:
+    def __init__(
+        self,
+        files: dict[str, FakeRemoteFile],
+        *,
+        put_calls: list[str],
+        atomic_renames: list[int],
+        on_put=None,
+        put_owner_uid: int = 1000,
+        put_file_type: str = "regular file",
+        honor_chmod: bool = True,
+    ) -> None:
         self._files = files
         self._put_calls = put_calls
         self._atomic_renames = atomic_renames
+        self._on_put = on_put
+        self._put_owner_uid = put_owner_uid
+        self._put_file_type = put_file_type
+        self._honor_chmod = honor_chmod
         self.closed = False
 
     def putfo(self, source_handle, remote_path: str, *, file_size: int = 0, callback=None) -> None:  # noqa: ARG002
         self._put_calls.append(remote_path)
         data = source_handle.read()
+        if self._on_put is not None:
+            self._on_put()
         if callback is not None:
             callback(len(data), len(data))
-        self._files[remote_path] = FakeRemoteFile(data, mode=0o644)
+        self._files[remote_path] = FakeRemoteFile(
+            data,
+            mode=0o644,
+            owner_uid=self._put_owner_uid,
+            file_type=self._put_file_type,
+        )
 
     def chmod(self, remote_path: str, mode: int) -> None:
-        self._files[remote_path].mode = mode
+        if self._honor_chmod:
+            self._files[remote_path].mode = mode
 
     def stat(self, remote_path: str) -> FakeSftpAttr:
         if remote_path not in self._files:
@@ -709,12 +741,20 @@ class SftpSessionTransport(ScriptedSessionTransport):
         sftp_available: bool = True,
         files: dict[str, FakeRemoteFile] | None = None,
         digest_mismatch: bool = False,
+        effective_uid: int = 1000,
+        put_owner_uid: int = 1000,
+        put_file_type: str = "regular file",
+        honor_chmod: bool = True,
     ) -> None:
         super().__init__(_sock, server_key=server_key)
         self.home = home
         self.sftp_available = sftp_available
         self.files: dict[str, FakeRemoteFile] = files if files is not None else {}
         self.digest_mismatch = digest_mismatch
+        self.effective_uid = effective_uid
+        self.put_owner_uid = put_owner_uid
+        self.put_file_type = put_file_type
+        self.honor_chmod = honor_chmod
         self.sftp_put_calls: list[str] = []
         self.atomic_renames: list[int] = []
         self.part_files_removed: list[str] = []
@@ -776,7 +816,11 @@ class FakeCommandOrSftpChannel(FakeChannel):
             if entry is None:
                 self._exit_status_value = 1
             else:
-                self._reply = f"{len(entry.data)}\n".encode()
+                file_type = stat.S_IFREG if entry.file_type == "regular file" else stat.S_IFLNK
+                self._reply = (
+                    f"{file_type | entry.mode:x}|{entry.owner_uid}|{entry.mode:o}|{len(entry.data)}\n"
+                    f"{backing.effective_uid}\n"
+                ).encode()
                 self._exit_status_value = 0
         elif command.startswith("mv "):
             parts = command.split()
@@ -851,6 +895,12 @@ def _sftp_transport(
     sftp_available: bool = True,
     files: dict[str, FakeRemoteFile] | None = None,
     digest_mismatch: bool = False,
+    clock=None,
+    on_put=None,
+    effective_uid: int = 1000,
+    put_owner_uid: int = 1000,
+    put_file_type: str = "regular file",
+    honor_chmod: bool = True,
 ) -> tuple[ParamikoSshTransport, SftpSessionTransport]:
     settings = _settings(tmp_path)
     _write_known_hosts(settings.known_hosts_path, settings.hostname, settings.port, server_key)
@@ -865,6 +915,10 @@ def _sftp_transport(
             sftp_available=sftp_available,
             files=files,
             digest_mismatch=digest_mismatch,
+            effective_uid=effective_uid,
+            put_owner_uid=put_owner_uid,
+            put_file_type=put_file_type,
+            honor_chmod=honor_chmod,
         )
         backing_holder["transport"] = backing
         return backing
@@ -873,7 +927,15 @@ def _sftp_transport(
         backing = backing_holder["transport"]
         if not backing.sftp_available:
             raise paramiko.SSHException("Channel closed.")
-        return FakeSftpClient(backing.files, put_calls=backing.sftp_put_calls, atomic_renames=backing.atomic_renames)
+        return FakeSftpClient(
+            backing.files,
+            put_calls=backing.sftp_put_calls,
+            atomic_renames=backing.atomic_renames,
+            on_put=on_put,
+            put_owner_uid=backing.put_owner_uid,
+            put_file_type=backing.put_file_type,
+            honor_chmod=backing.honor_chmod,
+        )
 
     transport = ParamikoSshTransport(
         settings,
@@ -881,6 +943,7 @@ def _sftp_transport(
         socket_factory=fake_socket_factory,
         transport_factory=transport_factory,
         sftp_client_factory=sftp_client_factory,
+        clock=clock or time.monotonic,
     )
     transport.start_session(connect_timeout=1.0)
     transport.submit_secret("one-time-code")
@@ -963,6 +1026,31 @@ def test_upload_verifies_part_then_atomically_replaces(authenticated_sftp_transp
     assert authenticated_sftp_transport.part_files == []
 
 
+def test_default_transfer_deadline_allows_documented_three_minute_upload(
+    tmp_path: Path, server_key: paramiko.RSAKey
+) -> None:
+    now = [0.0]
+
+    def clock() -> float:
+        return now[0]
+
+    def advance_three_minutes() -> None:
+        now[0] += 180.0
+
+    driver, _backing = _sftp_transport(
+        tmp_path,
+        server_key,
+        clock=clock,
+        on_put=advance_three_minutes,
+    )
+    source = tmp_path / "large-bundle.zip"
+    source.write_bytes(b"representative archive")
+
+    assert driver.upload_file(source, "~/.edge-deploy/large-bundle.zip") == hashlib.sha256(
+        source.read_bytes()
+    ).hexdigest()
+
+
 def test_upload_over_sftp_sets_final_file_mode_0600(authenticated_sftp_transport, tmp_path: Path) -> None:
     source = tmp_path / "bundle.zip"
     source.write_bytes(b"new-bundle")
@@ -979,6 +1067,38 @@ def test_digest_mismatch_removes_part_and_preserves_final(mismatch_sftp_transpor
     final = mismatch_sftp_transport._backing.files["/home/operator/.edge-deploy/bundle.zip"]
     assert final.data == b"previous-verified-bundle"
     assert mismatch_sftp_transport.part_files == []
+
+
+@pytest.mark.parametrize(
+    ("transport_options", "reason"),
+    [
+        ({"put_file_type": "symbolic link"}, "regular file"),
+        ({"put_owner_uid": 2000}, "owner"),
+        ({"honor_chmod": False}, "mode"),
+    ],
+)
+def test_upload_rejects_untrusted_part_metadata_and_preserves_final(
+    tmp_path: Path,
+    server_key: paramiko.RSAKey,
+    transport_options: dict[str, object],
+    reason: str,
+) -> None:
+    final_path = "/home/operator/.edge-deploy/bundle.zip"
+    previous = b"previous-verified-bundle"
+    driver, backing = _sftp_transport(
+        tmp_path,
+        server_key,
+        files={final_path: FakeRemoteFile(previous)},
+        **transport_options,
+    )
+    source = tmp_path / "bundle.zip"
+    source.write_bytes(b"replacement")
+
+    with pytest.raises(TransferError, match=reason):
+        driver.upload_file(source, "~/.edge-deploy/bundle.zip")
+
+    assert backing.files[final_path].data == previous
+    assert backing._part_files() == []
 
 
 def test_sftp_unavailable_uses_binary_exec_channel(no_sftp_transport, tmp_path: Path) -> None:

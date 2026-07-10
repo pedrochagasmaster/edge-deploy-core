@@ -722,6 +722,44 @@ _TRANSPORT_ERRORS = [
 ]
 
 
+def test_release_transport_construction_failure_is_durable_and_does_not_block_other_nodes(
+    fake_tmux, tmp_path, patched_drift
+) -> None:
+    endpoint = "operator@private-edge.example"
+    base_operator = _operator()
+    operator = dataclasses.replace(
+        base_operator,
+        nodes={
+            **base_operator.nodes,
+            "node03": NodeConfig(host=endpoint, session="s3", name="node03"),
+        },
+    )
+    drivers: dict = {}
+    fallback_factory = _make_factory(fake_tmux, drivers)
+
+    def factory(node, profile, **kwargs):
+        if node.name == "node03":
+            raise TransportUnavailable(f"transport unavailable for {node.host}")
+        return fallback_factory(node, profile, **kwargs)
+
+    report = run_release(
+        operator,
+        ReleaseSelection(tools=["autobench"], nodes=["node03", "node04"]),
+        report_dir=tmp_path,
+        publish_fn=_publishing([]),
+        driver_factory=factory,
+        auth_mode="prompt",
+    )
+
+    assert report.exit_code() == 1
+    node03 = next(item for item in report.rollouts if item["node"] == "node03")
+    node04 = next(item for item in report.rollouts if item["node"] == "node04")
+    assert node03["status"] == "failed"
+    assert node04["status"] == "rolled_out"
+    assert endpoint not in json.dumps(report.to_payload())
+    assert endpoint not in Path(node03["report_path"]).read_text(encoding="utf-8")
+
+
 @pytest.mark.parametrize("exc", _TRANSPORT_ERRORS, ids=lambda e: type(e).__name__)
 def test_release_auth_transport_failure_is_durable_node_failure(
     fake_tmux, tmp_path, patched_drift, exc

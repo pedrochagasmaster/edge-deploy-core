@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from edge_deploy.transport import RemoteTransport, TransferProgress
+from edge_deploy.transport import RemoteTransport, TransferError, TransferProgress
 from edge_deploy.transport_smoke import run_transport_smoke
 
 
@@ -22,13 +22,15 @@ class FakeSmokeTransport:
 
     session = "fake-smoke-session"
 
-    def __init__(self) -> None:
+    def __init__(self, *, pty_success: bool = True) -> None:
         self.start_count = 0
         self.stop_count = 0
         self._authenticated = False
         self._remote_files: dict[str, bytes] = {}
         self._pty_open = False
         self._pty_secret: str | None = None
+        self._pty_command = ""
+        self._pty_success = pty_success
         self.commands: list[str] = []
         self.uploads: list[str] = []
         self.removed_paths: list[str] = []
@@ -86,6 +88,8 @@ class FakeSmokeTransport:
             # command shape: printf '<text>\n' — mimic a real shell echoing the literal text.
             literal = command[len("printf '") : command.rindex("'")]
             return literal.replace("\\n", "\n"), 0
+        if command.startswith("sleep ") and "keepalive-ok" in command:
+            return "keepalive-ok\n", 0
         return "", 0
 
     # -- transfer ----------------------------------------------------------
@@ -101,10 +105,17 @@ class FakeSmokeTransport:
 
     # -- pty dialogue --------------------------------------------------
     def send_text(self, text: str) -> None:
-        if text.strip() == "read -r smoke_secret":
+        if "transport-smoke-pty-ready" in text and "read -r smoke_secret" in text:
             self._pty_open = True
+            self._pty_command = text
 
     def wait_for(self, pattern: str, timeout: float = 10.0, poll_interval: float = 0.5) -> str:
+        if "pty-ready" in pattern:
+            return "transport-smoke-pty-ready"
+        if "pty-success" in pattern and self._pty_success and self._pty_secret is not None:
+            digest = hashlib.sha256(self._pty_secret.encode("utf-8")).hexdigest()
+            if digest in self._pty_command:
+                return "transport-smoke-pty-success"
         return ""
 
 
@@ -134,6 +145,21 @@ def test_transport_smoke_reuses_one_connection_and_cleans_up(fake_transport, tmp
     ]
     assert fake_transport.start_count == 1
     assert fake_transport.stop_count == 1
+    assert any(command.startswith("sleep ") and "keepalive-ok" in command for command in fake_transport.commands)
+
+
+def test_transport_smoke_fails_when_pty_secret_is_not_validated() -> None:
+    transport = FakeSmokeTransport(pty_success=False)
+
+    result = run_transport_smoke(
+        transport,
+        node_label="node03",
+        payload_bytes=256,
+        keepalive_wait_s=0.0,
+    )
+
+    pty_check = next(check for check in result.checks if check.name == "pty")
+    assert pty_check.passed is False
 
 
 def test_transport_smoke_removes_scratch_directory_on_failure(fake_transport, monkeypatch) -> None:
@@ -161,6 +187,24 @@ def test_transport_smoke_removes_scratch_directory_on_failure(fake_transport, mo
     assert fake_transport.removed_paths
 
 
+def test_transport_smoke_removes_scratch_directory_when_probe_raises(fake_transport, monkeypatch) -> None:
+    def _broken_upload(*args, **kwargs):
+        raise TransferError("simulated upload failure")
+
+    monkeypatch.setattr(fake_transport, "upload_file", _broken_upload)
+
+    with pytest.raises(TransferError, match="simulated upload failure"):
+        run_transport_smoke(
+            fake_transport,
+            node_label="node03",
+            payload_bytes=256,
+            keepalive_wait_s=0.0,
+        )
+
+    assert fake_transport.stop_count == 1
+    assert fake_transport.removed_paths
+
+
 def test_transport_smoke_checks_never_leak_the_pty_secret(fake_transport) -> None:
     result = run_transport_smoke(
         fake_transport,
@@ -172,6 +216,7 @@ def test_transport_smoke_checks_never_leak_the_pty_secret(fake_transport) -> Non
     for check in result.checks:
         assert fake_transport._pty_secret not in check.message  # noqa: SLF001 - white-box redaction check
     assert fake_transport._pty_secret is not None  # noqa: SLF001
+    assert fake_transport._pty_secret not in fake_transport._pty_command  # noqa: SLF001
 
 
 def test_transport_smoke_result_message_has_no_endpoint_details(fake_transport) -> None:
