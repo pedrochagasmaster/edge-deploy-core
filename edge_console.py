@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import tempfile
 import threading
@@ -403,7 +404,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 def main() -> int:
     parser = argparse.ArgumentParser(description="Read-only posture console for edge-deploy runs")
     parser.add_argument("--root", default=".", help="Checkout containing edge-deploy/runs (default: cwd)")
-    parser.add_argument("--port", type=int, default=7643)
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 7643)))
     parser.add_argument("--demo", action="store_true", help="Serve fabricated runs; no network probes")
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()

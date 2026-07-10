@@ -4,8 +4,20 @@
     {
       "name": "edge-console-demo",
       "runtimeExecutable": "python",
-      "runtimeArgs": ["edge_console.py", "--demo", "--no-browser", "--port", "7643"],
-      "port": 7643
+      "runtimeArgs": ["edge_console.py", "--demo", "--no-browser"],
+      "autoPort": true
+    },
+    {
+      "name": "edge-console",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["edge_console.py", "--no-browser"],
+      "autoPort": true
+    },
+    {
+      "name": "edge-console-autobench",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["edge_console.py", "--root", "D:\\Projects\\autobench", "--no-browser"],
+      "autoPort": true
     }
   ]
 }
