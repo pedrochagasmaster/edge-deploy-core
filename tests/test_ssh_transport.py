@@ -58,13 +58,13 @@ class FakeTransport:
         accepted_secrets: tuple[str, ...] = ("one-time-code",),
         echo_prompt: bool = False,
         prompt_count: int = 1,
-        prompt_texts: tuple[str, ...] | None = None,
+        empty_challenge_first: bool = False,
     ) -> None:
         self._server_key = server_key
         self._accepted_secrets = accepted_secrets
         self._echo_prompt = echo_prompt
         self._prompt_count = prompt_count
-        self._prompt_texts = prompt_texts
+        self._empty_challenge_first = empty_challenge_first
         self._active = True
         self._authenticated = False
         self.closed = False
@@ -79,8 +79,9 @@ class FakeTransport:
 
     def auth_interactive(self, _username: str, handler) -> None:
         self.secret_requests += 1
-        prompt_texts = self._prompt_texts or ("Enter PASSCODE: ",) * self._prompt_count
-        prompts = [(text, self._echo_prompt) for text in prompt_texts]
+        if self._empty_challenge_first:
+            assert handler("", "", []) == []
+        prompts = [("Enter PASSCODE: ", self._echo_prompt)] * self._prompt_count
         responses = handler("", "", prompts)
         if responses and all(response in self._accepted_secrets for response in responses):
             self._authenticated = True
@@ -258,7 +259,7 @@ def multi_prompt_transport(tmp_path: Path, server_key: paramiko.RSAKey) -> Param
 
 
 @pytest.fixture
-def distinct_prompt_transport(tmp_path: Path, server_key: paramiko.RSAKey) -> ParamikoSshTransport:
+def empty_then_prompt_transport(tmp_path: Path, server_key: paramiko.RSAKey) -> ParamikoSshTransport:
     settings = _settings(tmp_path)
     _write_known_hosts(settings.known_hosts_path, settings.hostname, settings.port, server_key)
 
@@ -266,7 +267,7 @@ def distinct_prompt_transport(tmp_path: Path, server_key: paramiko.RSAKey) -> Pa
         return FakeTransport(
             sock,
             server_key=server_key,
-            prompt_texts=("Enter PASSCODE: ", "Enter password: "),
+            empty_challenge_first=True,
         )
 
     return ParamikoSshTransport(
@@ -339,18 +340,18 @@ def test_echoed_keyboard_prompt_is_rejected(echoed_prompt_transport) -> None:
         echoed_prompt_transport.await_authenticated(timeout=1.0)
 
 
-def test_repeated_non_echo_prompts_can_share_one_secret(multi_prompt_transport) -> None:
-    multi_prompt_transport.start_session(connect_timeout=1.0)
-    multi_prompt_transport.submit_secret("one-time-code")
-    multi_prompt_transport.await_authenticated(timeout=1.0)
-    assert multi_prompt_transport.at_shell_prompt() is True
+def test_empty_keyboard_interactive_round_can_precede_passcode_prompt(empty_then_prompt_transport) -> None:
+    empty_then_prompt_transport.start_session(connect_timeout=1.0)
+    empty_then_prompt_transport.submit_secret("one-time-code")
+    empty_then_prompt_transport.await_authenticated(timeout=1.0)
+    assert empty_then_prompt_transport.at_shell_prompt() is True
 
 
-def test_distinct_keyboard_prompts_are_rejected(distinct_prompt_transport) -> None:
+def test_multiple_unexpected_prompts_are_rejected(multi_prompt_transport) -> None:
     with pytest.raises(AuthenticationError):
-        distinct_prompt_transport.start_session(connect_timeout=1.0)
-        distinct_prompt_transport.submit_secret("one-time-code")
-        distinct_prompt_transport.await_authenticated(timeout=1.0)
+        multi_prompt_transport.start_session(connect_timeout=1.0)
+        multi_prompt_transport.submit_secret("one-time-code")
+        multi_prompt_transport.await_authenticated(timeout=1.0)
 
 
 def test_auth_timeout_poisons_and_closes_transport(hanging_auth_transport) -> None:
