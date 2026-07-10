@@ -94,6 +94,26 @@ def _dereferenced_tag_sha(
     return rows[0].split()[0]
 
 
+def _existing_remote_tag_sha(
+    repo_root: Path,
+    remote: str,
+    tag: str,
+    *,
+    git_prefix: list[str] | None = None,
+) -> str | None:
+    """Return the tag's dereferenced sha if it's already on the remote, else None.
+
+    A phase can crash after a push lands but before the ledger records
+    "passed" (killed process, network drop on the verification call, etc.).
+    The retry must not re-push a tag git already has, so callers check this
+    first instead of always attempting the push.
+    """
+    try:
+        return _dereferenced_tag_sha(repo_root, remote, tag, git_prefix=git_prefix)
+    except subprocess.CalledProcessError:
+        return None
+
+
 def _bitbucket_git_prefix() -> list[str]:
     token = os.environ.get("BB_TOKEN")
     if not token:
@@ -136,8 +156,10 @@ def _cmd_tag_github(args: argparse.Namespace, operator: OperatorConfig) -> int:
 
         tag = _ensure_release_tag(ledger, repo_root, source_sha, phase="tag_github")
 
-        subprocess.run(["git", "push", "origin", f"refs/tags/{tag}"], cwd=repo_root, check=True)
-        pushed_sha = _dereferenced_tag_sha(repo_root, "origin", tag)
+        pushed_sha = _existing_remote_tag_sha(repo_root, "origin", tag)
+        if pushed_sha is None:
+            subprocess.run(["git", "push", "origin", f"refs/tags/{tag}"], cwd=repo_root, check=True)
+            pushed_sha = _dereferenced_tag_sha(repo_root, "origin", tag)
         if pushed_sha != source_sha:
             ledger.set_phase("tag_github", "failed", evidence={"tag": tag, "pushed_sha": pushed_sha})
             raise RuntimeError(
@@ -185,30 +207,32 @@ def _cmd_tag_bitbucket(args: argparse.Namespace, operator: OperatorConfig) -> in
         deployed = snapshot_sha
         bb_prefix = _bitbucket_git_prefix()
 
-        if deployed == source_sha:
-            subprocess.run(
-                [*bb_prefix, "push", "bitbucket", f"refs/tags/{tag}"],
-                cwd=repo_root,
-                check=True,
-            )
-        else:
-            temp_tag = f"edge-deploy-mirror/{tag}"
-            message = f"Successful release {tag} (source {source_sha}) [edge-deploy]"
-            subprocess.run(
-                ["git", "tag", "-a", "-f", temp_tag, deployed, "-m", message],
-                cwd=repo_root,
-                check=True,
-            )
-            try:
+        pushed_sha = _existing_remote_tag_sha(repo_root, "bitbucket", tag, git_prefix=bb_prefix)
+        if pushed_sha is None:
+            if deployed == source_sha:
                 subprocess.run(
-                    [*bb_prefix, "push", "bitbucket", f"refs/tags/{temp_tag}:refs/tags/{tag}"],
+                    [*bb_prefix, "push", "bitbucket", f"refs/tags/{tag}"],
                     cwd=repo_root,
                     check=True,
                 )
-            finally:
-                subprocess.run(["git", "tag", "-d", temp_tag], cwd=repo_root, check=True)
+            else:
+                temp_tag = f"edge-deploy-mirror/{tag}"
+                message = f"Successful release {tag} (source {source_sha}) [edge-deploy]"
+                subprocess.run(
+                    ["git", "tag", "-a", "-f", temp_tag, deployed, "-m", message],
+                    cwd=repo_root,
+                    check=True,
+                )
+                try:
+                    subprocess.run(
+                        [*bb_prefix, "push", "bitbucket", f"refs/tags/{temp_tag}:refs/tags/{tag}"],
+                        cwd=repo_root,
+                        check=True,
+                    )
+                finally:
+                    subprocess.run(["git", "tag", "-d", temp_tag], cwd=repo_root, check=True)
+            pushed_sha = _dereferenced_tag_sha(repo_root, "bitbucket", tag, git_prefix=bb_prefix)
 
-        pushed_sha = _dereferenced_tag_sha(repo_root, "bitbucket", tag, git_prefix=bb_prefix)
         if pushed_sha != deployed:
             ledger.set_phase(
                 "tag_bitbucket",

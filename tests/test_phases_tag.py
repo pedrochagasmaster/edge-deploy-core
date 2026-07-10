@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -38,20 +39,38 @@ def _git_recorder(
     commands: list[list[str]],
     *,
     ls_remote_by_remote_tag: dict[tuple[str, str], str] | None = None,
+    preexisting_remote_tags: set[tuple[str, str]] | None = None,
 ):
+    """Fake ``subprocess.run`` for git tag/push/ls-remote calls.
+
+    ``ls_remote_by_remote_tag`` supplies the sha a tag resolves to once it is
+    on the remote. A tag only "exists" (ls-remote succeeds) if it was seeded
+    via ``preexisting_remote_tags`` or has since been pushed by a prior call
+    recorded here — mirroring real git so tests can model a phase retrying
+    after a crash that happened after the push but before the ledger write.
+    """
     ls_remote_by_remote_tag = ls_remote_by_remote_tag or {}
+    present = set(preexisting_remote_tags or set())
 
     def fake_run(cmd, cwd=None, check=False, capture_output=False, text=False):
         commands.append(list(cmd))
-        stdout = ""
         if "ls-remote" in cmd:
             remote = cmd[cmd.index("--tags") + 1] if "--tags" in cmd else ""
             ref = cmd[-1]
             tag_name = ref.removeprefix("refs/tags/").removesuffix("^{}")
             key = (remote, tag_name)
+            if key not in present:
+                raise subprocess.CalledProcessError(2, cmd)
             sha = ls_remote_by_remote_tag.get(key, SOURCE_SHA)
             stdout = f"{sha}\trefs/tags/{tag_name}^{{}}\n"
-        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+            return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+        if "push" in cmd:
+            remote = cmd[cmd.index("push") + 1]
+            refspec = cmd[-1]
+            dest_ref = refspec.split(":")[-1] if ":" in refspec else refspec
+            tag_name = dest_ref.removeprefix("refs/tags/")
+            present.add((remote, tag_name))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     return fake_run
 
@@ -110,6 +129,43 @@ def test_tag_github_refused_when_deploy_not_passed(tmp_path, monkeypatch, capsys
 
     assert rc == 2
     assert "not all deploy nodes passed" in capsys.readouterr().err
+
+
+def test_tag_bitbucket_retry_skips_push_when_remote_already_has_tag(
+    tmp_path, monkeypatch
+) -> None:
+    """A prior run can crash after the push lands but before the ledger
+
+    records "passed" — the ledger still shows tag_bitbucket pending, so a
+    retry must not blindly re-push a tag Bitbucket already rejects as
+    duplicate; it should notice the remote already has it and verify instead.
+    """
+    repo_root = _autobench_repo_root(tmp_path)
+    config_path = _write_operator_config(tmp_path)
+    ledger = _ledger_ready_for_tags(repo_root, snapshot_sha=SNAPSHOT_SHA)
+    ledger.set_phase("tag_bitbucket", "pending", evidence={"tag": TAG})
+    commands: list[list[str]] = []
+    monkeypatch.chdir(repo_root)
+    monkeypatch.setenv("BB_TOKEN", "test-token")
+    monkeypatch.setattr(tag_phase, "enter_phase", _noop_enter_phase)
+    monkeypatch.setattr(cli, "_record_release_attempt", lambda *a, **k: "audit-sha")
+    monkeypatch.setattr(
+        tag_phase.subprocess,
+        "run",
+        _git_recorder(
+            commands,
+            ls_remote_by_remote_tag={("bitbucket", TAG): SNAPSHOT_SHA},
+            preexisting_remote_tags={("bitbucket", TAG)},
+        ),
+    )
+
+    rc = cli.main(["--config", str(config_path), "tag-bitbucket", "--run", ledger.state["run_id"]])
+
+    assert rc == 0
+    assert not any("push" in cmd for cmd in commands)
+    reloaded = RunLedger.load(ledger.run_dir)
+    assert reloaded.phase_state("tag_bitbucket") == "passed"
+    assert reloaded.state["phases"]["tag_bitbucket"]["evidence"]["pushed_sha"] == SNAPSHOT_SHA
 
 
 def test_tag_github_idempotent_skip(tmp_path, monkeypatch, capsys) -> None:
