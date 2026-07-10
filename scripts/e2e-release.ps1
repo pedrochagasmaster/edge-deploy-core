@@ -253,6 +253,45 @@ function Wait-PostureGate {
     }
 }
 
+function Push-CurrentBranchToOrigin {
+    param(
+        [Parameter(Mandatory)][string]$BranchName
+    )
+
+    $expectedSha = (git rev-parse HEAD).Trim()
+    Assert-CommandPassed 'Resolve local branch HEAD'
+
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        git push -u origin HEAD
+
+        $remoteSha = (
+            git ls-remote --heads origin "refs/heads/$BranchName" |
+                ForEach-Object { ($_ -split '\s+')[0] }
+        )
+
+        if ($LASTEXITCODE -eq 0 -and $remoteSha -eq $expectedSha) {
+            return
+        }
+
+        Write-Host ''
+        Write-Host "Branch push did not verify on attempt $attempt." -ForegroundColor Yellow
+        Write-Host "Expected remote $BranchName at $expectedSha"
+        if ($remoteSha) {
+            Write-Host "Observed remote $BranchName at $remoteSha"
+        }
+        else {
+            Write-Host "Observed remote $BranchName missing"
+        }
+
+        if ($attempt -eq 5) {
+            throw "Push branch failed to verify after $attempt attempts"
+        }
+
+        Wait-PostureGate -Capability github-write -Reason 'Pushing the PR branch requires real GitHub write access; dry-run probes may succeed while the actual push returns HTTP 503.'
+        Start-Sleep -Seconds 5
+    }
+}
+
 function Get-BranchName {
     param([Parameter(Mandatory)][string]$ReleaseKind)
 
@@ -262,9 +301,11 @@ function Get-BranchName {
 
 function Apply-NoDepsMarker {
     py -c @"
+from datetime import datetime, timezone
 from pathlib import Path
 p = Path('benchmark.py')
-marker = b'# E2E release exercise: cosmetic runtime change; no behavior change.'
+stamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+marker = f'# E2E release exercise: cosmetic runtime change; no behavior change ({stamp}).'.encode()
 content = p.read_bytes()
 assert marker not in content
 p.write_bytes(content.rstrip() + b'\n\n' + marker + b'\n')
@@ -499,8 +540,7 @@ try {
 
     Wait-PostureGate -Capability github-write -Reason 'The PR workflow now pushes the branch, creates the GitHub PR, and watches GitHub checks.'
 
-    git push -u origin HEAD
-    Assert-CommandPassed 'Push branch'
+    Push-CurrentBranchToOrigin -BranchName $branchName
 
     $prBody = Get-PullRequestBody -ReleaseKind $Kind
 
