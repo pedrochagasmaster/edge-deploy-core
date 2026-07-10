@@ -33,6 +33,18 @@ import uuid
 from pathlib import Path
 
 from edge_deploy.remote_python import REMOTE_PYTHON_EXPR
+from edge_deploy.transport import (
+    AuthenticationError,
+    ConnectionLostError,
+    TransferProgress,
+    TransferProgressCallback,
+)
+
+__all__ = [
+    "AuthenticationError",
+    "SessionGoneError",
+    "TmuxDriver",
+]
 
 # Matches an ANSI escape sequence so screen text can be inspected as plain text.
 _ANSI_RE = r"\x1b\[[0-9;?]*[ -/]*[@-~]"
@@ -63,21 +75,11 @@ def _shell_remote_path(remote_path: str) -> str:
 _PROMPT_RE = r"[\$#]\s*$"
 
 
-class SessionGoneError(RuntimeError):
+class SessionGoneError(ConnectionLostError):
     """Raised when the tmux session has disappeared (pane process exited).
 
     Surfacing this distinctly stops the harness from cascading a dozen opaque
     ``capture-pane returned non-zero`` failures when the SSH pane has died.
-    """
-
-
-class AuthenticationError(RuntimeError):
-    """Raised when the Edge Node rejects the SSH credential / passcode.
-
-    RSA SecurID tokencodes are single-use and rotate roughly every 60s, so a stale or
-    mistyped code makes ``sshd`` re-display ``Enter PASSCODE:``. Surfacing this distinctly
-    lets the harness abort *immediately* with an actionable message instead of grinding
-    every check against a pane that is stuck at the authentication prompt.
     """
 
 
@@ -338,10 +340,21 @@ class TmuxDriver:
             check=False,
         )
 
-    def upload_file(self, source: str | Path, remote_path: str) -> str:
+    def upload_file(
+        self,
+        source: str | Path,
+        remote_path: str,
+        *,
+        progress: TransferProgressCallback | None = None,
+    ) -> str:
         """Copy a file through the authenticated tmux pane."""
         source_path = Path(source)
-        local_digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        source_bytes = source_path.read_bytes()
+        total_bytes = len(source_bytes)
+        local_digest = hashlib.sha256(source_bytes).hexdigest()
+        start_time = time.monotonic()
+        if progress is not None:
+            progress(TransferProgress(bytes_sent=0, total_bytes=total_bytes, elapsed_s=0.0))
         shell_path = _shell_remote_path(remote_path)
         precheck_cmd = (
             f"test -f {shell_path} && "
@@ -349,9 +362,17 @@ class TmuxDriver:
         )
         screen, _rc = self.run_remote(precheck_cmd, timeout=60.0)
         if self._extract_hex_digest(screen) == local_digest:
+            if progress is not None:
+                progress(
+                    TransferProgress(
+                        bytes_sent=total_bytes,
+                        total_bytes=total_bytes,
+                        elapsed_s=time.monotonic() - start_time,
+                    )
+                )
             return local_digest
 
-        encoded = base64.b64encode(source_path.read_bytes()).decode("ascii")
+        encoded = base64.b64encode(source_bytes).decode("ascii")
         remote_dir = posixpath.dirname(remote_path) or "."
         upload_id = uuid.uuid4().hex[:12]
         remote_b64 = f"{remote_path}.edge-deploy-{upload_id}.b64"
@@ -380,6 +401,17 @@ class TmuxDriver:
                 raise RuntimeError(
                     f"authenticated bundle transfer failed: could not write {remote_b64} "
                     f"(exit {rc}); last screen:\n{self._screen_tail(screen)}"
+                )
+            if progress is not None:
+                # Base64 expands source bytes by 4/3; report progress in source bytes so
+                # callers see a monotonic count against the file's real size.
+                source_bytes_sent = min(total_bytes, ((offset + len(chunk)) * 3) // 4)
+                progress(
+                    TransferProgress(
+                        bytes_sent=source_bytes_sent,
+                        total_bytes=total_bytes,
+                        elapsed_s=time.monotonic() - start_time,
+                    )
                 )
 
         # The decode script travels base64-encoded on a single line: psmux's
@@ -419,6 +451,14 @@ class TmuxDriver:
             self.run_remote(cleanup_cmd, timeout=30.0, ensure_shell=False)
             raise RuntimeError(
                 f"authenticated bundle transfer failed: digest mismatch for {remote_path}"
+            )
+        if progress is not None:
+            progress(
+                TransferProgress(
+                    bytes_sent=total_bytes,
+                    total_bytes=total_bytes,
+                    elapsed_s=time.monotonic() - start_time,
+                )
             )
         return local_digest
 

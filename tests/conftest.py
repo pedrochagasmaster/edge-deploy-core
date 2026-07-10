@@ -21,6 +21,7 @@ import pytest
 
 from edge_deploy.config import NodeConfig, ToolProfile
 from edge_deploy.tmux_driver import AuthenticationError
+from edge_deploy.transport import TransferProgress, TransferProgressCallback
 
 # Sibling Tool repos live next to edge-deploy-core (…/Projects/{autobench,robocop}).
 PROJECTS_ROOT = Path(__file__).resolve().parents[2]
@@ -188,9 +189,20 @@ class FakeTmuxDriver:
     def stop_session(self) -> None:
         return None
 
-    def upload_file(self, source: Path, remote_path: str) -> str:
+    def upload_file(
+        self,
+        source: Path,
+        remote_path: str,
+        *,
+        progress: TransferProgressCallback | None = None,
+    ) -> str:
         self.uploads.append((Path(source), remote_path))
-        return hashlib.sha256(Path(source).read_bytes()).hexdigest()
+        data = Path(source).read_bytes()
+        total_bytes = len(data)
+        if progress is not None:
+            progress(TransferProgress(bytes_sent=0, total_bytes=total_bytes, elapsed_s=0.0))
+            progress(TransferProgress(bytes_sent=total_bytes, total_bytes=total_bytes, elapsed_s=0.0))
+        return hashlib.sha256(data).hexdigest()
 
     def run_remote(self, command: str, *, timeout: float = 30.0, ensure_shell: bool = True) -> tuple[str, int]:
         self.commands.append(command)
