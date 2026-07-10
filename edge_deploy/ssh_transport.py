@@ -15,6 +15,7 @@ included in a ``repr()``.
 from __future__ import annotations
 
 import queue
+import re
 import shlex
 import socket
 import threading
@@ -27,11 +28,19 @@ import paramiko
 
 from edge_deploy.config import NodeConfig
 from edge_deploy.preflight import endpoint_from_node
-from edge_deploy.transport import AuthenticationError, HostKeyError, TransportUnavailable
+from edge_deploy.transport import (
+    AuthenticationError,
+    ConnectionLostError,
+    HostKeyError,
+    InteractiveChannelError,
+    RemoteCommandTimeout,
+    TransportUnavailable,
+)
 
 DEFAULT_KEEPALIVE_SECONDS = 5
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 15.0
 _AUTH_COMPLETION_TIMEOUT_SECONDS = 15.0
+_PTY_TRANSCRIPT_LIMIT = 65536
 
 
 @dataclass(frozen=True)
@@ -160,6 +169,7 @@ class ParamikoSshTransport:
         self._transport: paramiko.Transport | None = None
         self._remote_home: PurePosixPath | None = None
         self._interactive_channel: paramiko.Channel | None = None
+        self._pty_transcript: bytearray = bytearray()
         self._poisoned = False
         self._closed = False
 
@@ -297,10 +307,17 @@ class ParamikoSshTransport:
         worker.start()
 
     def submit_secret(self, secret: str) -> None:
-        """Forward a one-time passcode to the pending keyboard-interactive prompt.
+        """Forward a secret to the appropriate pending prompt.
 
-        Never logged, echoed, or retained beyond the queue handoff.
+        Before authentication completes, this feeds the keyboard-interactive queue for
+        the RSA passcode. Once authenticated and a PTY dialogue is active (e.g. a
+        ``kinit`` password prompt reached through :meth:`send_text` /
+        :meth:`wait_for`), this writes the secret plus newline directly to the PTY
+        instead. Never logged, echoed, or retained beyond the immediate handoff.
         """
+        if self.at_shell_prompt() and self._interactive_channel is not None:
+            self._submit_secret_to_pty(secret)
+            return
         if self._transport is None or self._poisoned:
             raise TransportUnavailable("No pending authentication prompt")
         if not self._prompt_ready.wait(timeout=self._settings.connect_timeout_s):
@@ -367,6 +384,7 @@ class ParamikoSshTransport:
 
     def _poison_and_close(self) -> None:
         self._poisoned = True
+        self._close_interactive_channel()
         self._best_effort_close(transport=self._transport, raw_socket=self._socket)
         self._transport = None
         self._socket = None
@@ -374,7 +392,213 @@ class ParamikoSshTransport:
     def stop_session(self) -> None:
         if self._closed:
             return
+        self._close_interactive_channel()
         self._best_effort_close(transport=self._transport, raw_socket=self._socket)
         self._transport = None
         self._socket = None
         self._closed = True
+
+    # ------------------------------------------------------------------
+    # Command execution
+    # ------------------------------------------------------------------
+
+    def _require_active_transport(self) -> paramiko.Transport:
+        if self._transport is None or self._poisoned or not self._transport.is_active():
+            raise ConnectionLostError("The Paramiko transport is not active")
+        return self._transport
+
+    def _channel_call_with_deadline(
+        self, channel: paramiko.Channel, deadline: float, action: Callable[[], object]
+    ) -> object:
+        """Run a Paramiko channel call in a daemon worker and poison on deadline."""
+        results: list[object] = []
+        errors: list[BaseException] = []
+        finished = threading.Event()
+
+        def invoke() -> None:
+            try:
+                results.append(action())
+            except BaseException as exc:  # noqa: BLE001 - forwarded to the caller
+                errors.append(exc)
+            finally:
+                finished.set()
+
+        remaining = deadline - self._clock()
+        if remaining <= 0:
+            self._poison_and_close()
+            raise RemoteCommandTimeout("Remote channel request exceeded its monotonic deadline")
+        channel.settimeout(remaining)
+
+        worker = threading.Thread(target=invoke, daemon=True, name=f"paramiko-exec-{self.session}")
+        worker.start()
+        remaining = deadline - self._clock()
+        if remaining <= 0 or not finished.wait(remaining):
+            self._poison_and_close()
+            raise RemoteCommandTimeout("Remote channel request exceeded its monotonic deadline")
+        if self._clock() >= deadline:
+            self._poison_and_close()
+            raise RemoteCommandTimeout("Remote channel request exceeded its monotonic deadline")
+        if errors:
+            if isinstance(errors[0], TimeoutError):
+                self._poison_and_close()
+                raise RemoteCommandTimeout("Remote channel request exceeded its monotonic deadline") from errors[0]
+            raise errors[0]
+        return results[0] if results else None
+
+    def _open_session_channel(self, transport: paramiko.Transport, deadline: float) -> paramiko.Channel:
+        remaining = deadline - self._clock()
+        if remaining <= 0:
+            self._poison_and_close()
+            raise RemoteCommandTimeout("Session channel open exceeded its monotonic deadline")
+        try:
+            channel = transport.open_session(timeout=remaining)
+        except BaseException as exc:
+            self._poison_and_close()
+            raise RemoteCommandTimeout("Session channel open exceeded its monotonic deadline") from exc
+        if channel is None:
+            self._poison_and_close()
+            raise ConnectionLostError("Authenticated transport returned no session channel")
+        channel.settimeout(max(deadline - self._clock(), 0.001))
+        return channel
+
+    def _drain_channel(self, channel: paramiko.Channel, *, deadline: float) -> tuple[bytearray, int]:
+        """Interleave stdout/stderr reads in polling order and only fetch status once ready."""
+        transcript = bytearray()
+        while True:
+            progressed = False
+            while channel.recv_ready():
+                block = channel.recv(65536)
+                if block:
+                    transcript.extend(block)
+                    progressed = True
+            while channel.recv_stderr_ready():
+                block = channel.recv_stderr(65536)
+                if block:
+                    transcript.extend(block)
+                    progressed = True
+
+            if (
+                channel.exit_status_ready()
+                and not channel.recv_ready()
+                and not channel.recv_stderr_ready()
+            ):
+                exit_status = channel.recv_exit_status()
+                return transcript, exit_status
+            if self._clock() >= deadline:
+                self._poison_and_close()
+                raise RemoteCommandTimeout("Remote command exceeded its monotonic deadline")
+            if not progressed:
+                time.sleep(0.01)
+
+    def run_remote(
+        self,
+        command: str,
+        *,
+        timeout: float = 30.0,
+        ensure_shell: bool = True,
+    ) -> tuple[str, int]:
+        """Run one command over a fresh session channel on the single reused transport.
+
+        ``ensure_shell`` is accepted for :class:`RemoteTransport` compatibility; the
+        Paramiko adapter always executes over a clean, non-interactive session channel
+        so there is no pane state to return to.
+        """
+        del ensure_shell
+        transport = self._require_active_transport()
+        deadline = self._clock() + timeout
+        channel = self._open_session_channel(transport, deadline)
+        try:
+            self._channel_call_with_deadline(channel, deadline, lambda: channel.exec_command(command))
+            transcript, exit_status = self._drain_channel(channel, deadline=deadline)
+        finally:
+            if not self._poisoned:
+                try:
+                    channel.close()
+                except BaseException:
+                    pass
+        text = transcript.decode("utf-8", errors="replace")
+        return text, exit_status
+
+    # ------------------------------------------------------------------
+    # PTY dialogue
+    # ------------------------------------------------------------------
+
+    def _open_interactive_channel(self) -> paramiko.Channel:
+        transport = self._require_active_transport()
+        deadline = self._clock() + self._settings.connect_timeout_s
+        channel = self._open_session_channel(transport, deadline)
+        try:
+            self._channel_call_with_deadline(
+                channel, deadline, lambda: channel.get_pty(term="xterm", width=80, height=24)
+            )
+            self._channel_call_with_deadline(channel, deadline, lambda: channel.invoke_shell())
+        except BaseException:
+            try:
+                channel.close()
+            except BaseException:
+                pass
+            raise
+        self._interactive_channel = channel
+        self._pty_transcript = bytearray()
+        return channel
+
+    def _close_interactive_channel(self) -> None:
+        channel = self._interactive_channel
+        self._interactive_channel = None
+        self._pty_transcript = bytearray()
+        if channel is not None:
+            try:
+                channel.close()
+            except BaseException:
+                pass
+
+    def send_text(self, text: str) -> None:
+        """Send one line of non-secret text to the persistent PTY dialogue channel.
+
+        Opens the PTY lazily on first use. Never send a secret through this method —
+        use :meth:`submit_secret` so the value never travels through a transcript.
+        """
+        channel = self._interactive_channel or self._open_interactive_channel()
+        try:
+            channel.sendall(f"{text}\n".encode("utf-8"))
+        except BaseException as exc:
+            self._close_interactive_channel()
+            raise InteractiveChannelError("Could not send text to the interactive channel") from exc
+
+    def wait_for(
+        self,
+        pattern: str,
+        timeout: float = 10.0,
+        poll_interval: float = 0.5,
+    ) -> str:
+        """Drain the interactive channel into a private bounded transcript until ``pattern``
+        matches, then return the transcript decoded so far."""
+        channel = self._interactive_channel
+        if channel is None:
+            raise InteractiveChannelError("No interactive channel is open")
+        deadline = self._clock() + timeout
+        compiled = re.compile(pattern)
+        while True:
+            while channel.recv_ready():
+                block = channel.recv(4096)
+                if block:
+                    self._pty_transcript.extend(block)
+                    if len(self._pty_transcript) > _PTY_TRANSCRIPT_LIMIT:
+                        del self._pty_transcript[:-_PTY_TRANSCRIPT_LIMIT]
+            text = self._pty_transcript.decode("utf-8", errors="replace")
+            if compiled.search(text):
+                return text
+            if self._clock() >= deadline:
+                self._close_interactive_channel()
+                raise InteractiveChannelError(f"Timed out waiting for pattern {pattern!r}")
+            time.sleep(poll_interval)
+
+    def _submit_secret_to_pty(self, secret: str) -> None:
+        channel = self._interactive_channel
+        if channel is None:
+            raise InteractiveChannelError("No interactive channel is open for a secret submission")
+        try:
+            channel.sendall(f"{secret}\n".encode("utf-8"))
+        except BaseException as exc:
+            self._close_interactive_channel()
+            raise InteractiveChannelError("Could not send the secret to the interactive channel") from exc
