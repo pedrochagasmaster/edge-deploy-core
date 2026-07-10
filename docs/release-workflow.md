@@ -20,6 +20,46 @@ exact next command.
 4. Copy [config.example.yaml](../config.example.yaml) to
    `%APPDATA%\edge-deploy\config.yaml` and set `BB_TOKEN` in the environment.
 
+5. Before releasing to a node for the first time, or after any change to its
+   `ssh_options`, known-hosts entry, or credentials, verify its transport:
+
+   ```powershell
+   python -m edge_deploy preflight --node node03
+   python -m edge_deploy transport-smoke --node node03
+   ```
+
+   `transport-smoke` authenticates once and exercises command execution,
+   verified file transfer, PTY dialogue, and keepalive over that single
+   connection, then always tears it down and reports pass/fail per check.
+
+## Transport (ADR-0014)
+
+SSH (Paramiko) is the default transport (`transport: ssh` in
+`config.example.yaml`): one persistent, digest-verified connection per node
+per deploy invocation, reused for authentication, dependency transfer,
+rollout commands, and drift checks. Matching dependency archives already
+present on the node are reused by digest without transferring any bytes; new
+archives stream over SFTP (falling back to a binary exec-channel stream if
+the SFTP subsystem is unavailable) and report live byte progress — MiB sent,
+percent complete, and MiB/s — both on the console and in
+`release-progress.json`, which `edge_console.py` renders as a progress bar.
+
+`transport: pane` remains an explicit per-node override for recovery when SSH
+access to a node regresses (ADR-0011); selecting it restores the psmux pane
+protocol unchanged. No transport failure silently falls back from `ssh` to
+`pane` — a transport failure is a durable node failure (see status below), not
+an automatic retry over a different channel.
+
+No manual SCP or symlink workaround (for example, hand-copying a bundle to a
+node, or a `/ads_storage/$USER` symlink) is part of the canonical 1.5.0
+workflow. Release-owned remote state lives under the canonical
+`~/.edge-deploy` path, resolved once per session against the authenticated
+node's real home directory.
+
+```powershell
+python -m edge_deploy release --guided --tool autobench
+```
+
 ## Release flow (run ledger)
 
 Work from the clean GitHub `main` checkout of the tool being released
@@ -159,8 +199,10 @@ bitbucket-vpn or both-vpns without repeating verify.
 On completion, guided mode prints `release complete: <run_id>` followed by the
 same status summary as `python -m edge_deploy status --run <run_id>`.
 
-During deploy, enter the RSA passcode in the controller tmux pane when prompted.
-The progress heartbeat shows `>>> WAITING FOR OPERATOR - …` while waiting.
+During deploy, enter the RSA passcode at the interactive prompt when asked (the
+keyboard-interactive SSH prompt for `transport: ssh` nodes, or the controller
+tmux pane for `transport: pane` nodes). The progress heartbeat shows
+`>>> WAITING FOR OPERATOR - …` while waiting.
 
 ### 4. Complete
 
@@ -204,11 +246,13 @@ python -m edge_deploy abandon --run <run_id> --reason "why this run stops"
 
 ## Artifacts
 
-Each run directory holds `state.json`, `events.jsonl`, per-node
-`pane-<node>.log` files, publish reports, rollout reports, and dependency
-bundles. Bundles are content-addressed and never committed. A failed deploy
-node can be retried with `deploy --run <run_id> --nodes <node>` without
-re-running verify or publish when their ledger state is already `passed`.
+Each run directory holds `state.json`, `events.jsonl`, `release-progress.json`
+(live transfer byte progress), per-node `pane-<node>.log` files (when
+`transport: pane` is in use), publish reports, rollout reports, and
+dependency bundles. Bundles are content-addressed and never committed. A
+failed deploy node can be retried with `deploy --run <run_id> --nodes <node>`
+without re-running verify or publish when their ledger state is already
+`passed`.
 
 ## Rules
 
@@ -220,6 +264,9 @@ re-running verify or publish when their ledger state is already `passed`.
 
 See [docs/DESIGN.md](DESIGN.md) for module boundaries,
 [docs/adr/0008-run-ledger-and-posture-phases.md](adr/0008-run-ledger-and-posture-phases.md)
-for architecture decisions, and
+for architecture decisions,
 [docs/adr/0010-guided-posture-loop.md](adr/0010-guided-posture-loop.md) for
-guided mode and cross-posture resume.
+guided mode and cross-posture resume, and
+[docs/adr/0014-paramiko-release-transport.md](adr/0014-paramiko-release-transport.md)
+(with [ADR-0011](adr/0011-pane-safe-remote-transport.md)) for the transport
+layer.

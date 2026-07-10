@@ -55,9 +55,15 @@ Successful tool releases receive an immutable `release-<UTC>-<short-sha>` tag on
 GitHub and Bitbucket. Redacted release bundles are appended to the Bitbucket-only
 `release-log` branch of this repository.
 
+Remote work runs over `transport.py` and `ssh_transport.py`: a persistent,
+digest-verified Paramiko SSH connection per node by default
+(`transport: ssh`), with the local tmux/psmux pane kept as an explicit
+per-node recovery override (`transport: pane`), not a universal channel.
+
 See [docs/release-workflow.md](docs/release-workflow.md) for the operator
 procedure and [docs/DESIGN.md](docs/DESIGN.md) for engine internals. Architecture
 decisions: [ADR-0008](docs/adr/0008-run-ledger-and-posture-phases.md) (run
 ledger and phases), [ADR-0009](docs/adr/0009-on-node-runner-file-evidence.md)
 (runner and file evidence), [ADR-0013](docs/adr/0013-five-posture-capability-model.md)
-(five-posture capability model).
+(five-posture capability model), [ADR-0014](docs/adr/0014-paramiko-release-transport.md)
+(Paramiko as the default release transport).

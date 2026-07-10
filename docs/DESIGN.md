@@ -39,6 +39,14 @@ until continued (`--run`), abandoned, or completed.
 - `ledger.py`: durable run state, lock, engine identity
 - `posture.py`: five-posture capability model (ADR-0013), phase endpoints, probes
 - `phases/`: verify, publish, deploy, tag, status subcommands
+- `transport.py`: `RemoteTransport` protocol and the `transport_for_node`
+  factory (ADR-0014) — the seam every remote-facing module depends on
+- `ssh_transport.py`: `ParamikoSshTransport`, the default `transport: ssh`
+  implementation — one persistent, digest-verified connection per node per
+  deploy invocation (ADR-0014)
+- `tmux_driver.py`: `TmuxDriver`, the `transport: pane` implementation kept as
+  an explicit per-node recovery override, not a universal channel (ADR-0011)
+- `remote_paths.py`: canonical `~/.edge-deploy` release-owned remote paths
 - `runner.py`: on-node step executor and D8 read protocol
 - `repository.py`: canonical checkout and GitHub CI gates
 - `publish.py`: exact-SHA, fast-forward-only Bitbucket Publish
@@ -48,9 +56,12 @@ until continued (`--run`), abandoned, or completed.
 - `reporting.py`: redacted machine-readable evidence
 - `config.py`: operator and Tool Profile contracts
 
-Run artifacts (reports, bundles, pane logs) live under the run directory.
-Audit synchronization uses an isolated temporary worktree and the explicit
-refspec `HEAD:refs/heads/release-log` against the `bitbucket` remote.
+Run artifacts (reports, bundles, transfer progress, and per-node pane logs
+when `transport: pane` is in use) live under the run directory. Audit
+synchronization uses an isolated temporary worktree and the explicit refspec
+`HEAD:refs/heads/release-log` against the `bitbucket` remote.
 
-See [adr/0008-run-ledger-and-posture-phases.md](adr/0008-run-ledger-and-posture-phases.md)
-and [adr/0009-on-node-runner-file-evidence.md](adr/0009-on-node-runner-file-evidence.md).
+See [adr/0008-run-ledger-and-posture-phases.md](adr/0008-run-ledger-and-posture-phases.md),
+[adr/0009-on-node-runner-file-evidence.md](adr/0009-on-node-runner-file-evidence.md),
+[adr/0011-pane-safe-remote-transport.md](adr/0011-pane-safe-remote-transport.md),
+and [adr/0014-paramiko-release-transport.md](adr/0014-paramiko-release-transport.md).

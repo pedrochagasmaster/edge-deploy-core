@@ -72,3 +72,17 @@ Every byte crossing the pane follows one protocol, implemented in
 - Local simulation is possible without an Edge Node (psmux pane + Git bash +
   interpreter shim), and caught the CRLF defect that node-side inspection
   could not explain.
+
+## Postscript (2026-07-10)
+
+[ADR-0014](0014-paramiko-release-transport.md) supersedes this ADR's
+context-section conclusion that "the pane is the only channel": a live probe
+against node03 shows a Paramiko SSH connection authenticates cleanly under
+the same RSA/Kerberos policy and its SFTP subsystem (with a binary
+exec-channel fallback) is reachable. Paramiko (`transport: ssh`) is now the
+default release transport.
+
+Every rule in this ADR — single-line commands, base64 chunking, D8
+wrap-immune markers, LF-only staging — remains **binding without
+modification** whenever a node is explicitly configured `transport: pane`.
+Pane is kept as a named per-node recovery override, not removed.
