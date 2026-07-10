@@ -46,6 +46,7 @@ from edge_deploy.reporting import OperationReport, redact, write_report
 from edge_deploy.repository import RepositoryError, RepositoryState, inspect_repository
 from edge_deploy.tmux_driver import AuthenticationError, SessionGoneError, TmuxDriver
 from edge_deploy.transport import RemoteTransport, TransportError, transport_for_node
+from edge_deploy.transport_smoke import run_transport_smoke
 
 TOOL_CHOICES = ("autobench", "robocop")
 # tag_bitbucket precedes tag_github (ADR-0012/0013): it shares deploy's
@@ -143,6 +144,14 @@ def build_parser() -> argparse.ArgumentParser:
     preflight_parser.add_argument("--tool", default=None, help="Optional: include the tool repo_path in the report")
     preflight_parser.add_argument("--timeout", type=float, default=None, help="TCP connect timeout (seconds)")
     preflight_parser.add_argument("--json-report")
+
+    transport_smoke_parser = subparsers.add_parser(
+        "transport-smoke", help="Diagnose the Paramiko transport: command, transfer, PTY, keepalive, cleanup"
+    )
+    transport_smoke_parser.add_argument("--node", required=True)
+    transport_smoke_parser.add_argument(
+        "--payload-mib", type=float, default=8.0, help="Transfer check payload size in MiB (default: 8)"
+    )
 
     abandon_parser = subparsers.add_parser("abandon", help="Abandon an open run")
     abandon_parser.add_argument("--run", required=True)
@@ -865,6 +874,42 @@ def _cmd_preflight(args: argparse.Namespace, operator: OperatorConfig) -> int:
     return 2
 
 
+def _cmd_transport_smoke(args: argparse.Namespace, operator: OperatorConfig) -> int:
+    node = operator.node(args.node)
+    node_transport = getattr(node, "transport", "ssh")
+    if node_transport != "ssh":
+        print(
+            f"transport-smoke refused: node {args.node!r} is configured for transport: "
+            f"{node_transport!r}; this diagnostic validates the Paramiko (transport: ssh) adapter only.",
+            file=sys.stderr,
+        )
+        return 2
+
+    preflight_result = preflight.run_tcp_preflight(node)
+    if not preflight_result.connected:
+        print(f"TCP preflight: FAIL - {preflight_result.error}", file=sys.stderr)
+        return 2
+    print("TCP preflight: PASS")
+
+    driver = transport_for_node(node, profile=None, retries=2)
+    try:
+        broker = AuthBroker(_CliAuthProgress(), "prompt", 300.0, 3)
+        broker.ensure_authenticated(driver, args.node)
+        result = run_transport_smoke(
+            driver,
+            node_label=args.node,
+            payload_bytes=int(args.payload_mib * 1024 * 1024),
+        )
+    finally:
+        _safe_stop_transport(driver)
+
+    for check in result.checks:
+        outcome = "PASS" if check.passed else "FAIL"
+        print(redact(f"[{outcome}] {check.name}: {check.message}"))
+    print(f"transport-smoke: {'PASS' if result.passed else 'FAIL'}")
+    return 0 if result.passed else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "mirror":
@@ -902,6 +947,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_drift(args, operator)
         if args.command == "preflight":
             return _cmd_preflight(args, operator)
+        if args.command == "transport-smoke":
+            return _cmd_transport_smoke(args, operator)
         func = getattr(args, "func", None)
         if func is not None:
             return func(args, operator)

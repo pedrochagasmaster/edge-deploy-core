@@ -436,6 +436,97 @@ def test_rollout_command_refused_returns_1(tmp_path, fake_tmux, monkeypatch) -> 
 
 
 # ---------------------------------------------------------------------------
+# transport-smoke command (no real network)
+# ---------------------------------------------------------------------------
+
+
+def _patch_transport_smoke_success(monkeypatch, *, passed: bool = True) -> None:
+    from edge_deploy.transport_smoke import SmokeCheck, SmokeResult
+
+    monkeypatch.setattr(socket, "getaddrinfo", _ok_addrinfo)
+    monkeypatch.setattr(socket, "create_connection", _reachable_connect)
+    fake_driver = SimpleNamespace(stop_session=lambda: None)
+    monkeypatch.setattr(cli, "transport_for_node", lambda node, profile, **kwargs: fake_driver)
+    monkeypatch.setattr(
+        "edge_deploy.auth.AuthBroker.ensure_authenticated", lambda self, driver, node_name: None
+    )
+    checks = [
+        SmokeCheck("command", True, "ok"),
+        SmokeCheck("transfer", passed, "8.0 MiB uploaded and digest-verified (0.40 MiB/s)"),
+        SmokeCheck("pty", True, "ok"),
+        SmokeCheck("keepalive", True, "ok"),
+        SmokeCheck("cleanup", True, "ok"),
+    ]
+    monkeypatch.setattr(
+        cli,
+        "run_transport_smoke",
+        lambda driver, *, node_label, payload_bytes: SmokeResult(node_label=node_label, checks=checks),
+    )
+
+
+def test_transport_smoke_command_passes(tmp_path, capsys, monkeypatch) -> None:
+    config_path = _write_operator_config(tmp_path)
+    _patch_transport_smoke_success(monkeypatch)
+
+    rc = cli.main(["--config", str(config_path), "transport-smoke", "--node", "node03"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "TCP preflight: PASS" in out
+    assert "[PASS] command: ok" in out
+    assert "transport-smoke: PASS" in out
+
+
+def test_transport_smoke_command_fails_when_a_check_fails(tmp_path, capsys, monkeypatch) -> None:
+    config_path = _write_operator_config(tmp_path)
+    _patch_transport_smoke_success(monkeypatch, passed=False)
+
+    rc = cli.main(["--config", str(config_path), "transport-smoke", "--node", "node03"])
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "[FAIL] transfer:" in out
+    assert "transport-smoke: FAIL" in out
+
+
+def test_transport_smoke_command_refuses_pane_transport(tmp_path, capsys) -> None:
+    autobench_path = _write_tool_profile(tmp_path, "autobench")
+    config_path = tmp_path / "config-pane.yaml"
+    config_path.write_text(
+        (
+            "operator_email: operator@example.com\n"
+            "nodes:\n"
+            "  node03:\n"
+            '    host: "user@edge.example"\n'
+            '    ssh_options: "-p 2222"\n'
+            "    transport: pane\n"
+            "tools:\n"
+            f"  autobench: {autobench_path.as_posix()}\n"
+        ),
+        encoding="utf-8",
+    )
+
+    rc = cli.main(["--config", str(config_path), "transport-smoke", "--node", "node03"])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "transport-smoke refused" in err
+    assert "'pane'" in err
+
+
+def test_transport_smoke_command_reports_tcp_preflight_failure(tmp_path, capsys, monkeypatch) -> None:
+    config_path = _write_operator_config(tmp_path)
+    monkeypatch.setattr(socket, "getaddrinfo", _ok_addrinfo)
+    monkeypatch.setattr(socket, "create_connection", _raise_timeout)
+
+    rc = cli.main(["--config", str(config_path), "transport-smoke", "--node", "node03"])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "TCP preflight: FAIL" in err
+
+
+# ---------------------------------------------------------------------------
 # release command dispatch (phase chain)
 # ---------------------------------------------------------------------------
 
