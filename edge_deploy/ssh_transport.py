@@ -303,15 +303,17 @@ class ParamikoSshTransport:
         self._auth_error = None
 
         def handler(_title: str, _instructions: str, prompts: list[tuple[str, bool]]) -> list[str]:
-            if len(prompts) != 1:
-                raise AuthenticationError("Expected exactly one keyboard-interactive prompt")
-            _prompt, echo = prompts[0]
-            if echo:
+            if not prompts:
+                raise AuthenticationError("Keyboard-interactive authentication returned no prompts")
+            if any(echo for _prompt, echo in prompts):
                 raise AuthenticationError("Keyboard-interactive passcode prompt requested echo")
+            non_blank_prompts = {prompt.strip() for prompt, _echo in prompts if prompt.strip()}
+            if len(non_blank_prompts) > 1:
+                raise AuthenticationError("Keyboard-interactive challenge requested distinct prompts")
             self._prompt_ready.set()
             code = self._secret_queue.get()
             try:
-                return [code]
+                return [code if prompt.strip() else "" for prompt, _echo in prompts]
             finally:
                 code = ""  # noqa: F841 - drop the local reference to the secret
 
