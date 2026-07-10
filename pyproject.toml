@@ -9,7 +9,7 @@ description = "Shared deployment toolkit that rolls a reviewed build of a Tool (
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Proprietary" }
-dependencies = ["PyYAML>=6.0"]
+dependencies = ["PyYAML>=6.0", "paramiko>=5.0,<6"]
 
 [project.optional-dependencies]
 dev = ["pytest>=7", "pytest-xdist>=3.6", "ruff>=0.4"]
