@@ -9,7 +9,9 @@ nodes:
     host: operator@edge-node-03.example
     ssh_options: "-p 2222 -o ServerAliveInterval=30"
     session: edge-node03
+    transport: ssh  # "pane" is an explicit per-node recovery override (ADR-0011).
   node04:
     host: operator@edge-node-04.example
     ssh_options: "-p 2222 -o ServerAliveInterval=30"
     session: edge-node04
+    transport: ssh  # "pane" is an explicit per-node recovery override (ADR-0011).

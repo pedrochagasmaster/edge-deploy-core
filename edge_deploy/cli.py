@@ -20,6 +20,7 @@ from pathlib import Path
 
 from edge_deploy import __version__, drift, preflight, rollout
 from edge_deploy.audit import AuditAttempt, AuditSyncError, append_audit_attempt
+from edge_deploy.auth import AuthBroker
 from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, OperatorConfig, load_tool_profile
 from edge_deploy.ledger import LedgerError, RunLedger
 from edge_deploy.mirror import MirrorError, mirror_release
@@ -44,6 +45,7 @@ from edge_deploy.release import resolve_nodes
 from edge_deploy.reporting import OperationReport, redact, write_report
 from edge_deploy.repository import RepositoryError, RepositoryState, inspect_repository
 from edge_deploy.tmux_driver import AuthenticationError, SessionGoneError, TmuxDriver
+from edge_deploy.transport import RemoteTransport, TransportError, transport_for_node
 
 TOOL_CHOICES = ("autobench", "robocop")
 # tag_bitbucket precedes tag_github (ADR-0012/0013): it shares deploy's
@@ -153,6 +155,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+class _CliAuthProgress:
+    """Minimal :class:`~edge_deploy.auth.AuthProgress` adapter for standalone CLI commands."""
+
+    def emit(self, message: str, **_kwargs: object) -> None:
+        print(redact(message))
+
+    def set_waiting(self, _waiting_on: str | None) -> None:
+        return None
+
+
 def _ensure_session(driver: TmuxDriver, reuse_session: bool) -> None:
     if driver.session_exists():
         return
@@ -167,6 +179,36 @@ def _ensure_session(driver: TmuxDriver, reuse_session: bool) -> None:
             "Started a tmux session but it still needs human authentication. "
             "Enter the PASSCODE in that pane, then rerun with --reuse-session."
         )
+
+
+def _safe_stop_transport(driver: RemoteTransport) -> None:
+    try:
+        driver.stop_session()
+    except (TransportError, RuntimeError):  # teardown must never mask the real outcome
+        pass
+
+
+def _authenticate_standalone_transport(
+    driver: RemoteTransport, node: object, reuse_session: bool
+) -> None:
+    """Authenticate a freshly built :func:`transport_for_node` transport for standalone commands.
+
+    ``--reuse-session`` is only legal for ``transport: pane`` (an already-authenticated
+    tmux pane can be attached to); a standalone process cannot reuse another process's
+    Paramiko connection, so SSH nodes always authenticate a fresh connection here.
+    """
+    node_transport = getattr(node, "transport", "ssh")
+    if reuse_session and node_transport != "pane":
+        raise RuntimeError(
+            "--reuse-session requires transport: pane; "
+            f"node {getattr(node, 'name', '')!r} is configured for transport: {node_transport!r}. "
+            "A standalone process cannot reuse another process's Paramiko connection."
+        )
+    if node_transport == "pane":
+        _ensure_session(driver, reuse_session)  # type: ignore[arg-type]
+        return
+    broker = AuthBroker(_CliAuthProgress(), "prompt", 300.0, 3)
+    broker.ensure_authenticated(driver, getattr(node, "name", ""))
 
 
 def _emit(report: OperationReport, json_report: str | None) -> None:
@@ -770,17 +812,20 @@ def _cmd_mirror(args: argparse.Namespace) -> int:
 def _cmd_rollout(args: argparse.Namespace, operator: OperatorConfig) -> int:
     node = operator.node(args.node)
     profile = load_tool_profile(Path(operator.tool_path(args.tool)))
-    driver = TmuxDriver.from_node_and_profile(node, profile, retries=2)
-    _ensure_session(driver, args.reuse_session)
-    report = rollout.run_rollout(
-        driver,
-        profile,
-        node,
-        target_commit=args.commit,
-        run_id="edge-deploy",
-        install_mode=args.install,
-        operator_email=operator.operator_email,
-    )
+    driver = transport_for_node(node, profile, retries=2)
+    try:
+        _authenticate_standalone_transport(driver, node, args.reuse_session)
+        report = rollout.run_rollout(
+            driver,
+            profile,
+            node,
+            target_commit=args.commit,
+            run_id="edge-deploy",
+            install_mode=args.install,
+            operator_email=operator.operator_email,
+        )
+    finally:
+        _safe_stop_transport(driver)
     _emit(report, args.json_report)
     return 0 if report.status == "rolled_out" else 1
 
@@ -789,9 +834,12 @@ def _cmd_drift(args: argparse.Namespace, operator: OperatorConfig) -> int:
     node = operator.node(args.node)
     tool_path = operator.tool_path(args.tool)
     profile = load_tool_profile(Path(tool_path))
-    driver = TmuxDriver.from_node_and_profile(node, profile, retries=2)
-    _ensure_session(driver, args.reuse_session)
-    report = drift.check_drift(driver, profile, node, commit=args.commit, local_root=tool_path)
+    driver = transport_for_node(node, profile, retries=2)
+    try:
+        _authenticate_standalone_transport(driver, node, args.reuse_session)
+        report = drift.check_drift(driver, profile, node, commit=args.commit, local_root=tool_path)
+    finally:
+        _safe_stop_transport(driver)
     _emit(report, args.json_report)
     return 0 if report.status == "passed" else 1
 

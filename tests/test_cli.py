@@ -402,8 +402,9 @@ def test_preflight_command_writes_json_report(tmp_path, monkeypatch) -> None:
 
 
 def _patch_driver_factory(monkeypatch, fake) -> None:
+    monkeypatch.setattr(cli, "transport_for_node", lambda node, profile, **kwargs: fake)
     monkeypatch.setattr(
-        cli, "TmuxDriver", SimpleNamespace(from_node_and_profile=lambda node, profile, **kwargs: fake)
+        "edge_deploy.auth.AuthBroker.ensure_authenticated", lambda self, driver, node_name: None
     )
 
 

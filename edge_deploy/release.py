@@ -32,8 +32,8 @@ from edge_deploy.reporting import (
     write_report,
 )
 from edge_deploy.rollout import run_rollout
-from edge_deploy.tmux_driver import AuthenticationError, SessionGoneError, TmuxDriver
-from edge_deploy.transport import RemoteTransport
+from edge_deploy.tmux_driver import AuthenticationError, SessionGoneError
+from edge_deploy.transport import RemoteTransport, TransportError, transport_for_node
 from edge_deploy.verify import verify_after_rollout
 
 
@@ -346,7 +346,7 @@ def run_release(
     *,
     report_dir: str | Path,
     publish_fn: Callable[..., PublishResult] = publish_snapshot,
-    driver_factory: Callable[..., RemoteTransport] = TmuxDriver.from_node_and_profile,
+    driver_factory: Callable[..., RemoteTransport] = transport_for_node,
     clock: Callable[[], datetime] = _utc_now,
     remote: str = "bitbucket",
     max_auth_attempts: int = 3,
@@ -523,7 +523,7 @@ def run_release(
                     tmux_session=getattr(driver, "session", None),
                 ):
                     broker.ensure_authenticated(driver, node_name)
-            except (AuthenticationError, SessionGoneError, TimeoutError) as exc:
+            except (AuthenticationError, SessionGoneError, TransportError, TimeoutError) as exc:
                 # Never block other nodes (ADR-0003): record every still-open pair as failed.
                 for tool in tools:
                     if (node_name, tool) in recorded:
@@ -629,7 +629,7 @@ def run_release(
                         _log_successful_preflight_repair(
                             tracker, tool=tool, node=node_name, report=report
                         )
-                except (RuntimeError, SessionGoneError, AuthenticationError) as exc:
+                except (RuntimeError, SessionGoneError, AuthenticationError, TransportError) as exc:
                     report = _synthetic_report(
                         "failed",
                         node,

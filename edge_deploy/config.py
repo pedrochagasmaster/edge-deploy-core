@@ -29,6 +29,11 @@ TOOL_PROFILE_FILENAME = "edge_deploy.yaml"
 VALID_TUI_EXIT = ("ctrl_c", "dispatch_dynamic", "none")
 DEFAULT_TUI_EXIT = "ctrl_c"
 
+# Valid per-node remote transports (:func:`edge_deploy.transport.transport_for_node`).
+# ``ssh`` (persistent Paramiko) is the default; ``pane`` is an explicit recovery override.
+VALID_TRANSPORTS = ("pane", "ssh")
+DEFAULT_TRANSPORT = "ssh"
+
 
 # ---------------------------------------------------------------------------
 # Minimal YAML fallback (mirrors robocop's _fallback_yaml_load, nested-aware)
@@ -201,14 +206,21 @@ class NodeConfig:
     ssh_options: str = ""
     session: str = ""
     name: str = ""
+    transport: str = DEFAULT_TRANSPORT
 
     @classmethod
     def from_mapping(cls, name: str, data: Mapping[str, Any]) -> "NodeConfig":
+        transport = str(data.get("transport", DEFAULT_TRANSPORT) or DEFAULT_TRANSPORT)
+        if transport not in VALID_TRANSPORTS:
+            raise ValueError(
+                f"node {name!r}: transport must be one of: {', '.join(VALID_TRANSPORTS)}; got {transport!r}"
+            )
         return cls(
             host=str(data.get("host", "")),
             ssh_options=str(data.get("ssh_options", "") or ""),
             session=str(data.get("session", name)),
             name=name,
+            transport=transport,
         )
 
 

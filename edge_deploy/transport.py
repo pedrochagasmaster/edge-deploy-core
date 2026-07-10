@@ -108,3 +108,27 @@ class RemoteTransport(Protocol):
     ) -> str: ...
 
     def stop_session(self) -> None: ...
+
+
+def transport_for_node(
+    node: object,
+    profile: object,
+    *,
+    retries: int = 2,
+    pane_log_path: Path | None = None,
+) -> RemoteTransport:
+    selected = getattr(node, "transport", "ssh")
+    if selected == "ssh":
+        from edge_deploy.ssh_transport import ParamikoSshTransport
+
+        return ParamikoSshTransport.from_node_and_profile(node, profile, retries=retries)
+    if selected == "pane":
+        from edge_deploy.tmux_driver import TmuxDriver
+
+        return TmuxDriver.from_node_and_profile(
+            node,
+            profile,
+            retries=retries,
+            pane_log_path=pane_log_path,
+        )
+    raise TransportUnavailable(f"unsupported transport {selected!r}")

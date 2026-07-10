@@ -108,6 +108,27 @@ def test_node_config_defaults_session_to_node_name() -> None:
     assert node.name == "node04"
 
 
+def test_node_config_defaults_to_ssh_transport() -> None:
+    node = OperatorConfig.from_mapping(
+        {"nodes": {"node03": {"host": "operator@edge"}}}
+    ).node("node03")
+    assert node.transport == "ssh"
+
+
+def test_node_config_accepts_explicit_pane_transport() -> None:
+    node = OperatorConfig.from_mapping(
+        {"nodes": {"node03": {"host": "operator@edge", "transport": "pane"}}}
+    ).node("node03")
+    assert node.transport == "pane"
+
+
+def test_node_config_rejects_unknown_transport() -> None:
+    with pytest.raises(ValueError, match="transport must be one of: pane, ssh"):
+        OperatorConfig.from_mapping(
+            {"nodes": {"node03": {"host": "operator@edge", "transport": "magic"}}}
+        )
+
+
 def test_operator_config_unknown_node_and_tool_raise_keyerror() -> None:
     operator = OperatorConfig.from_mapping({"nodes": {"node03": {"host": "h"}}, "tools": {"t": "/p"}})
 

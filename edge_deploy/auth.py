@@ -11,14 +11,27 @@ re-display ``Enter PASSCODE:``; the seam re-prompts for a *fresh* code on reject
 from __future__ import annotations
 
 import sys
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
 
-from edge_deploy.progress import ReleaseProgressTracker
 from edge_deploy.reporting import ReportCheck
 from edge_deploy.transport import AuthenticationError
 
 if TYPE_CHECKING:
     from edge_deploy.transport import RemoteTransport
+
+
+@runtime_checkable
+class AuthProgress(Protocol):
+    """The minimal progress surface :class:`AuthBroker` needs from a caller.
+
+    :class:`~edge_deploy.progress.ReleaseProgressTracker` satisfies this during a
+    Release; standalone CLI commands (``rollout``, ``drift``) supply a small
+    print-based adapter instead.
+    """
+
+    def emit(self, message: str, **kwargs: object) -> None: ...
+
+    def set_waiting(self, waiting_on: str | None) -> None: ...
 
 
 def _prompt_for_secret(prompt: str) -> str:
@@ -33,7 +46,7 @@ class AuthBroker:
 
     def __init__(
         self,
-        tracker: ReleaseProgressTracker,
+        tracker: AuthProgress,
         auth_mode: str,
         wait_seconds: float,
         max_attempts: int,
