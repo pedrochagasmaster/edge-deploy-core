@@ -19,6 +19,14 @@ from edge_deploy.config import DependencyBundleConfig, NodeConfig, OperatorConfi
 from edge_deploy.dependencies import create_dependency_bundle
 from edge_deploy.publish import PublishError, PublishResult
 from edge_deploy.release import ReleaseSelection, run_release
+from edge_deploy.transport import (
+    ConnectionLostError,
+    HostKeyError,
+    InteractiveChannelError,
+    RemoteCommandTimeout,
+    TransferError,
+    TransportUnavailable,
+)
 
 PROJECTS_ROOT = Path(__file__).resolve().parents[2]
 PREV = "0" * 40
@@ -696,3 +704,104 @@ def test_release_log_includes_local_check_output_tail_redacted(fake_tmux, tmp_pa
     assert "local_check passed with" in log_text
     assert secret not in log_text
     assert "token=***REDACTED***" in log_text
+
+
+# ---------------------------------------------------------------------------
+# Transport failures are converted to durable node failures (Task 9)
+# ---------------------------------------------------------------------------
+
+_ENDPOINT = "operator@private-edge.example"
+
+_TRANSPORT_ERRORS = [
+    TransportUnavailable(f"transport unavailable for {_ENDPOINT}"),
+    HostKeyError(f"host key mismatch for {_ENDPOINT}"),
+    ConnectionLostError(f"connection lost to {_ENDPOINT}"),
+    RemoteCommandTimeout(f"command timed out on {_ENDPOINT}"),
+    TransferError(f"transfer failed to {_ENDPOINT}"),
+    InteractiveChannelError(f"interactive channel failed on {_ENDPOINT}"),
+]
+
+
+@pytest.mark.parametrize("exc", _TRANSPORT_ERRORS, ids=lambda e: type(e).__name__)
+def test_release_auth_transport_failure_is_durable_node_failure(
+    fake_tmux, tmp_path, patched_drift, exc
+) -> None:
+    operator = _operator()
+    drivers: dict = {}
+
+    def configure(name, kw):
+        if name == "node03":
+            kw["raise_on_auth"] = exc
+
+    report = run_release(
+        operator,
+        ReleaseSelection(tools=["autobench"], nodes=["node03", "node04"]),
+        report_dir=tmp_path,
+        publish_fn=_publishing([]),
+        driver_factory=_make_factory(fake_tmux, drivers, configure=configure),
+        auth_mode="prompt",
+    )
+
+    assert report.exit_code() == 1
+    node03 = [r for r in report.rollouts if r["node"] == "node03"][0]
+    assert node03["status"] == "failed"
+    assert node03["node"] == "node03"
+    assert "Traceback" not in node03["state_left"]
+    payload_text = json.dumps(report.to_payload())
+    assert "Traceback" not in payload_text
+    assert _ENDPOINT not in payload_text
+
+
+@pytest.mark.parametrize("exc", _TRANSPORT_ERRORS, ids=lambda e: type(e).__name__)
+def test_release_rollout_transport_failure_is_durable_node_failure(
+    fake_tmux, tmp_path, patched_drift, exc
+) -> None:
+    operator = _operator()
+    drivers: dict = {}
+
+    def configure(name, kw):
+        if name == "node03":
+            kw["raise_on_run_remote"] = exc
+
+    report = run_release(
+        operator,
+        ReleaseSelection(tools=["autobench"], nodes=["node03", "node04"]),
+        report_dir=tmp_path,
+        publish_fn=_publishing([]),
+        driver_factory=_make_factory(fake_tmux, drivers, configure=configure),
+        auth_mode="prompt",
+    )
+
+    assert report.exit_code() == 1
+    node03 = [r for r in report.rollouts if r["node"] == "node03"][0]
+    assert node03["status"] == "failed"
+    assert node03["node"] == "node03"
+    assert "Traceback" not in node03["state_left"]
+    payload_text = json.dumps(report.to_payload())
+    assert "Traceback" not in payload_text
+    assert _ENDPOINT not in payload_text
+    # node04 must not be blocked by node03's transport failure (ADR-0003).
+    node04 = [r for r in report.rollouts if r["node"] == "node04"][0]
+    assert node04["status"] == "rolled_out"
+
+
+def test_release_transport_failure_always_stops_session(fake_tmux, tmp_path, patched_drift) -> None:
+    """``_safe_stop`` must run even when a transport error escapes mid-rollout."""
+    operator = _operator()
+    drivers: dict = {}
+
+    def configure(name, kw):
+        if name == "node03":
+            kw["raise_on_run_remote"] = ConnectionLostError(f"connection lost to {_ENDPOINT}")
+
+    report = run_release(
+        operator,
+        ReleaseSelection(tools=["autobench"], nodes=["node03"]),
+        report_dir=tmp_path,
+        publish_fn=_publishing([]),
+        driver_factory=_make_factory(fake_tmux, drivers, configure=configure),
+        auth_mode="prompt",
+    )
+
+    assert report.exit_code() == 1
+    assert drivers["node03"].stop_calls >= 1

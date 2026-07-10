@@ -12,6 +12,7 @@ from edge_deploy import auth, drift, release
 from edge_deploy.config import NodeConfig, OperatorConfig
 from edge_deploy.ledger import RunLedger
 from edge_deploy.phases.deploy import run_deploy
+from edge_deploy.transport import TransferError
 
 PREV = "0" * 40
 SNAP = "5" * 40
@@ -274,3 +275,46 @@ def test_deploy_happy_path_marks_all_nodes_passed(
     reloaded = RunLedger.load(ledger.run_dir)
     assert reloaded.phase_state("deploy", node="node03") == "passed"
     assert reloaded.phase_state("deploy", node="node04") == "passed"
+
+
+def test_deploy_transport_failure_marks_node_failed_not_pending(
+    tmp_path, fake_tmux, patched_deploy_env, monkeypatch
+) -> None:
+    """A ``TransferError`` mid-rollout must land as ``failed`` in the ledger, not ``pending``."""
+    repo_root = _write_tool_profile(tmp_path)
+    ledger = _create_run(repo_root, publish_passed=True)
+    _write_publish_report(ledger.run_dir)
+    operator = _operator(repo_root)
+    drivers: dict = {}
+
+    def configure_factory(node, profile, **kwargs):
+        kw = dict(
+            head_commits=[PREV, SNAP],
+            changed_paths=["benchmark.py"],
+            remote_runtime={"a.py": "1"},
+            auth_script=["accept"],
+        )
+        if node.name == "node03":
+            kw["raise_on_run_remote"] = TransferError("dependency bundle transfer failed")
+        driver = fake_tmux(**kw)
+        drivers[node.name] = driver
+        return driver
+
+    monkeypatch.setattr(
+        "edge_deploy.phases.deploy.run_release",
+        lambda op, selection, **kwargs: release.run_release(
+            op,
+            selection,
+            driver_factory=configure_factory,
+            heartbeat_interval_s=3600.0,
+            stall_threshold_s=7200.0,
+            **kwargs,
+        ),
+    )
+
+    code = run_deploy(_deploy_args(ledger.state["run_id"], nodes="node03"), operator)
+
+    assert code == 1
+    reloaded = RunLedger.load(ledger.run_dir)
+    assert reloaded.phase_state("deploy", node="node03") == "failed"
+    assert reloaded.phase_state("deploy", node="node03") != "pending"

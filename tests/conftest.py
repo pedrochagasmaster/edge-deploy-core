@@ -145,7 +145,12 @@ class FakeTmuxDriver:
         command_codes: dict[str, int] | None = None,
         fetch_script: list[tuple[int, str]] | None = None,
         runner_step_results: dict[str, dict] | None = None,
+        raise_on_auth: Exception | None = None,
+        raise_on_run_remote: Exception | None = None,
     ) -> None:
+        self._raise_on_auth = raise_on_auth
+        self._raise_on_run_remote = raise_on_run_remote
+        self.stop_calls = 0
         self.commands: list[str] = []
         self.call_log: list[dict[str, Any]] = []
         self._head_commits = list(head_commits) if head_commits else []
@@ -188,6 +193,7 @@ class FakeTmuxDriver:
         return self._auth_script[0] == "preauthed" if self._auth_script else False
 
     def stop_session(self) -> None:
+        self.stop_calls += 1
         return None
 
     def upload_file(
@@ -207,6 +213,8 @@ class FakeTmuxDriver:
         return hashlib.sha256(data).hexdigest()
 
     def run_remote(self, command: str, *, timeout: float = 30.0, ensure_shell: bool = True) -> tuple[str, int]:
+        if self._raise_on_run_remote is not None:
+            raise self._raise_on_run_remote
         self.commands.append(command)
         self.call_log.append({"command": command, "timeout": timeout, "ensure_shell": ensure_shell})
         return self._respond(command)
@@ -217,6 +225,8 @@ class FakeTmuxDriver:
 
     def await_authenticated(self, *, timeout: float | None = None, poll_interval: float = 1.0) -> None:
         self.await_timeouts.append(timeout)
+        if self._raise_on_auth is not None:
+            raise self._raise_on_auth
         outcome = self._auth_script.pop(0) if self._auth_script else "accept"
         if outcome == "reject":
             raise AuthenticationError("Edge Node re-prompted for a PASSCODE — the code was stale or wrong.")

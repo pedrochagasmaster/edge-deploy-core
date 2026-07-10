@@ -12,6 +12,7 @@ publish-failed tools, snapshot-unavailable resumes (Risk #1), and pairs left unt
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -314,6 +315,32 @@ def _log_successful_preflight_repair(
         return
 
 
+# Transport-layer errors (e.g. Paramiko auth/connection failures) may embed the raw
+# ``user@host`` SSH endpoint in their exception message; that infrastructure detail
+# never belongs in a durable, operator-facing report (Task 9).
+_ENDPOINT_RE = re.compile(r"\b[\w.\-]+@[\w.\-]+\b")
+
+
+def _redact_transport_message(exc: TransportError) -> str:
+    return _ENDPOINT_RE.sub("***REDACTED***", str(exc))
+
+
+def _transport_failure_report(
+    exc: TransportError,
+    node: object,
+    profile: Any,
+    snapshot: str,
+) -> OperationReport:
+    """Convert a raised :class:`TransportError` into a durable, redacted failed report."""
+    return _synthetic_report(
+        "failed",
+        node,
+        profile.repo_path,
+        deployment_commit=snapshot,
+        check=ReportCheck("transport", False, f"transport failed: {_redact_transport_message(exc)}"),
+    )
+
+
 def _safe_stop(driver: RemoteTransport) -> None:
     try:
         driver.stop_session()
@@ -530,102 +557,80 @@ def run_release(
                     broker.ensure_authenticated(driver, node_name)
             except (AuthenticationError, SessionGoneError, TransportError, TimeoutError) as exc:
                 # Never block other nodes (ADR-0003): record every still-open pair as failed.
-                for tool in tools:
-                    if (node_name, tool) in recorded:
-                        continue
-                    synthetic = _synthetic_report(
-                        "failed",
-                        node,
-                        profiles[tool].repo_path,
-                        deployment_commit=snapshots.get(tool, "not_applicable"),
-                        check=ReportCheck("auth", False, f"authentication failed: {exc}"),
-                    )
-                    path = write_report(report_dir / f"rollout-{tool}-{node_name}.json", synthetic)
-                    recorded[(node_name, tool)] = _compact_rollout(
-                        tool=tool,
-                        node=node_name,
-                        status="failed",
-                        state_left=f"auth: {exc}",
-                        deployment_commit=snapshots.get(tool),
-                        report_path=path,
-                    )
-                _safe_stop(driver)
+                exc_message = (
+                    _redact_transport_message(exc) if isinstance(exc, TransportError) else str(exc)
+                )
+                try:
+                    for tool in tools:
+                        if (node_name, tool) in recorded:
+                            continue
+                        synthetic = _synthetic_report(
+                            "failed",
+                            node,
+                            profiles[tool].repo_path,
+                            deployment_commit=snapshots.get(tool, "not_applicable"),
+                            check=ReportCheck("auth", False, f"authentication failed: {exc_message}"),
+                        )
+                        path = write_report(report_dir / f"rollout-{tool}-{node_name}.json", synthetic)
+                        recorded[(node_name, tool)] = _compact_rollout(
+                            tool=tool,
+                            node=node_name,
+                            status="failed",
+                            state_left=f"auth: {exc_message}",
+                            deployment_commit=snapshots.get(tool),
+                            report_path=path,
+                        )
+                finally:
+                    _safe_stop(driver)
                 if selection.fail_fast:
                     stop = True
                 continue
 
-            # Kerberos is paid once per node, and only when a selected tool has deep smoke.
-            kerb_check: ReportCheck | None = None
-            if selection.smoke == "deep" and any(profiles[tool].smoke.deep for tool in tools):
-                kerb_check = ensure_kerberos(driver, node_name)
+            try:
+                # Kerberos is paid once per node, and only when a selected tool has deep smoke.
+                kerb_check: ReportCheck | None = None
+                if selection.smoke == "deep" and any(profiles[tool].smoke.deep for tool in tools):
+                    kerb_check = ensure_kerberos(driver, node_name)
 
-            for tool in tools:
-                if (node_name, tool) in recorded or tool not in snapshots:
-                    continue
-                snapshot = snapshots[tool]
-                profile = profiles[tool]
+                for tool in tools:
+                    if (node_name, tool) in recorded or tool not in snapshots:
+                        continue
+                    snapshot = snapshots[tool]
+                    profile = profiles[tool]
 
-                def bundle_for_tool(
-                    current_tool: str = tool,
-                    current_profile: Any = profile,
-                ) -> DependencyBundle:
-                    if current_tool in dependency_bundles:
+                    def bundle_for_tool(
+                        current_tool: str = tool,
+                        current_profile: Any = profile,
+                    ) -> DependencyBundle:
+                        if current_tool in dependency_bundles:
+                            return dependency_bundles[current_tool]
+                        source_commit = source_commits.get(current_tool)
+                        if not source_commit:
+                            raise BundleError(
+                                "Dependency delivery requires reviewed-source provenance; "
+                                "resume from the original release report"
+                            )
+                        dependency_bundles[current_tool] = dependency_builder(
+                            current_profile,
+                            repo_root=Path(local_roots[current_tool]),
+                            source_sha=source_commit,
+                            output_root=report_dir / "bundles",
+                        )
                         return dependency_bundles[current_tool]
-                    source_commit = source_commits.get(current_tool)
-                    if not source_commit:
-                        raise BundleError(
-                            "Dependency delivery requires reviewed-source provenance; "
-                            "resume from the original release report"
-                        )
-                    dependency_bundles[current_tool] = dependency_builder(
-                        current_profile,
-                        repo_root=Path(local_roots[current_tool]),
-                        source_sha=source_commit,
-                        output_root=report_dir / "bundles",
-                    )
-                    return dependency_bundles[current_tool]
 
-                def on_transfer(
-                    progress_event: TransferProgress,
-                    current_tool: str = tool,
-                ) -> None:
-                    tracker.update_transfer(
-                        artifact=f"{current_tool} dependency bundle",
-                        progress=progress_event,
-                    )
+                    def on_transfer(
+                        progress_event: TransferProgress,
+                        current_tool: str = tool,
+                    ) -> None:
+                        tracker.update_transfer(
+                            artifact=f"{current_tool} dependency bundle",
+                            progress=progress_event,
+                        )
 
-                try:
-                    progress(f"rolling out {tool}/{node_name} -> {snapshot}")
-                    with tracker.tracked(
-                        f"rollout {tool}/{node_name}",
-                        phase="rollout",
-                        tool=tool,
-                        node=node_name,
-                        tmux_session=getattr(driver, "session", None),
-                    ):
-                        report = run_rollout(
-                            driver,
-                            profile,
-                            node,
-                            target_commit=snapshot,
-                            operator_email=operator.operator_email,
-                            remote=remote,
-                            dependency_bundle_factory=bundle_for_tool,
-                            run_id=report_dir.name,
-                            transfer_progress=on_transfer,
-                        )
-                    _log_successful_preflight_repair(
-                        tracker, tool=tool, node=node_name, report=report
-                    )
-                    if report.status == "failed" and _is_transient_preflight_failure(report):
-                        _log_preflight_evidence(
-                            tracker, tool=tool, node=node_name, report=report, retry=True
-                        )
-                        tracker.retry(
-                            f"transient remote git preflight for {tool}/{node_name}; retrying rollout once"
-                        )
+                    try:
+                        progress(f"rolling out {tool}/{node_name} -> {snapshot}")
                         with tracker.tracked(
-                            f"rollout retry {tool}/{node_name}",
+                            f"rollout {tool}/{node_name}",
                             phase="rollout",
                             tool=tool,
                             node=node_name,
@@ -645,66 +650,99 @@ def run_release(
                         _log_successful_preflight_repair(
                             tracker, tool=tool, node=node_name, report=report
                         )
-                except (RuntimeError, SessionGoneError, AuthenticationError, TransportError) as exc:
-                    report = _synthetic_report(
-                        "failed",
-                        node,
-                        profile.repo_path,
-                        deployment_commit=snapshot,
-                        check=ReportCheck("rollout_error", False, f"rollout raised: {exc}"),
-                    )
+                        if report.status == "failed" and _is_transient_preflight_failure(report):
+                            _log_preflight_evidence(
+                                tracker, tool=tool, node=node_name, report=report, retry=True
+                            )
+                            tracker.retry(
+                                f"transient remote git preflight for {tool}/{node_name}; retrying rollout once"
+                            )
+                            with tracker.tracked(
+                                f"rollout retry {tool}/{node_name}",
+                                phase="rollout",
+                                tool=tool,
+                                node=node_name,
+                                tmux_session=getattr(driver, "session", None),
+                            ):
+                                report = run_rollout(
+                                    driver,
+                                    profile,
+                                    node,
+                                    target_commit=snapshot,
+                                    operator_email=operator.operator_email,
+                                    remote=remote,
+                                    dependency_bundle_factory=bundle_for_tool,
+                                    run_id=report_dir.name,
+                                    transfer_progress=on_transfer,
+                                )
+                            _log_successful_preflight_repair(
+                                tracker, tool=tool, node=node_name, report=report
+                            )
+                    except TransportError as exc:
+                        # Centralized, redacted conversion: an unrecovered transport failure
+                        # becomes a durable "failed" node/tool pair, never a raw traceback.
+                        report = _transport_failure_report(exc, node, profile, snapshot)
+                    except (RuntimeError, SessionGoneError, AuthenticationError) as exc:
+                        report = _synthetic_report(
+                            "failed",
+                            node,
+                            profile.repo_path,
+                            deployment_commit=snapshot,
+                            check=ReportCheck("rollout_error", False, f"rollout raised: {exc}"),
+                        )
 
-                state_left = ""
-                if report.status == "rolled_out":
-                    with tracker.tracked(
-                        f"verify {tool}/{node_name}",
-                        phase="verify",
+                    state_left = ""
+                    if report.status == "rolled_out":
+                        with tracker.tracked(
+                            f"verify {tool}/{node_name}",
+                            phase="verify",
+                            tool=tool,
+                            node=node_name,
+                            tmux_session=getattr(driver, "session", None),
+                        ):
+                            report.checks.extend(
+                                verify_after_rollout(
+                                    driver,
+                                    profile,
+                                    node,
+                                    commit=snapshot,
+                                    local_root=local_roots[tool],
+                                    smoke_level=selection.smoke,
+                                )
+                            )
+                        if selection.smoke == "deep" and profile.smoke.deep and kerb_check is not None:
+                            report.checks.append(kerb_check)
+                        if not all(check.passed for check in report.checks):
+                            report.status = "failed"
+                            state_left = _verify_state_left(report)
+                    else:
+                        state_left = _preflight_state_left(report) if any(
+                            check.name == "remote_git_preflight" and not check.passed
+                            for check in report.checks
+                        ) else _engine_state_left(report)
+                        _log_preflight_evidence(tracker, tool=tool, node=node_name, report=report)
+
+                    path = write_report(report_dir / f"rollout-{tool}-{node_name}.json", report)
+                    progress(f"{tool}/{node_name}: {report.status}")
+                    recorded[(node_name, tool)] = _compact_rollout(
                         tool=tool,
                         node=node_name,
-                        tmux_session=getattr(driver, "session", None),
-                    ):
-                        report.checks.extend(
-                            verify_after_rollout(
-                                driver,
-                                profile,
-                                node,
-                                commit=snapshot,
-                                local_root=local_roots[tool],
-                                smoke_level=selection.smoke,
-                            )
-                        )
-                    if selection.smoke == "deep" and profile.smoke.deep and kerb_check is not None:
-                        report.checks.append(kerb_check)
-                    if not all(check.passed for check in report.checks):
-                        report.status = "failed"
-                        state_left = _verify_state_left(report)
-                else:
-                    state_left = _preflight_state_left(report) if any(
-                        check.name == "remote_git_preflight" and not check.passed
-                        for check in report.checks
-                    ) else _engine_state_left(report)
-                    _log_preflight_evidence(tracker, tool=tool, node=node_name, report=report)
+                        status=report.status,
+                        state_left=state_left,
+                        deployment_commit=report.deployment_commit,
+                        previous_remote_commit=report.previous_remote_commit,
+                        sensitive_changed=list(report.sensitive_changed),
+                        drift=_drift_result(report.checks),
+                        smoke=_smoke_result(report.checks),
+                        report_path=path,
+                        dependency=report.extra.get("dependency"),
+                    )
+                    if report.status != "rolled_out" and selection.fail_fast:
+                        stop = True
+                        break
 
-                path = write_report(report_dir / f"rollout-{tool}-{node_name}.json", report)
-                progress(f"{tool}/{node_name}: {report.status}")
-                recorded[(node_name, tool)] = _compact_rollout(
-                    tool=tool,
-                    node=node_name,
-                    status=report.status,
-                    state_left=state_left,
-                    deployment_commit=report.deployment_commit,
-                    previous_remote_commit=report.previous_remote_commit,
-                    sensitive_changed=list(report.sensitive_changed),
-                    drift=_drift_result(report.checks),
-                    smoke=_smoke_result(report.checks),
-                    report_path=path,
-                    dependency=report.extra.get("dependency"),
-                )
-                if report.status != "rolled_out" and selection.fail_fast:
-                    stop = True
-                    break
-
-            _safe_stop(driver)
+            finally:
+                _safe_stop(driver)
 
     # ---- assemble rollouts in pair order; any unreached pair was halted by --fail-fast ----
     rollouts: list[dict[str, Any]] = []
