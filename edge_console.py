@@ -88,7 +88,10 @@ def collect_runs(runs_root: Path) -> list[dict]:
         if not state or state.get("schema") != _SCHEMA:
             continue
         lock = _read_json(entry / "run.lock") if (entry / "run.lock").is_file() else None
-        runs.append({"state": state, "events": _tail_events(entry), "lock": lock})
+        progress = _read_json(entry / "release-progress.json")
+        runs.append(
+            {"state": state, "events": _tail_events(entry), "lock": lock, "progress": progress}
+        )
     # Open runs first, then newest first within each group.
     runs.sort(
         key=lambda r: (
@@ -548,6 +551,12 @@ header{border-bottom:1px solid var(--line);background:var(--panel)}
 @media (prefers-reduced-motion: reduce){.gate.hot{animation:none}}
 
 /* ---------- next command / details ---------- */
+.transfer{display:flex;gap:10px;align-items:center;padding:9px 16px;border-top:1px solid var(--line);flex-wrap:wrap;font-family:var(--mono);font-size:11px;color:var(--dim)}
+.transfer-artifact{flex:none}
+.transfer-bar{flex:1 1 160px;height:6px;background:var(--void);border:1px solid var(--line);border-radius:3px;overflow:hidden}
+.transfer-fill{height:100%;background:var(--edge)}
+.transfer-stats{flex:none;color:var(--faint)}
+
 .nextcmd{display:flex;gap:10px;align-items:center;padding:11px 16px;border-top:1px solid var(--line);flex-wrap:wrap}
 .nextcmd .label{font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--dim);font-weight:600;flex:none}
 .nextcmd code{font-family:var(--mono);font-size:12px;background:var(--void);border:1px solid var(--line);border-radius:5px;padding:6px 10px;flex:1 1 320px;overflow-x:auto;white-space:nowrap;scrollbar-width:thin}
@@ -751,6 +760,22 @@ function eventsHtml(run){
     <div class="events">${rows}</div></details>`;
 }
 
+function transferHtml(run){
+  const progress = run.progress;
+  if(!progress || !progress.active) return "";
+  const transfer = progress.active.transfer;
+  if(!transfer) return "";
+  const percent = Math.max(0, Math.min(100, transfer.percent));
+  const mibSent = (transfer.bytes_sent / (1024*1024)).toFixed(1);
+  const mibTotal = (transfer.total_bytes / (1024*1024)).toFixed(1);
+  const rate = (transfer.bytes_per_second / (1024*1024)).toFixed(2);
+  return `<div class="transfer">
+    <span class="transfer-artifact">${esc(transfer.artifact)}</span>
+    <div class="transfer-bar"><div class="transfer-fill" style="width:${percent}%"></div></div>
+    <span class="transfer-stats">${esc(mibSent)}/${esc(mibTotal)} MiB · ${esc(percent.toFixed(1))}% · ${esc(rate)} MiB/s</span>
+  </div>`;
+}
+
 function runHtml(run){
   const st = run.state;
   const next = nextPhase(run);
@@ -786,6 +811,7 @@ function runHtml(run){
       <span class="runmeta">source ${esc(st.source_sha.slice(0,7))} · ${esc(st.operator)} · engine ${esc(st.engine && st.engine.version || "?")} · ${esc(shortDate(st.created_at))}</span>
     </div>
     ${railHtml(run)}
+    ${transferHtml(run)}
     ${tail}
     ${eventsHtml(run)}
   </article>`;

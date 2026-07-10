@@ -30,7 +30,7 @@ from edge_deploy.reporting import OperationReport, ReportCheck, report_node_name
 from edge_deploy.runner import bootstrap_runner, read_remote_json, read_remote_text, run_step
 
 if TYPE_CHECKING:
-    from edge_deploy.transport import RemoteTransport
+    from edge_deploy.transport import RemoteTransport, TransferProgressCallback
 
 # The status values a single Rollout can report.
 ROLLOUT_STATUSES = ("rolled_out", "failed", "skipped", "refused")
@@ -523,6 +523,7 @@ def run_rollout(
     remote: str = "bitbucket",
     dependency_bundle: DependencyBundle | None = None,
     dependency_bundle_factory: Callable[[], DependencyBundle] | None = None,
+    transfer_progress: "TransferProgressCallback | None" = None,
 ) -> OperationReport:
     """Roll one Edge Node to ``target_commit`` and return an :class:`OperationReport`.
 
@@ -615,7 +616,11 @@ def run_rollout(
             )
         try:
             delivered = deliver_dependency_bundle(
-                driver, profile, dependency_bundle, run_id=run_id
+                driver,
+                profile,
+                dependency_bundle,
+                run_id=run_id,
+                transfer_progress=transfer_progress,
             )
         except BundleError as exc:
             check = ReportCheck("dependency_delivery", False, str(exc))
@@ -674,7 +679,11 @@ def run_rollout(
             try:
                 dependency_bundle = dependency_bundle or dependency_bundle_factory()
                 delivered = deliver_dependency_bundle(
-                    driver, profile, dependency_bundle, run_id=run_id
+                    driver,
+                    profile,
+                    dependency_bundle,
+                    run_id=run_id,
+                    transfer_progress=transfer_progress,
                 )
             except BundleError as exc:
                 return OperationReport(

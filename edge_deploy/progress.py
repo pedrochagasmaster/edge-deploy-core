@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from edge_deploy.reporting import redact, utc_iso_timestamp
+from edge_deploy.transport import TransferProgress
 
 PROGRESS_SCHEMA = "edge-deploy/release-progress/1"
 
@@ -49,6 +50,7 @@ class ReleaseProgressTracker:
         self._events: list[str] = []
         self._active: ActiveOperation | None = None
         self._stall_warned = False
+        self._lock = threading.RLock()
         self._log_path = self.report_dir / "release.log"
         self._progress_path = self.report_dir / "release-progress.json"
         self.report_dir.mkdir(parents=True, exist_ok=True)
@@ -69,10 +71,11 @@ class ReleaseProgressTracker:
             self._append_log(phase, redacted)
 
     def mark_activity(self) -> None:
-        if self._active is not None:
-            self._active.last_activity_at = self._clock()
-            self._active.last_meaningful_output_at = utc_iso_timestamp()
-            self._stall_warned = False
+        with self._lock:
+            if self._active is not None:
+                self._active.last_activity_at = self._clock()
+                self._active.last_meaningful_output_at = utc_iso_timestamp()
+                self._stall_warned = False
 
     def start(
         self,
@@ -84,33 +87,59 @@ class ReleaseProgressTracker:
         **meta: Any,
     ) -> None:
         now = self._clock()
-        self._active = ActiveOperation(
-            phase=phase,
-            label=label,
-            started_at=now,
-            last_activity_at=now,
-            last_meaningful_output_at=utc_iso_timestamp(),
-            tmux_session=tmux_session,
-            tool=meta.get("tool"),
-            node=meta.get("node"),
-            waiting_on=waiting_on,
-            extra=dict(meta),
-        )
-        self._stall_warned = False
+        with self._lock:
+            self._active = ActiveOperation(
+                phase=phase,
+                label=label,
+                started_at=now,
+                last_activity_at=now,
+                last_meaningful_output_at=utc_iso_timestamp(),
+                tmux_session=tmux_session,
+                tool=meta.get("tool"),
+                node=meta.get("node"),
+                waiting_on=waiting_on,
+                extra=dict(meta),
+            )
+            self._stall_warned = False
         self.emit(f"starting: {label}", phase=phase)
         self._write_progress_json()
 
     def set_waiting(self, waiting_on: str | None) -> None:
-        if self._active is None:
-            return
-        self._active.waiting_on = waiting_on
+        with self._lock:
+            if self._active is None:
+                return
+            self._active.waiting_on = waiting_on
         self._write_progress_json()
+
+    def update_transfer(self, *, artifact: str, progress: TransferProgress) -> None:
+        with self._lock:
+            if self._active is None:
+                return
+            self._active.extra["transfer"] = {
+                "artifact": artifact,
+                "bytes_sent": progress.bytes_sent,
+                "total_bytes": progress.total_bytes,
+                "percent": round(progress.percent, 1),
+                "bytes_per_second": round(progress.bytes_per_second, 1),
+                "updated_at": utc_iso_timestamp(),
+            }
+            self.mark_activity()
+            self._write_progress_json()
+            mib_sent = progress.bytes_sent / (1024 * 1024)
+            mib_total = progress.total_bytes / (1024 * 1024)
+            rate_mib_s = progress.bytes_per_second / (1024 * 1024)
+            message = (
+                f"{artifact}: {mib_sent:.1f}/{mib_total:.1f} MiB "
+                f"({progress.percent:.1f}%) at {rate_mib_s:.2f} MiB/s"
+            )
+            self._notify(redact(message))
 
     def complete(self, message: str, *, phase: str | None = None) -> None:
         active_phase = phase or (self._active.phase if self._active else "release")
         self.emit(f"completed: {message}", phase=active_phase)
-        self._active = None
-        self._stall_warned = False
+        with self._lock:
+            self._active = None
+            self._stall_warned = False
         self._write_progress_json()
 
     def log(self, phase: str, message: str) -> None:
@@ -191,32 +220,35 @@ class ReleaseProgressTracker:
             handle.write(line)
 
     def _write_progress_json(self) -> None:
-        payload: dict[str, Any] = {
-            "schema": PROGRESS_SCHEMA,
-            "updated_at": utc_iso_timestamp(),
-            "elapsed_s": round(self._elapsed_s(), 1),
-        }
-        if self._active is not None:
-            payload["active"] = {
-                "phase": self._active.phase,
-                "label": self._active.label,
-                "tool": self._active.tool,
-                "node": self._active.node,
-                "tmux_session": self._active.tmux_session,
-                "last_meaningful_output_at": self._active.last_meaningful_output_at,
-                "waiting_on": self._active.waiting_on,
+        with self._lock:
+            payload: dict[str, Any] = {
+                "schema": PROGRESS_SCHEMA,
+                "updated_at": utc_iso_timestamp(),
+                "elapsed_s": round(self._elapsed_s(), 1),
             }
-            payload["inactive_s"] = round(self._inactive_s(), 1)
-            if self._inactive_s() >= self.stall_threshold_s:
-                payload["stall_warning"] = True
-        else:
-            payload["active"] = None
-        text = json.dumps(payload, indent=2) + "\n"
-        self.report_dir.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.report_dir / f".{self._progress_path.name}.tmp"
-        tmp_path.write_text(text, encoding="utf-8")
-        try:
-            tmp_path.replace(self._progress_path)
-        except OSError:
-            self._progress_path.write_text(text, encoding="utf-8")
-            tmp_path.unlink(missing_ok=True)
+            if self._active is not None:
+                active_payload = {
+                    "phase": self._active.phase,
+                    "label": self._active.label,
+                    "tool": self._active.tool,
+                    "node": self._active.node,
+                    "tmux_session": self._active.tmux_session,
+                    "last_meaningful_output_at": self._active.last_meaningful_output_at,
+                    "waiting_on": self._active.waiting_on,
+                }
+                active_payload.update(self._active.extra)
+                payload["active"] = active_payload
+                payload["inactive_s"] = round(self._inactive_s(), 1)
+                if self._inactive_s() >= self.stall_threshold_s:
+                    payload["stall_warning"] = True
+            else:
+                payload["active"] = None
+            text = json.dumps(payload, indent=2) + "\n"
+            self.report_dir.mkdir(parents=True, exist_ok=True)
+            tmp_path = self.report_dir / f".{self._progress_path.name}.tmp"
+            tmp_path.write_text(text, encoding="utf-8")
+            try:
+                tmp_path.replace(self._progress_path)
+            except OSError:
+                self._progress_path.write_text(text, encoding="utf-8")
+                tmp_path.unlink(missing_ok=True)

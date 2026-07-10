@@ -33,7 +33,12 @@ from edge_deploy.reporting import (
 )
 from edge_deploy.rollout import run_rollout
 from edge_deploy.tmux_driver import AuthenticationError, SessionGoneError
-from edge_deploy.transport import RemoteTransport, TransportError, transport_for_node
+from edge_deploy.transport import (
+    RemoteTransport,
+    TransferProgress,
+    TransportError,
+    transport_for_node,
+)
 from edge_deploy.verify import verify_after_rollout
 
 
@@ -580,6 +585,15 @@ def run_release(
                     )
                     return dependency_bundles[current_tool]
 
+                def on_transfer(
+                    progress_event: TransferProgress,
+                    current_tool: str = tool,
+                ) -> None:
+                    tracker.update_transfer(
+                        artifact=f"{current_tool} dependency bundle",
+                        progress=progress_event,
+                    )
+
                 try:
                     progress(f"rolling out {tool}/{node_name} -> {snapshot}")
                     with tracker.tracked(
@@ -598,6 +612,7 @@ def run_release(
                             remote=remote,
                             dependency_bundle_factory=bundle_for_tool,
                             run_id=report_dir.name,
+                            transfer_progress=on_transfer,
                         )
                     _log_successful_preflight_repair(
                         tracker, tool=tool, node=node_name, report=report
@@ -625,6 +640,7 @@ def run_release(
                                 remote=remote,
                                 dependency_bundle_factory=bundle_for_tool,
                                 run_id=report_dir.name,
+                                transfer_progress=on_transfer,
                             )
                         _log_successful_preflight_repair(
                             tracker, tool=tool, node=node_name, report=report

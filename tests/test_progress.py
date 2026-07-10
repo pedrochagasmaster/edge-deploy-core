@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from edge_deploy.progress import PROGRESS_SCHEMA, ReleaseProgressTracker
+from edge_deploy.transport import TransferProgress
 
 
 class FakeClock:
@@ -121,6 +122,41 @@ def test_heartbeat_does_not_change_last_meaningful_output_timestamp(tmp_path) ->
         == before["active"]["last_meaningful_output_at"]
     )
     assert after["inactive_s"] == 2.0
+
+
+def test_transfer_progress_is_durable_and_marks_activity(tmp_path) -> None:
+    clock = FakeClock()
+    tracker = ReleaseProgressTracker(tmp_path, clock=clock, stall_threshold_s=3.0)
+    tracker.start("rollout autobench/node03", phase="rollout", tool="autobench", node="node03")
+    clock.advance(2.0)
+    tracker.update_transfer(
+        artifact="dependency bundle",
+        progress=TransferProgress(bytes_sent=25, total_bytes=100, elapsed_s=2.0),
+    )
+    payload = json.loads((tmp_path / "release-progress.json").read_text(encoding="utf-8"))
+    assert payload["active"]["transfer"]["percent"] == 25.0
+    assert payload["active"]["transfer"]["bytes_sent"] == 25
+    assert payload["inactive_s"] == 0.0
+    assert "stall_warning" not in payload
+
+
+def test_transfer_progress_completion_reports_full_percent_and_console_message(tmp_path) -> None:
+    clock = FakeClock()
+    messages: list[str] = []
+    tracker = ReleaseProgressTracker(tmp_path, clock=clock, notify_fn=messages.append)
+    tracker.start("rollout autobench/node03", phase="rollout", tool="autobench", node="node03")
+    clock.advance(5.0)
+    tracker.update_transfer(
+        artifact="dependency bundle",
+        progress=TransferProgress(bytes_sent=10_485_760, total_bytes=10_485_760, elapsed_s=5.0),
+    )
+    payload = json.loads((tmp_path / "release-progress.json").read_text(encoding="utf-8"))
+    assert payload["active"]["transfer"]["percent"] == 100.0
+    assert payload["active"]["transfer"]["bytes_sent"] == 10_485_760
+    console_message = messages[-1]
+    assert "MiB" in console_message
+    assert "%" in console_message
+    assert "MiB/s" in console_message
 
 
 def test_release_log_created_with_phase_transitions_and_redacts_secrets(tmp_path) -> None:

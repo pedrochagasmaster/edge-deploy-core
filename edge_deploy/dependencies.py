@@ -16,6 +16,7 @@ from typing import Callable, Mapping, Sequence
 from edge_deploy.config import DependencyBundleConfig, ToolProfile
 from edge_deploy.remote_paths import edge_deploy_path, shell_remote_path
 from edge_deploy.runner import bootstrap_runner, read_remote_json, run_step
+from edge_deploy.transport import TransferProgressCallback
 
 BUNDLE_SCHEMA = "edge-deploy/dependency-bundle/1"
 _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
@@ -349,6 +350,7 @@ def deliver_dependency_bundle(
     bundle: DependencyBundle,
     *,
     run_id: str,
+    transfer_progress: TransferProgressCallback | None = None,
 ) -> DeliveredBundle:
     """Transfer and verify one bundle through an authenticated transport."""
     config = profile.dependency_bundle
@@ -364,7 +366,9 @@ def deliver_dependency_bundle(
     )
     if code:
         raise BundleError(f"could not create remote bundle staging directory: {screen.strip()}")
-    _archive_digest = driver.upload_file(bundle.archive_path, remote_archive)  # type: ignore[attr-defined]
+    _archive_digest = driver.upload_file(  # type: ignore[attr-defined]
+        bundle.archive_path, remote_archive, progress=transfer_progress
+    )
     script = _stage_script(bundle, config, remote_archive=remote_archive, run_id=run_id)
     # newline="\n" prevents Windows CRLF translation; the script runs on Linux.
     with tempfile.NamedTemporaryFile(
