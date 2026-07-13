@@ -15,7 +15,7 @@ $ErrorActionPreference = 'Stop'
 
 $script:RunId = $null
 $script:SourceSha = $null
-$script:ExpectedEngineVersion = '1.5.0'
+$script:ExpectedEngineVersion = '1.5.1'
 $script:PublishedEngineTag = 'v1.4.0'
 
 function Assert-CommandPassed {
@@ -134,8 +134,8 @@ function Show-FailureGuidance {
     Write-Host ''
     Write-Host '==> Failure guidance (run preserved; do not abandon or delete)' -ForegroundColor Yellow
     Write-Host "Run id: $runId"
-    Write-Host "Inspect: python -m edge_deploy status --run $runId"
-    Write-Host "Resume:  python -m edge_deploy release --guided --run $runId"
+    Write-Host "Inspect: py -m edge_deploy status --run $runId"
+    Write-Host "Resume:  py -m edge_deploy release --guided --run $runId"
     Write-Host ''
 }
 
@@ -157,10 +157,10 @@ Open release run(s) exist. Do not start another release.
 $statusOutput
 
 Continue the existing run:
-  python -m edge_deploy release --guided --run <run-id>
+  py -m edge_deploy release --guided --run <run-id>
 
 Or abandon it with a truthful reason:
-  python -m edge_deploy abandon --run <run-id> --reason "<reason>"
+  py -m edge_deploy abandon --run <run-id> --reason "<reason>"
 "@
 }
 
@@ -638,7 +638,7 @@ try {
 
         $answer = Read-Host 'Ensure the posture shown above, then press Enter to resume (or type stop to abort)'
         if ($answer -eq 'stop') {
-            throw "Guided release aborted by operator; resume later with: python -m edge_deploy release --guided --run $script:RunId"
+            throw "Guided release aborted by operator; resume later with: py -m edge_deploy release --guided --run $script:RunId"
         }
     }
 

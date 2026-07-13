@@ -1,4 +1,4 @@
-"""Thin CLI surface: ``python -m edge_deploy {release|publish|rollout|drift|preflight}``.
+"""Thin CLI surface: ``py -m edge_deploy {release|publish|rollout|drift|preflight}``.
 
 Resolves ``--tool`` / ``--node`` against the two config layers (OperatorConfig + the
 tool's ToolProfile), establishes an Authenticated Pane, and calls the engine. The umbrella
@@ -66,7 +66,7 @@ _sleep = time.sleep
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="python -m edge_deploy",
+        prog="py -m edge_deploy",
         description="Publish and deploy an exact reviewed Tool commit, then verify it.",
     )
     parser.add_argument(
@@ -246,8 +246,8 @@ def _print_open_run_refusal(run: dict) -> None:
         f"(source {sha7}, created {created_at}) exists."
     )
     print("Choose one:")
-    print(f"  1. continue it:   python -m edge_deploy release --run {run_id}")
-    print(f'  2. abandon it:    python -m edge_deploy abandon --run {run_id} --reason "<why>"')
+    print(f"  1. continue it:   py -m edge_deploy release --run {run_id}")
+    print(f'  2. abandon it:    py -m edge_deploy abandon --run {run_id} --reason "<why>"')
 
 
 def _phase_already_passed(ledger: RunLedger, phase: str, requested_nodes: list[str]) -> bool:
@@ -265,7 +265,7 @@ def _posture_display_keys(phase: str) -> str:
 
 def _resume_release_command(run_id: str, *, guided: bool) -> str:
     guided_flag = " --guided" if guided else ""
-    return f"python -m edge_deploy release{guided_flag} --run {run_id}"
+    return f"py -m edge_deploy release{guided_flag} --run {run_id}"
 
 
 def _posture_probe_failures(
@@ -367,7 +367,7 @@ def _run_verify_phase(
     connect: SocketConnector | None = None,
 ) -> int:
     run_id = ledger.state["run_id"]
-    next_command = f"python -m edge_deploy verify --run {run_id}"
+    next_command = f"py -m edge_deploy verify --run {run_id}"
     connector = connect or socket.create_connection
     stack = enter_phase(
         VERIFY_SPEC,

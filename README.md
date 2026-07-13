@@ -38,8 +38,8 @@ From the clean GitHub `main` checkout of the tool being released:
 ```powershell
 python -m pip install -e ".[dev,release]"
 python -m pytest
-python -m edge_deploy status
-python -m edge_deploy release --tool autobench
+py -m edge_deploy status
+py -m edge_deploy release --tool autobench
 ```
 
 Each release creates a durable **run** under `edge-deploy/runs/`. Phases are
@@ -48,7 +48,7 @@ short, idempotent commands (`verify`, `publish-phase`, `deploy`, `tag-github`,
 see per-phase state and the exact next command.
 
 ```powershell
-python -m edge_deploy rollback --tag release-<UTC>-<short-sha>
+py -m edge_deploy rollback --tag release-<UTC>-<short-sha>
 ```
 
 Successful tool releases receive an immutable `release-<UTC>-<short-sha>` tag on

@@ -1,4 +1,4 @@
-"""``python -m edge_deploy`` entry point."""
+"""``py -m edge_deploy`` entry point."""
 
 from __future__ import annotations
 

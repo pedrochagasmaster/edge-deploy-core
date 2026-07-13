@@ -57,7 +57,7 @@ def test_format_run_status_golden_block(tmp_path: Path) -> None:
             "  deploy:        node03=passed node04=failed",
             "  tag_bitbucket: pending",
             "  tag_github:    pending",
-            f"next: python -m edge_deploy deploy --run {run_id} --nodes node04   [posture: both-vpns]",
+            f"next: py -m edge_deploy deploy --run {run_id} --nodes node04   [posture: both-vpns]",
         ]
     )
     assert format_run_status(ledger) == expected
@@ -189,6 +189,6 @@ def test_next_skips_skipped_verify_on_rollback_run(tmp_path: Path) -> None:
     output = format_run_status(ledger)
 
     assert (
-        f"next: python -m edge_deploy deploy --run {run_id} --nodes node03,node04"
+        f"next: py -m edge_deploy deploy --run {run_id} --nodes node03,node04"
         f"   [posture: both-vpns]"
     ) in output

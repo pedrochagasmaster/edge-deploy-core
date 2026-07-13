@@ -28,7 +28,7 @@ def _load_run(args: argparse.Namespace, operator: OperatorConfig) -> tuple[RunLe
 
 
 def _deploy_next_command(run_id: str, nodes: str | None) -> str:
-    command = f"python -m edge_deploy deploy --run {run_id}"
+    command = f"py -m edge_deploy deploy --run {run_id}"
     if nodes:
         command += f" --nodes {nodes}"
     return command

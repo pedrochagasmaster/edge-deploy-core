@@ -133,7 +133,7 @@ def _cmd_tag_github(args: argparse.Namespace, operator: OperatorConfig) -> int:
     ledger, repo_root = _load_ledger(args, operator)
     run_id = ledger.state["run_id"]
     source_sha = ledger.state["source_sha"]
-    next_command = f"python -m edge_deploy tag-github --run {run_id}"
+    next_command = f"py -m edge_deploy tag-github --run {run_id}"
 
     with enter_phase(
         TAG_GITHUB_SPEC,
@@ -180,7 +180,7 @@ def _cmd_tag_bitbucket(args: argparse.Namespace, operator: OperatorConfig) -> in
     profile = load_tool_profile(repo_root)
     run_id = ledger.state["run_id"]
     source_sha = ledger.state["source_sha"]
-    next_command = f"python -m edge_deploy tag-bitbucket --run {run_id}"
+    next_command = f"py -m edge_deploy tag-bitbucket --run {run_id}"
 
     with enter_phase(
         TAG_BITBUCKET_SPEC,

@@ -257,7 +257,7 @@ def test_release_report_handoffs_enumerate_followups() -> None:
 
     assert "publish" in by_kind
     assert by_kind["publish"]["tool"] == "robocop"
-    assert by_kind["publish"]["action"].endswith("python -m edge_deploy release")
+    assert by_kind["publish"]["action"].endswith("py -m edge_deploy release")
     assert "mid_state" in by_kind
     assert by_kind["mid_state"]["node"] == "node04"
     action = by_kind["mid_state"]["action"].replace("\\", "/")

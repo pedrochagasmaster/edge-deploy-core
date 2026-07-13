@@ -106,7 +106,7 @@ def _cmd_verify(args: argparse.Namespace, operator: OperatorConfig) -> int:
     ledger, repo_root = load_run(args, operator)
     repo_root = run_repo_root(ledger, operator, repo_root)
     profile = load_tool_profile(repo_root)
-    next_command = f"python -m edge_deploy verify --run {args.run}"
+    next_command = f"py -m edge_deploy verify --run {args.run}"
     stack = enter_phase(
         VERIFY_SPEC,
         operator,

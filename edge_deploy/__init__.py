@@ -36,7 +36,7 @@ from edge_deploy.tmux_driver import AuthenticationError, SessionGoneError, TmuxD
 from edge_deploy.transport import RemoteTransport, TransferProgress, TransportError
 from edge_deploy.verify import run_smoke, verify_after_rollout
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 
 __all__ = [
     "DEFAULT_OPERATOR_CONFIG_PATH",

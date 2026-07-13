@@ -150,14 +150,14 @@ def test_require_posture_all_reachable_does_not_raise() -> None:
     require_posture(
         "verify",
         None,
-        next_command="python -m edge_deploy verify --run run-1",
+        next_command="py -m edge_deploy verify --run run-1",
         connect=fake_connect,
     )
 
 
 def test_require_posture_unreachable_edge_node_matches_d7_message() -> None:
     operator = _operator_with_two_nodes()
-    next_command = "python -m edge_deploy deploy --run run-1 --nodes node04"
+    next_command = "py -m edge_deploy deploy --run run-1 --nodes node04"
 
     def fake_connect(address: tuple[str, int], timeout: float) -> object:
         if address == ("hde2stl020004.mastercard.int", 2222):
@@ -267,7 +267,7 @@ def test_require_posture_raises_on_git_probe_failure(tmp_path) -> None:
         require_posture(
             "tag_github",
             None,
-            next_command="python -m edge_deploy tag-github --run run-1",
+            next_command="py -m edge_deploy tag-github --run run-1",
             connect=fake_connect,
             repo_root=tmp_path,
             git_runner=lambda command, repo_root: 128,

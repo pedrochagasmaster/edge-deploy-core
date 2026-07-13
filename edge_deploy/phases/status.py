@@ -57,9 +57,9 @@ def _format_deploy_line(ledger: RunLedger) -> str:
 def _next_command_for_phase(ledger: RunLedger, phase: str) -> str:
     run_id = ledger.state["run_id"]
     if phase == "verify":
-        return f"python -m edge_deploy verify --run {run_id}"
+        return f"py -m edge_deploy verify --run {run_id}"
     if phase == "publish":
-        return f"python -m edge_deploy publish-phase --run {run_id}"
+        return f"py -m edge_deploy publish-phase --run {run_id}"
     if phase == "deploy":
         pending = [
             node
@@ -67,11 +67,11 @@ def _next_command_for_phase(ledger: RunLedger, phase: str) -> str:
             if info["state"] != "passed"
         ]
         nodes = ",".join(pending)
-        return f"python -m edge_deploy deploy --run {run_id} --nodes {nodes}"
+        return f"py -m edge_deploy deploy --run {run_id} --nodes {nodes}"
     if phase == "tag_github":
-        return f"python -m edge_deploy tag-github --run {run_id}"
+        return f"py -m edge_deploy tag-github --run {run_id}"
     if phase == "tag_bitbucket":
-        return f"python -m edge_deploy tag-bitbucket --run {run_id}"
+        return f"py -m edge_deploy tag-bitbucket --run {run_id}"
     raise KeyError(phase)
 
 

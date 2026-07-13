@@ -47,7 +47,7 @@ def run_publish_phase(
     publish_fn: PublishFn | None = None,
 ) -> int:
     run_id = ledger.state["run_id"]
-    next_command = f"python -m edge_deploy publish-phase --run {run_id}"
+    next_command = f"py -m edge_deploy publish-phase --run {run_id}"
     resolve_remote_head = remote_head_fn or _default_remote_branch_head
     do_publish = publish_fn or publish_snapshot
 

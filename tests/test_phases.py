@@ -65,7 +65,7 @@ def test_enter_phase_lock_failure_before_engine_and_posture(
     monkeypatch.setattr("edge_deploy.phases.require_posture", fail_posture)
 
     with pytest.raises(RunLockError):
-        enter_phase(_verify_spec(), None, ledger, next_command="python -m edge_deploy verify --run x")
+        enter_phase(_verify_spec(), None, ledger, next_command="py -m edge_deploy verify --run x")
 
 
 def test_enter_phase_engine_mismatch_before_posture(
@@ -85,7 +85,7 @@ def test_enter_phase_engine_mismatch_before_posture(
     monkeypatch.setattr("edge_deploy.phases.require_posture", track_posture)
 
     with pytest.raises(EngineMismatchError):
-        enter_phase(_verify_spec(), None, ledger, next_command="python -m edge_deploy verify --run x")
+        enter_phase(_verify_spec(), None, ledger, next_command="py -m edge_deploy verify --run x")
 
     assert not posture_called
     assert not (ledger.run_dir / "run.lock").is_file()
@@ -113,7 +113,7 @@ def test_enter_phase_engine_mismatch_exact_message(
     )
 
     with pytest.raises(EngineMismatchError, match=re.escape(expected)):
-        enter_phase(_verify_spec(), None, ledger, next_command="python -m edge_deploy verify --run x")
+        enter_phase(_verify_spec(), None, ledger, next_command="py -m edge_deploy verify --run x")
 
 
 def test_enter_phase_posture_failure_before_phase_entered_event(
@@ -134,7 +134,7 @@ def test_enter_phase_posture_failure_before_phase_entered_event(
             _verify_spec(),
             None,
             ledger,
-            next_command="python -m edge_deploy verify --run x",
+            next_command="py -m edge_deploy verify --run x",
             connect=unreachable_connect,
         )
 
@@ -159,7 +159,7 @@ def test_enter_phase_success_records_event_and_exit_stack_releases_lock(
         _verify_spec(),
         None,
         ledger,
-        next_command="python -m edge_deploy verify --run x",
+        next_command="py -m edge_deploy verify --run x",
         connect=reachable_connect,
     )
     assert (ledger.run_dir / "run.lock").is_file()
@@ -185,7 +185,7 @@ def test_enter_phase_refuses_non_open_run(
     )
 
     with pytest.raises(LedgerError, match=f"phase 'verify' refused: run {run_id} is complete"):
-        enter_phase(_verify_spec(), None, ledger, next_command="python -m edge_deploy verify --run x")
+        enter_phase(_verify_spec(), None, ledger, next_command="py -m edge_deploy verify --run x")
 
 
 def test_registry_driven_subcommand_appears_in_help() -> None:

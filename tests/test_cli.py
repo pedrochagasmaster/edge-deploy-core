@@ -1,7 +1,7 @@
 """Thin CLI surface: argparse wiring, config resolution, and command dispatch.
 
 Network and tmux are faked, so ``rollout`` / ``drift`` / ``preflight`` run end to end with
-no nodes. A subprocess smoke test exercises the real ``python -m edge_deploy`` entry point.
+no nodes. A subprocess smoke test exercises the real ``py -m edge_deploy`` entry point.
 """
 
 from __future__ import annotations
@@ -676,7 +676,7 @@ def test_release_posture_failure_mid_chain_exits_zero(tmp_path, monkeypatch, cap
     out = capsys.readouterr().out
     expected = (
         f"phase 'publish' requires posture [bitbucket-vpn or both-vpns]; unreachable: scm.mastercard.int:443.\n"
-        f"Switch the firewall posture, then re-run: python -m edge_deploy release --run {run_id}\n"
+        f"Switch the firewall posture, then re-run: py -m edge_deploy release --run {run_id}\n"
     )
     assert out == expected
     reloaded = RunLedger.load(ledger.run_dir)
@@ -914,7 +914,7 @@ def test_release_guided_interrupted_leaves_run_open(tmp_path, monkeypatch, capsy
 
     assert rc == 1
     out = capsys.readouterr().out
-    assert f"Paused at posture boundary. Resume with: python -m edge_deploy release --guided --run {run_id}" in out
+    assert f"Paused at posture boundary. Resume with: py -m edge_deploy release --guided --run {run_id}" in out
     reloaded = RunLedger.load(ledger.run_dir)
     assert reloaded.state["status"] == "open"
     assert reloaded.phase_state("publish") == "pending"
@@ -1148,8 +1148,8 @@ def test_release_refuses_when_open_run_exists(tmp_path, monkeypatch, capsys) -> 
         f"release refused: unresolved run {run['run_id']} for {run['tool']} "
         f"(source {run['source_sha'][:7]}, created {run['created_at']}) exists.\n"
         "Choose one:\n"
-        f"  1. continue it:   python -m edge_deploy release --run {run['run_id']}\n"
-        f'  2. abandon it:    python -m edge_deploy abandon --run {run["run_id"]} --reason "<why>"\n'
+        f"  1. continue it:   py -m edge_deploy release --run {run['run_id']}\n"
+        f'  2. abandon it:    py -m edge_deploy abandon --run {run["run_id"]} --reason "<why>"\n'
     )
     assert out == expected
 
@@ -1423,7 +1423,7 @@ def test_resolve_release_tag_rejects_tree_divergence(tmp_path, monkeypatch) -> N
 
 
 # ---------------------------------------------------------------------------
-# python -m edge_deploy entry point
+# py -m edge_deploy entry point
 # ---------------------------------------------------------------------------
 
 

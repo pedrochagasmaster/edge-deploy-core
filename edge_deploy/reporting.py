@@ -137,9 +137,9 @@ def _resume_action(rollout: dict[str, Any]) -> str:
     report_path = rollout.get("report_path")
     if report_path:
         run_id = Path(report_path).parent.name
-        command = f"python -m edge_deploy deploy --run {run_id} --nodes {node}"
+        command = f"py -m edge_deploy deploy --run {run_id} --nodes {node}"
     else:
-        command = "python -m edge_deploy status"
+        command = "py -m edge_deploy status"
     return f"investigate {node}; re-run: {command}"
 
 
@@ -186,7 +186,7 @@ class ReleaseReport:
                     "tool": tool,
                     "node": None,
                     "message": publish.get("error", "publish failed"),
-                    "action": "fix the publish gate, then re-run: python -m edge_deploy release",
+                    "action": "fix the publish gate, then re-run: py -m edge_deploy release",
                 })
         for rollout in self.rollouts:
             status = rollout.get("status")

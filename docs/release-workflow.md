@@ -24,8 +24,8 @@ exact next command.
    `ssh_options`, known-hosts entry, or credentials, verify its transport:
 
    ```powershell
-   python -m edge_deploy preflight --node node03
-   python -m edge_deploy transport-smoke --node node03
+   py -m edge_deploy preflight --node node03
+   py -m edge_deploy transport-smoke --node node03
    ```
 
    `transport-smoke` authenticates once and exercises command execution,
@@ -57,7 +57,7 @@ workflow. Release-owned remote state lives under the canonical
 node's real home directory.
 
 ```powershell
-python -m edge_deploy release --guided --tool autobench
+py -m edge_deploy release --guided --tool autobench
 ```
 
 ## Release flow (run ledger)
@@ -72,14 +72,14 @@ Starting a new release when an unresolved run already exists is refused:
 ```text
 release refused: unresolved run <run_id> for <tool> (source <sha7>, created <created_at>) exists.
 Choose one:
-  1. continue it:   python -m edge_deploy release --run <run_id>
-  2. abandon it:    python -m edge_deploy abandon --run <run_id> --reason "<why>"
+  1. continue it:   py -m edge_deploy release --run <run_id>
+  2. abandon it:    py -m edge_deploy abandon --run <run_id> --reason "<why>"
 ```
 
 To start fresh (no open run):
 
 ```powershell
-python -m edge_deploy release --tool autobench
+py -m edge_deploy release --tool autobench
 ```
 
 This creates `edge-deploy/runs/run-<UTC>-<sha7>/` with `state.json`,
@@ -88,7 +88,7 @@ This creates `edge-deploy/runs/run-<UTC>-<sha7>/` with `state.json`,
 To continue an existing run:
 
 ```powershell
-python -m edge_deploy release --run <run_id>
+py -m edge_deploy release --run <run_id>
 ```
 
 If another process holds the lock, the engine exits with exactly:
@@ -100,7 +100,7 @@ run <run_id> is locked by PID <pid> on <hostname> (acquired <acquired_at>); if t
 ### 2. Inspect state
 
 ```powershell
-python -m edge_deploy status
+py -m edge_deploy status
 ```
 
 With no open runs:
@@ -119,7 +119,7 @@ run run-20260703T120000Z-aa6d9a5  tool=autobench  kind=release  source=aa6d9a5  
   deploy:        node03=passed node04=failed
   tag_bitbucket: pending
   tag_github:    pending
-next: python -m edge_deploy deploy --run run-20260703T120000Z-aa6d9a5 --nodes node04   [posture: both-vpns]
+next: py -m edge_deploy deploy --run run-20260703T120000Z-aa6d9a5 --nodes node04   [posture: both-vpns]
 ```
 
 ### 3. Run phases (posture-scoped)
@@ -150,11 +150,11 @@ connects in every posture. Edge SSH endpoints are still TCP-probed.
 
 | Phase | Command | Posture |
 |-------|---------|---------|
-| Verify | `python -m edge_deploy verify --run <run_id>` | any (GitHub read) |
-| Publish | `python -m edge_deploy publish-phase --run <run_id>` | bitbucket-vpn or both-vpns |
-| Deploy | `python -m edge_deploy deploy --run <run_id> [--nodes …]` | both-vpns |
-| Tag Bitbucket | `python -m edge_deploy tag-bitbucket --run <run_id>` | bitbucket-vpn or both-vpns |
-| Tag GitHub | `python -m edge_deploy tag-github --run <run_id>` | firewall-off |
+| Verify | `py -m edge_deploy verify --run <run_id>` | any (GitHub read) |
+| Publish | `py -m edge_deploy publish-phase --run <run_id>` | bitbucket-vpn or both-vpns |
+| Deploy | `py -m edge_deploy deploy --run <run_id> [--nodes …]` | both-vpns |
+| Tag Bitbucket | `py -m edge_deploy tag-bitbucket --run <run_id>` | bitbucket-vpn or both-vpns |
+| Tag GitHub | `py -m edge_deploy tag-github --run <run_id>` | firewall-off |
 
 Tag Bitbucket runs before Tag GitHub (ADR-0012/0013), and Verify runs in any
 posture, so a release started in both-vpns needs exactly one posture switch:
@@ -170,7 +170,7 @@ firewall.
 To walk through all posture switches in one invocation, use `--guided`:
 
 ```powershell
-python -m edge_deploy release --guided --tool autobench
+py -m edge_deploy release --guided --tool autobench
 ```
 
 At each posture boundary the engine prints the satisfying posture names and any
@@ -189,7 +189,7 @@ before giving up (ADR-0012). Press Ctrl+C (or EOF) to pause: the run stays
 `open` and the engine prints the resume command, for example:
 
 ```text
-Paused at posture boundary. Resume with: python -m edge_deploy release --guided --run <run_id>
+Paused at posture boundary. Resume with: py -m edge_deploy release --guided --run <run_id>
 ```
 
 Resume works across postures: when `verify` is already `passed` or `skipped`,
@@ -197,7 +197,7 @@ Resume works across postures: when `verify` is already `passed` or `skipped`,
 bitbucket-vpn or both-vpns without repeating verify.
 
 On completion, guided mode prints `release complete: <run_id>` followed by the
-same status summary as `python -m edge_deploy status --run <run_id>`.
+same status summary as `py -m edge_deploy status --run <run_id>`.
 
 During deploy, enter the RSA passcode at the interactive prompt when asked (the
 keyboard-interactive SSH prompt for `transport: ssh` nodes, or the controller
@@ -216,7 +216,7 @@ Then mirror the core package tag if releasing `edge-deploy-core` itself:
 
 ```powershell
 git push origin main "refs/tags/vX.Y.Z"
-python -m edge_deploy mirror --tag vX.Y.Z
+py -m edge_deploy mirror --tag vX.Y.Z
 ```
 
 Mirror pushes the exact commit when Bitbucket accepts it; when Bitbucket's
@@ -230,7 +230,7 @@ in each tool through a normal GitHub pull request.
 ## Rollback
 
 ```powershell
-python -m edge_deploy rollback --tag release-<UTC>-<short-sha>
+py -m edge_deploy rollback --tag release-<UTC>-<short-sha>
 ```
 
 Rollback creates a run with `kind=rollback` seeded from the tag's provenance,
@@ -241,7 +241,7 @@ then follows the same phase chain.
 Close a run that will not be finished (recorded in the ledger and audit):
 
 ```powershell
-python -m edge_deploy abandon --run <run_id> --reason "why this run stops"
+py -m edge_deploy abandon --run <run_id> --reason "why this run stops"
 ```
 
 ## Artifacts
