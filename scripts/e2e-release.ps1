@@ -15,6 +15,8 @@ $ErrorActionPreference = 'Stop'
 
 $script:RunId = $null
 $script:SourceSha = $null
+$script:ExpectedEngineVersion = '1.5.0'
+$script:PublishedEngineTag = 'v1.4.0'
 
 function Assert-CommandPassed {
     param([Parameter(Mandatory)][string]$Description)
@@ -166,12 +168,12 @@ function Assert-EngineVersion {
     $engineVersion = (& py -c 'import edge_deploy; print(edge_deploy.__version__)').Trim()
     Assert-CommandPassed 'Inspect loaded edge-deploy-core version'
 
-    if ($engineVersion -ne '1.4.0') {
+    if ($engineVersion -ne $script:ExpectedEngineVersion) {
         throw @"
-Expected edge-deploy-core version 1.4.0; loaded $engineVersion.
+Expected edge-deploy-core version $($script:ExpectedEngineVersion); loaded $engineVersion.
 
-Install the tagged release engine (not editable):
-  py -m pip install "git+https://github.com/pedrochagasmaster/edge-deploy-core.git@v1.4.0"
+Install the current release candidate from this checkout:
+  py -m pip install -e "$((Resolve-Path (Join-Path $PSScriptRoot '..')).Path)"
 "@
     }
 }
@@ -343,7 +345,7 @@ function Update-ReleaseEnginePin {
     # Replace whatever engine version is currently pinned; no-op when the pin
     # already matches, so a pre-bumped checkout does not break the deps flow.
     $pinPattern = 'edge-deploy-core @ git\+https://github\.com/pedrochagasmaster/edge-deploy-core\.git@v\d+\.\d+\.\d+'
-    $pinNew = 'edge-deploy-core @ git+https://github.com/pedrochagasmaster/edge-deploy-core.git@v1.4.0'
+    $pinNew = "edge-deploy-core @ git+https://github.com/pedrochagasmaster/edge-deploy-core.git@$($script:PublishedEngineTag)"
     $pyprojectPath = Join-Path $ToolPath 'pyproject.toml'
     $content = Get-Content $pyprojectPath -Raw
 
@@ -372,10 +374,10 @@ Cosmetic Python comment only. No runtime or dependency behavior changes.
 ## Validation
 - powershell -NoProfile -File tools/dev/local_check.ps1
 - Effective non-comment requirements compared before and after
-- Pins edge-deploy-core release extra to v1.4.0
+- Pins edge-deploy-core release extra to $($script:PublishedEngineTag)
 
 ## Release risk
-Comment-only requirements.txt change plus release-engine pin bump to v1.4.0.
+Comment-only requirements.txt change plus release-engine pin bump to $($script:PublishedEngineTag).
 Dependency resolution is intentionally unchanged, but the dependency delivery
 path will run.
 "@

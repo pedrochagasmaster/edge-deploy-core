@@ -70,11 +70,27 @@ def run_update_sh(tmp_path_factory):
         work.mkdir()
         shutil.copyfile(script_src, work / "update.sh")
 
+        if tool == "autobench":
+            helper_src = PROJECTS_ROOT / tool / "scripts" / "provision_telemetry_dirs.sh"
+            helper_dir = work / "scripts"
+            helper_dir.mkdir()
+            shutil.copyfile(helper_src, helper_dir / helper_src.name)
+
         env = dict(os.environ)
         env["PATH"] = str(shim) + os.pathsep + env["PATH"]
         for name in RESOLUTION_VARS:
             env.pop(name, None)
         env.update(env_extra or {})
+
+        if tool == "autobench":
+            posix_work = subprocess.run(
+                [SH, "-c", "pwd"],
+                cwd=str(work),
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            env["AUTOBENCH_TELEMETRY_DIR"] = f"{posix_work}/telemetry"
 
         result = subprocess.run(
             [SH, "update.sh", *args],
