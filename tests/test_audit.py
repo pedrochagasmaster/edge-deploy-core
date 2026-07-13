@@ -46,6 +46,29 @@ def test_copy_redacted_masks_secrets(tmp_path):
     assert "12345678" not in text
 
 
+def test_copy_redacted_excludes_dependency_bundles(tmp_path):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    bundle = (
+        source
+        / "bundles"
+        / "autobench"
+        / ("a" * 40)
+        / "wheels"
+        / "pyyaml-6.0.3-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl"
+    )
+    bundle.parent.mkdir(parents=True)
+    bundle.write_bytes(b"\x00\xce\xffbinary-wheel")
+    (source / "release.json").write_text(
+        '{"summary":{"overall":"passed"}}', encoding="utf-8"
+    )
+
+    _copy_redacted(source, target)
+
+    assert (target / "release.json").is_file()
+    assert not (target / "bundles").exists()
+
+
 def test_copy_redacted_refuses_existing_attempt(tmp_path):
     source = tmp_path / "source"
     target = tmp_path / "target"

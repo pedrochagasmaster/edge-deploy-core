@@ -66,6 +66,8 @@ def _copy_redacted(source: Path, destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=False)
     for path in source.rglob("*"):
         relative = path.relative_to(source)
+        if relative.parts and relative.parts[0] == "bundles":
+            continue
         target = destination / relative
         if path.is_dir():
             target.mkdir(parents=True, exist_ok=True)
