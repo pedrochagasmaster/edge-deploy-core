@@ -12,6 +12,7 @@ from edge_deploy.config import OperatorConfig, load_tool_profile
 from edge_deploy.ledger import RunLedger
 from edge_deploy.phases import PhaseSpec, enter_phase, load_run, run_repo_root
 from edge_deploy.posture import PHASE_ENDPOINTS
+from edge_deploy.python_env import repo_venv_python
 from edge_deploy.repository import RepositoryError, inspect_repository, require_successful_github_ci
 
 VERIFY_SPEC = PhaseSpec(name="verify", order=10, endpoints=PHASE_ENDPOINTS["verify"])
@@ -75,7 +76,8 @@ def ensure_verified(
             ledger.record_event("phase_skipped", phase="verify")
             return state
         require_successful_github_ci(state)
-        pytest_command = [sys.executable, "-m", "pytest", "-n", "8", "--dist", "loadfile"]
+        python = repo_venv_python(repo_root) or Path(sys.executable)
+        pytest_command = [str(python), "-m", "pytest", "-n", "8", "--dist", "loadfile"]
         completed = subprocess.run(pytest_command, cwd=repo_root)
         if completed.returncode:
             raise RuntimeError("python -m pytest -n 8 --dist loadfile failed; release blocked")

@@ -166,6 +166,36 @@ def test_verify_reverify_forces_pytest_run(
     assert "verify: already passed" not in capsys.readouterr().out
 
 
+def test_verify_uses_repo_virtualenv_python_when_present(tmp_path, monkeypatch) -> None:
+    commit = "b" * 40
+    repo_root = _write_tool_profile(tmp_path)
+    config_path = _write_operator_config(tmp_path, repo_root)
+    ledger = _create_ledger(tmp_path, source_sha=commit)
+    run_id = ledger.state["run_id"]
+    venv_python = tmp_path / "autobench" / ".venv" / "Scripts" / "python.exe"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.write_text("", encoding="utf-8")
+    subprocess_calls: list = []
+
+    def track_subprocess(command, **kwargs):
+        subprocess_calls.append(SimpleNamespace(args=command, kwargs=kwargs))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.chdir(tmp_path / "autobench")
+    monkeypatch.setattr("edge_deploy.posture.socket.create_connection", _reachable_connect)
+    monkeypatch.setattr(
+        "edge_deploy.phases.verify.inspect_repository",
+        lambda *a, **k: SimpleNamespace(commit=commit),
+    )
+    monkeypatch.setattr("edge_deploy.phases.verify.require_successful_github_ci", lambda state: None)
+    monkeypatch.setattr("edge_deploy.phases.verify.subprocess.run", track_subprocess)
+
+    exit_code = cli.main(["--config", config_path, "verify", "--run", run_id])
+
+    assert exit_code == 0
+    assert _pytest_calls(subprocess_calls)[0].args[0] == str(venv_python)
+
+
 def test_verify_failure_records_failed_state(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

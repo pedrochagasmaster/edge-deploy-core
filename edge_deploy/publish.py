@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from edge_deploy.config import ToolProfile
+from edge_deploy.python_env import repo_venv_python
 
 # A git seam: takes an argv (without the leading ``git``) and returns stdout, raising
 # :class:`PublishError` on a nonzero exit. Injectable so tests never shell out to git.
@@ -152,10 +153,10 @@ def _run_local_check_ps1(repo_root: Path) -> tuple[int, str]:
             "Cannot run the local_check gate: neither 'pwsh' nor 'powershell' is on PATH. "
             "Install PowerShell or pass --no-local-check to bypass the gate."
         )
-    venv_python = repo_root / ".venv" / "Scripts" / "python.exe"
+    venv_python = repo_venv_python(repo_root)
     shim_dir: Path | None = None
     env = os.environ.copy()
-    if venv_python.is_file():
+    if venv_python is not None:
         shim_dir = Path(tempfile.mkdtemp(prefix="edge-deploy-pyshim-", dir=repo_root))
         shim = shim_dir / "py.cmd"
         shim.write_text(f'@"{venv_python}" %*\n', encoding="utf-8")
