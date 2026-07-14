@@ -152,6 +152,34 @@ def test_release_full_matrix_succeeds(fake_tmux, tmp_path, patched_drift, monkey
     assert (tmp_path / "release.log").exists()
 
 
+def test_release_forces_install_once_when_skipped_install_smoke_fails(
+    fake_tmux, tmp_path, patched_drift
+) -> None:
+    operator = _operator()
+    drivers: dict = {}
+
+    def configure(_name, kw):
+        kw["head_commits"] = [PREV, SNAP, SNAP, SNAP]
+        kw["changed_paths"] = ["README.md"]
+        kw["command_codes"] = {"dispatch --help": [1, 0]}
+
+    report = run_release(
+        operator,
+        ReleaseSelection(tools=["robocop"], nodes=["node03"]),
+        report_dir=tmp_path,
+        publish_fn=_publishing([]),
+        driver_factory=_make_factory(fake_tmux, drivers, configure=configure),
+        auth_mode="prompt",
+        heartbeat_interval_s=3600.0,
+        stall_threshold_s=7200.0,
+    )
+
+    assert report.exit_code() == 0
+    assert report.rollouts[0]["status"] == "rolled_out"
+    assert sum("dispatch --help" in command for command in drivers["node03"].commands) == 2
+    assert any(step == "install" for step, _command in drivers["node03"].decoded_step_commands)
+
+
 def test_release_default_auth_mode_is_prompt() -> None:
     signature = inspect.signature(run_release)
     assert signature.parameters["auth_mode"].default == "prompt"

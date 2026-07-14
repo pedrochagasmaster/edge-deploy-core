@@ -142,7 +142,7 @@ class FakeTmuxDriver:
         remote_runtime: dict[str, str] | None = None,
         auth_script: list[str] | None = None,
         klist_code: int | list[int] = 0,
-        command_codes: dict[str, int] | None = None,
+        command_codes: dict[str, int | list[int]] | None = None,
         fetch_script: list[tuple[int, str]] | None = None,
         runner_step_results: dict[str, dict] | None = None,
         raise_on_auth: Exception | None = None,
@@ -163,7 +163,10 @@ class FakeTmuxDriver:
         # Auth-seam scripting (Phase 2, ADR-0002).
         self._auth_script = list(auth_script) if auth_script else ["accept"]
         self._klist_codes = [klist_code] if isinstance(klist_code, int) else list(klist_code) or [0]
-        self._command_codes = dict(command_codes) if command_codes else {}
+        self._command_codes = {
+            needle: list(code) if isinstance(code, list) else [code]
+            for needle, code in (command_codes or {}).items()
+        }
         self._fetch_script = list(fetch_script) if fetch_script else [(0, "")]
         self.runner_step_results = dict(runner_step_results) if runner_step_results else {}
         self.runner_step_commands: list[tuple[str, str, str]] = []
@@ -370,8 +373,11 @@ class FakeTmuxDriver:
     def _respond(self, command: str) -> tuple[str, int]:
         # Opt-in per-command exit-code overrides (smoke failure injection). Keys are
         # test-chosen substrings; they take precedence over the structural routing below.
-        for needle, code in self._command_codes.items():
+        for needle, codes in self._command_codes.items():
             if needle in command:
+                code = codes[0]
+                if len(codes) > 1:
+                    codes.pop(0)
                 return self._sentinel(f"{needle} -> exit {code}", code)
         runner_match = re.search(r"sh (\S*runner-\S+\.sh) (\S+) (\S+) (\S+)(?: (\S+))?", command)
         if runner_match:

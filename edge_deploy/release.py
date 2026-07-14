@@ -739,6 +739,57 @@ def run_release(
                                     smoke_level=selection.smoke,
                                 )
                             )
+                        smoke_failed = any(
+                            check.name.startswith("smoke:") and not check.passed
+                            for check in report.checks
+                        )
+                        non_smoke_passed = all(
+                            check.passed
+                            for check in report.checks
+                            if not check.name.startswith("smoke:")
+                        )
+                        if report.install_decision == "skip" and smoke_failed and non_smoke_passed:
+                            tracker.retry(
+                                f"smoke failed after skipped install for {tool}/{node_name}; "
+                                "forcing one verified install and rechecking"
+                            )
+                            with tracker.tracked(
+                                f"runtime repair {tool}/{node_name}",
+                                phase="rollout",
+                                tool=tool,
+                                node=node_name,
+                                tmux_session=getattr(driver, "session", None),
+                            ):
+                                report = run_rollout(
+                                    driver,
+                                    profile,
+                                    node,
+                                    target_commit=snapshot,
+                                    install_mode="always",
+                                    operator_email=operator.operator_email,
+                                    remote=remote,
+                                    dependency_bundle_factory=bundle_for_tool,
+                                    run_id=report_dir.name,
+                                    transfer_progress=on_transfer,
+                                )
+                            if report.status == "rolled_out":
+                                with tracker.tracked(
+                                    f"verify repaired {tool}/{node_name}",
+                                    phase="verify",
+                                    tool=tool,
+                                    node=node_name,
+                                    tmux_session=getattr(driver, "session", None),
+                                ):
+                                    report.checks.extend(
+                                        verify_after_rollout(
+                                            driver,
+                                            profile,
+                                            node,
+                                            commit=snapshot,
+                                            local_root=local_roots[tool],
+                                            smoke_level=selection.smoke,
+                                        )
+                                    )
                         if selection.smoke == "deep" and profile.smoke.deep and kerb_check is not None:
                             report.checks.append(kerb_check)
                         if not all(check.passed for check in report.checks):

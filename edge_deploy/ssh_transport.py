@@ -357,10 +357,10 @@ class ParamikoSshTransport:
     def await_authenticated(self, *, timeout: float | None = None, poll_interval: float = 1.0) -> None:
         """Block until the pending keyboard-interactive attempt resolves.
 
-        On rejection, a new keyboard-interactive attempt is started on the same active
-        SSH transport so the existing AuthBroker retry loop can call
-        :meth:`submit_secret` again with a fresh code. On timeout, the transport is
-        closed and poisoned.
+        On rejection, the rejected SSH transport is closed and a fresh connection starts
+        its own keyboard-interactive exchange. Some servers reject a second auth request
+        on the same transport with ``SSH_MSG_UNIMPLEMENTED`` instead of issuing another
+        prompt. On timeout, the transport is closed and poisoned.
         """
         del poll_interval
         if self._transport is None:
@@ -374,13 +374,7 @@ class ParamikoSshTransport:
         error = self._auth_error
         self._auth_error = None
         if error is not None:
-            if self._transport is not None and not self._poisoned and self._transport.is_active():
-                # Preserve the active SSH transport and prepare a fresh attempt so the
-                # caller can submit a fresh (non-stale) one-time code.
-                self._prompt_ready.clear()
-                self._start_auth_worker()
-            else:
-                self._poison_and_close()
+            self._reconnect_after_auth_rejection(effective_timeout)
             raise AuthenticationError("Keyboard-interactive authentication was rejected") from error
 
         if not self.at_shell_prompt():
@@ -388,6 +382,17 @@ class ParamikoSshTransport:
             raise AuthenticationError("Authentication did not complete")
 
         self._transport.set_keepalive(self._settings.keepalive_s)
+
+    def _reconnect_after_auth_rejection(self, connect_timeout: float) -> None:
+        """Replace a server-rejected SSH transport before the next one-time code."""
+        self._best_effort_close(transport=self._transport, raw_socket=self._socket)
+        self._transport = None
+        self._socket = None
+        self._prompt_ready.clear()
+        self._auth_done.clear()
+        with self._secret_queue.mutex:  # type: ignore[attr-defined]
+            self._secret_queue.queue.clear()
+        self.start_session(connect_timeout=connect_timeout)
 
     # ------------------------------------------------------------------
     # Teardown helpers

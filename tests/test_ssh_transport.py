@@ -102,13 +102,6 @@ class FakeTransport:
         self.closed = True
 
 
-class RejectThenAcceptTransport(FakeTransport):
-    """Rejects the first submitted secret, accepts the second, on the same object."""
-
-    def __init__(self, _sock: object, *, server_key: paramiko.PKey) -> None:
-        super().__init__(_sock, server_key=server_key, accepted_secrets=("fresh-code",))
-
-
 class HangingAuthTransport(FakeTransport):
     """Never completes ``auth_interactive`` — used to exercise the timeout path."""
 
@@ -175,18 +168,27 @@ def ssh_transport(tmp_path: Path, server_key: paramiko.RSAKey) -> ParamikoSshTra
 
 
 @pytest.fixture
-def reject_then_accept_transport(tmp_path: Path, server_key: paramiko.RSAKey) -> ParamikoSshTransport:
+def reject_then_accept_transport(
+    tmp_path: Path, server_key: paramiko.RSAKey
+) -> tuple[ParamikoSshTransport, list[FakeTransport]]:
     settings = _settings(tmp_path)
     _write_known_hosts(settings.known_hosts_path, settings.hostname, settings.port, server_key)
+    transports: list[FakeTransport] = []
 
-    def transport_factory(sock: object) -> RejectThenAcceptTransport:
-        return RejectThenAcceptTransport(sock, server_key=server_key)
+    def transport_factory(sock: object) -> FakeTransport:
+        accepted = () if not transports else ("fresh-code",)
+        transport = FakeTransport(sock, server_key=server_key, accepted_secrets=accepted)
+        transports.append(transport)
+        return transport
 
-    return ParamikoSshTransport(
-        settings,
-        session="edge-node03",
-        socket_factory=fake_socket_factory,
-        transport_factory=transport_factory,
+    return (
+        ParamikoSshTransport(
+            settings,
+            session="edge-node03",
+            socket_factory=fake_socket_factory,
+            transport_factory=transport_factory,
+        ),
+        transports,
     )
 
 
@@ -313,12 +315,17 @@ def test_submit_secret_completes_auth_without_persisting_secret(ssh_transport) -
 
 
 def test_rejected_code_prepares_fresh_auth_attempt(reject_then_accept_transport) -> None:
-    reject_then_accept_transport.start_session(connect_timeout=1.0)
-    reject_then_accept_transport.submit_secret("stale-code")
+    driver, transports = reject_then_accept_transport
+    driver.start_session(connect_timeout=1.0)
+    driver.submit_secret("stale-code")
     with pytest.raises(AuthenticationError):
-        reject_then_accept_transport.await_authenticated(timeout=1.0)
-    reject_then_accept_transport.submit_secret("fresh-code")
-    reject_then_accept_transport.await_authenticated(timeout=1.0)
+        driver.await_authenticated(timeout=1.0)
+    driver.submit_secret("fresh-code")
+    driver.await_authenticated(timeout=1.0)
+
+    assert len(transports) == 2
+    assert transports[0].closed is True
+    assert transports[1].is_authenticated() is True
 
 
 def test_unknown_host_key_fails_before_prompt(unknown_host_transport) -> None:
