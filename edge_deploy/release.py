@@ -234,6 +234,8 @@ def _write_publish_report(report_dir: Path, tool: str, result: PublishResult, re
             "source_commit": result.source_commit,
             "source_short": result.source_short,
             "branch": result.branch,
+            "verification_source": result.verification_source,
+            "local_check_ran": result.local_check_ran,
         },
     )
     return write_report(report_dir / f"publish-{tool}.json", report)

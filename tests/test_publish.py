@@ -13,7 +13,7 @@ import pytest
 
 from edge_deploy import publish
 from edge_deploy.config import ToolProfile
-from edge_deploy.publish import PublishError, publish_snapshot
+from edge_deploy.publish import LocalCheckError, PublishError, publish_snapshot
 
 TOKEN = "s3cr3t-bearer-token"
 FIXED_CLOCK = lambda: datetime(2026, 6, 29, 23, 0, tzinfo=timezone.utc)  # noqa: E731
@@ -288,6 +288,25 @@ def test_publish_fails_when_local_check_nonzero() -> None:
         )
 
 
+def test_local_check_failure_preserves_exit_code_and_output_tail(monkeypatch) -> None:
+    git = FakeGit()
+    monkeypatch.setattr(
+        publish,
+        "_run_local_check_ps1",
+        lambda root: (7, "first detail\nfinal failure detail"),
+    )
+
+    with pytest.raises(LocalCheckError) as raised:
+        publish_snapshot(AUTOBENCH, repo_root="/x", git_runner=git)
+
+    assert raised.value.exit_code == 7
+    assert raised.value.output_tail == "first detail\nfinal failure detail"
+    assert "final failure detail" not in str(raised.value)
+    assert not any(
+        "fetch" in call or "push" in call or "commit" in call for call in git.calls
+    )
+
+
 def test_publish_runs_local_check_by_default() -> None:
     git = FakeGit()
     seen: list[Path] = []
@@ -296,9 +315,16 @@ def test_publish_runs_local_check_by_default() -> None:
         seen.append(Path(root))
         return 0
 
-    publish_snapshot(AUTOBENCH, repo_root="/repo/autobench", git_runner=git, local_check_runner=local_check)
+    result = publish_snapshot(
+        AUTOBENCH,
+        repo_root="/repo/autobench",
+        git_runner=git,
+        local_check_runner=local_check,
+    )
 
     assert seen == [Path("/repo/autobench")]
+    assert result.verification_source == "local-check"
+    assert result.local_check_ran is True
 
 
 def test_publish_commit_override_relaxes_tree_and_branch_gate() -> None:

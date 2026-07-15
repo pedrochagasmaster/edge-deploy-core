@@ -55,7 +55,7 @@ def test_copy_redacted_excludes_dependency_bundles(tmp_path):
         / "autobench"
         / ("a" * 40)
         / "wheels"
-        / "pyyaml-6.0.3-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl"
+        / "pyyaml-6.0.3-py3-none-any.whl"
     )
     bundle.parent.mkdir(parents=True)
     bundle.write_bytes(b"\x00\xce\xffbinary-wheel")
