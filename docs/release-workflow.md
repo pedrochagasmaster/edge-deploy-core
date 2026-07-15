@@ -196,6 +196,19 @@ Resume works across postures: when `verify` is already `passed` or `skipped`,
 `release --run <id>` does not fetch from GitHub, so you can continue from
 bitbucket-vpn or both-vpns without repeating verify.
 
+Publish normally reuses the run ledger's verification instead of repeating a
+tool's `local_check.ps1`. Reuse requires evidence bound to the run's exact
+source SHA with successful CI, passed tests, and a verification timestamp. An
+incomplete or legacy ledger safely falls back to the local check; standalone
+`edge_deploy publish` also retains that gate by default. Publish evidence and
+`publish-<tool>.json` record `verification_source` and `local_check_ran` so a
+reused gate is never reported as though the script executed.
+
+If the fallback local check fails, publish becomes `failed` and writes its
+redacted output tail to `publish-local-check.log` in the run directory. Inspect
+that artifact, correct the failure, and retry the same `publish-phase` command;
+no Bitbucket mutation occurs before the gate passes.
+
 On completion, guided mode prints `release complete: <run_id>` followed by the
 same status summary as `py -m edge_deploy status --run <run_id>`.
 
@@ -265,6 +278,8 @@ without re-running verify or publish when their ledger state is already
 See [docs/DESIGN.md](DESIGN.md) for module boundaries,
 [docs/adr/0008-run-ledger-and-posture-phases.md](adr/0008-run-ledger-and-posture-phases.md)
 for architecture decisions,
+[docs/adr/0015-source-bound-verification-reuse.md](adr/0015-source-bound-verification-reuse.md)
+for the durable publish verification contract,
 [docs/adr/0010-guided-posture-loop.md](adr/0010-guided-posture-loop.md) for
 guided mode and cross-posture resume, and
 [docs/adr/0014-paramiko-release-transport.md](adr/0014-paramiko-release-transport.md)

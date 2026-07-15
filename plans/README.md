@@ -25,6 +25,7 @@ update your row when done.
 | 009 | Error-path test hardening (deps delivery, ledger retry, drift globs) | P2 | M | — | TODO |
 | 010 | Transient-secret redaction registry | P2 | S–M | — | TODO |
 | 011 | Paramiko transport productization (Transport seam, M0 gates, pane fallback) | P1 | L | 006 (verdict = M0), 007 recommended first | TODO |
+| 012 | Reuse durable verification and preserve publish diagnostics | P1 | M | — | DONE |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
 

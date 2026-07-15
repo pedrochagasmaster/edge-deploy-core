@@ -52,6 +52,15 @@ class PublishError(RuntimeError):
     """Raised when a Publish cannot proceed (gate failure, git error, missing token)."""
 
 
+class LocalCheckError(PublishError):
+    """A failed local check whose captured output must be redacted before use."""
+
+    def __init__(self, exit_code: int, output_tail: str) -> None:
+        self.exit_code = exit_code
+        self.output_tail = output_tail
+        super().__init__(f"local_check.ps1 failed with exit code {exit_code}")
+
+
 @dataclass(frozen=True)
 class PublishResult:
     """The outcome of one reviewed source commit published to ``bitbucket/main``."""
@@ -66,6 +75,8 @@ class PublishResult:
     message: str
     gate: dict[str, bool] = field(default_factory=dict)
     local_check_output_tail: str = ""
+    verification_source: str = "local-check"
+    local_check_ran: bool = True
 
     def to_payload(self) -> dict[str, Any]:
         """A compact, secret-free dict for the consolidated release report."""
@@ -77,6 +88,8 @@ class PublishResult:
             "branch": self.branch,
             "previous_remote_commit": self.previous_remote_commit,
             "message": self.message,
+            "verification_source": self.verification_source,
+            "local_check_ran": self.local_check_ran,
         }
 
 
@@ -259,7 +272,7 @@ def publish_snapshot(
             code = local_check_runner(repo_root)
         local_check_passed = code == 0
         if not local_check_passed:
-            raise PublishError(f"local_check.ps1 failed with exit code {code}")
+            raise LocalCheckError(code, local_check_output_tail)
 
     gate = {
         "clean_tree": clean_tree,
@@ -330,4 +343,6 @@ def publish_snapshot(
         message=message,
         gate=gate,
         local_check_output_tail=local_check_output_tail,
+        verification_source="local-check" if run_local_check else "operator-bypass",
+        local_check_ran=run_local_check,
     )

@@ -12,7 +12,7 @@ from edge_deploy import cli
 from edge_deploy.config import OperatorConfig
 from edge_deploy.ledger import RunLedger
 from edge_deploy.phases.publish import PUBLISH_SPEC, run_publish_phase
-from edge_deploy.publish import PublishResult
+from edge_deploy.publish import LocalCheckError, PublishResult
 
 OPERATOR_CONFIG_WITH_AUDIT = """\
 operator_email: operator@example.com
@@ -72,6 +72,7 @@ def _create_ledger(
     repo_root: Path,
     *,
     verify_state: str = "pending",
+    verify_evidence: dict | None = None,
     publish_state: str = "pending",
     publish_evidence: dict | None = None,
 ) -> RunLedger:
@@ -84,7 +85,17 @@ def _create_ledger(
         operator="operator@example.com",
     )
     if verify_state != "pending":
-        ledger.set_phase("verify", verify_state, evidence={"commit": SOURCE_SHA})
+        ledger.set_phase(
+            "verify",
+            verify_state,
+            evidence=verify_evidence
+            or {
+                "commit": SOURCE_SHA,
+                "ci": "success",
+                "tests": "passed",
+                "verified_at": "2026-07-15T21:28:01+00:00",
+            },
+        )
     if publish_state != "pending":
         ledger.set_phase(
             "publish",
@@ -215,7 +226,178 @@ def test_publish_records_evidence(
     assert evidence["snapshot_sha"] == SNAPSHOT_SHA
     assert evidence["source_commit"] == SOURCE_SHA
     assert evidence["previous_remote_commit"] == PREV_REMOTE
-    assert (ledger.run_dir / "publish-autobench.json").is_file()
+    assert evidence["verification_source"] == "run-ledger"
+    assert evidence["local_check_ran"] is False
+    report = json.loads(
+        (ledger.run_dir / "publish-autobench.json").read_text(encoding="utf-8")
+    )
+    assert report["verification_source"] == "run-ledger"
+    assert report["local_check_ran"] is False
+
+
+def test_publish_reuses_complete_source_bound_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = _write_tool_profile(tmp_path)
+    config_path = _write_operator_config(tmp_path, repo_root)
+    ledger = _create_ledger(repo_root, verify_state="passed")
+    operator = _operator(config_path)
+    _patch_posture_and_engine(monkeypatch, ledger)
+    monkeypatch.setattr("edge_deploy.phases.publish.check_audit_remote", _noop_audit)
+    calls: list[bool] = []
+
+    def fake_publish(profile, **kwargs) -> PublishResult:
+        calls.append(kwargs["run_local_check"])
+        return _fake_publish_result(profile, **kwargs)
+
+    assert run_publish_phase(ledger, operator, repo_root, publish_fn=fake_publish) == 0
+    assert calls == [False]
+
+
+def test_publish_runs_local_check_when_verified_commit_differs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = _write_tool_profile(tmp_path)
+    config_path = _write_operator_config(tmp_path, repo_root)
+    ledger = _create_ledger(
+        repo_root,
+        verify_state="passed",
+        verify_evidence={
+            "commit": "d" * 40,
+            "ci": "success",
+            "tests": "passed",
+            "verified_at": "2026-07-15T21:28:01+00:00",
+        },
+    )
+    operator = _operator(config_path)
+    _patch_posture_and_engine(monkeypatch, ledger)
+    monkeypatch.setattr("edge_deploy.phases.publish.check_audit_remote", _noop_audit)
+    calls: list[bool] = []
+
+    def fake_publish(profile, **kwargs) -> PublishResult:
+        calls.append(kwargs["run_local_check"])
+        return _fake_publish_result(profile, **kwargs)
+
+    assert run_publish_phase(ledger, operator, repo_root, publish_fn=fake_publish) == 0
+    assert calls == [True]
+    evidence = ledger.state["phases"]["publish"]["evidence"]
+    assert evidence["verification_source"] == "local-check"
+    assert evidence["local_check_ran"] is True
+    report = json.loads(
+        (ledger.run_dir / "publish-autobench.json").read_text(encoding="utf-8")
+    )
+    assert report["verification_source"] == "local-check"
+    assert report["local_check_ran"] is True
+
+
+@pytest.mark.parametrize("missing_field", ["ci", "tests", "verified_at"])
+def test_publish_runs_local_check_for_incomplete_verification_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing_field: str
+) -> None:
+    repo_root = _write_tool_profile(tmp_path)
+    config_path = _write_operator_config(tmp_path, repo_root)
+    evidence = {
+        "commit": SOURCE_SHA,
+        "ci": "success",
+        "tests": "passed",
+        "verified_at": "2026-07-15T21:28:01+00:00",
+    }
+    del evidence[missing_field]
+    ledger = _create_ledger(repo_root, verify_state="passed", verify_evidence=evidence)
+    operator = _operator(config_path)
+    _patch_posture_and_engine(monkeypatch, ledger)
+    monkeypatch.setattr("edge_deploy.phases.publish.check_audit_remote", _noop_audit)
+    calls: list[bool] = []
+
+    def fake_publish(profile, **kwargs) -> PublishResult:
+        calls.append(kwargs["run_local_check"])
+        return _fake_publish_result(profile, **kwargs)
+
+    assert run_publish_phase(ledger, operator, repo_root, publish_fn=fake_publish) == 0
+    assert calls == [True]
+
+
+def test_no_local_check_bypasses_incomplete_verification_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = _write_tool_profile(tmp_path)
+    config_path = _write_operator_config(tmp_path, repo_root)
+    ledger = _create_ledger(
+        repo_root,
+        verify_state="passed",
+        verify_evidence={"commit": SOURCE_SHA},
+    )
+    operator = _operator(config_path)
+    _patch_posture_and_engine(monkeypatch, ledger)
+    monkeypatch.setattr("edge_deploy.phases.publish.check_audit_remote", _noop_audit)
+    calls: list[bool] = []
+
+    def fake_publish(profile, **kwargs) -> PublishResult:
+        calls.append(kwargs["run_local_check"])
+        return _fake_publish_result(profile, **kwargs)
+
+    assert (
+        run_publish_phase(
+            ledger,
+            operator,
+            repo_root,
+            no_local_check=True,
+            publish_fn=fake_publish,
+        )
+        == 0
+    )
+    assert calls == [False]
+    evidence = ledger.state["phases"]["publish"]["evidence"]
+    assert evidence["verification_source"] == "operator-bypass"
+    assert evidence["local_check_ran"] is False
+
+
+def test_local_check_failure_is_redacted_persisted_and_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo_root = _write_tool_profile(tmp_path)
+    config_path = _write_operator_config(tmp_path, repo_root)
+    ledger = _create_ledger(
+        repo_root,
+        verify_state="passed",
+        verify_evidence={"commit": SOURCE_SHA},
+    )
+    operator = _operator(config_path)
+    _patch_posture_and_engine(monkeypatch, ledger)
+    monkeypatch.setattr("edge_deploy.phases.publish.check_audit_remote", _noop_audit)
+    raw_tail = (
+        "password=hunter2 token=abc123 passcode=87654321\n"
+        "Authorization: Bearer bearer-secret\npytest failed"
+    )
+
+    def fail_publish(profile, **kwargs) -> PublishResult:
+        raise LocalCheckError(7, raw_tail)
+
+    assert run_publish_phase(ledger, operator, repo_root, publish_fn=fail_publish) == 1
+
+    stderr = capsys.readouterr().err
+    artifact = ledger.run_dir / "publish-local-check.log"
+    artifact_text = artifact.read_text(encoding="utf-8")
+    persisted_state = (ledger.run_dir / "state.json").read_text(encoding="utf-8")
+    for secret in ("hunter2", "abc123", "87654321", "bearer-secret"):
+        assert secret not in stderr
+        assert secret not in artifact_text
+        assert secret not in persisted_state
+    assert "password=***REDACTED***" in stderr
+    assert "token=***REDACTED***" in artifact_text
+    assert "passcode=***REDACTED***" in artifact_text
+    assert "Authorization: Bearer ***REDACTED***" in artifact_text
+    assert ledger.phase_state("publish") == "failed"
+    assert ledger.state["phases"]["publish"]["evidence"] == {
+        "error_type": "LocalCheckError",
+        "exit_code": 7,
+        "diagnostic_artifact": "publish-local-check.log",
+    }
+
+    assert run_publish_phase(ledger, operator, repo_root, publish_fn=_fake_publish_result) == 0
+    assert ledger.phase_state("publish") == "passed"
 
 
 def test_check_audit_remote_runs_in_publish_phase(

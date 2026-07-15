@@ -6,6 +6,7 @@ import argparse
 import subprocess
 import sys
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 from edge_deploy.audit import AuditSyncError, check_audit_remote
@@ -13,13 +14,28 @@ from edge_deploy.config import OperatorConfig, load_tool_profile
 from edge_deploy.ledger import RunLedger
 from edge_deploy.phases import PHASE_REGISTRY, PhaseSpec, enter_phase
 from edge_deploy.posture import PHASE_ENDPOINTS
-from edge_deploy.publish import PublishResult, publish_snapshot
+from edge_deploy.publish import LocalCheckError, PublishResult, publish_snapshot
 from edge_deploy.release import _write_publish_report
+from edge_deploy.reporting import redact
 
 PUBLISH_SPEC = PhaseSpec(name="publish", order=20, endpoints=PHASE_ENDPOINTS["publish"])
 
 RemoteBranchHeadFn = Callable[[Path, str, str], str]
 PublishFn = Callable[..., PublishResult]
+
+
+def _has_reusable_verification(ledger: RunLedger) -> bool:
+    if ledger.phase_state("verify") != "passed":
+        return False
+    evidence = ledger.state["phases"]["verify"].get("evidence", {})
+    verified_at = evidence.get("verified_at")
+    return (
+        evidence.get("commit") == ledger.state["source_sha"]
+        and evidence.get("ci") == "success"
+        and evidence.get("tests") == "passed"
+        and isinstance(verified_at, str)
+        and bool(verified_at.strip())
+    )
 
 
 def _default_remote_branch_head(repo_root: Path, remote: str, branch: str) -> str:
@@ -96,11 +112,45 @@ def run_publish_phase(
                     ledger.record_event("phase_skipped", phase="publish")
                     return 0
 
-        result = do_publish(
-            profile,
-            repo_root=repo_root,
-            commit=ledger.state["source_sha"],
-            run_local_check=not no_local_check,
+        reuse_verification = _has_reusable_verification(ledger)
+        try:
+            result = do_publish(
+                profile,
+                repo_root=repo_root,
+                commit=ledger.state["source_sha"],
+                run_local_check=not (no_local_check or reuse_verification),
+            )
+        except LocalCheckError as exc:
+            diagnostic_name = "publish-local-check.log"
+            redacted_tail = redact(exc.output_tail)
+            diagnostic = ledger.run_dir / diagnostic_name
+            diagnostic.write_text(
+                redacted_tail + ("\n" if redacted_tail else ""), encoding="utf-8"
+            )
+            ledger.set_phase(
+                "publish",
+                "failed",
+                evidence={
+                    "error_type": "LocalCheckError",
+                    "exit_code": exc.exit_code,
+                    "diagnostic_artifact": diagnostic_name,
+                },
+            )
+            print(str(exc), file=sys.stderr)
+            if redacted_tail:
+                print(redacted_tail, file=sys.stderr)
+            return 1
+        verification_source = (
+            "run-ledger"
+            if reuse_verification
+            else "operator-bypass"
+            if no_local_check
+            else "local-check"
+        )
+        result = replace(
+            result,
+            verification_source=verification_source,
+            local_check_ran=not (no_local_check or reuse_verification),
         )
         _write_publish_report(ledger.run_dir, profile.tool, result, str(repo_root))
         ledger.set_phase(
@@ -110,6 +160,8 @@ def run_publish_phase(
                 "snapshot_sha": result.snapshot,
                 "source_commit": result.source_commit,
                 "previous_remote_commit": result.previous_remote_commit,
+                "verification_source": result.verification_source,
+                "local_check_ran": result.local_check_ran,
             },
         )
         return 0
