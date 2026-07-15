@@ -93,6 +93,35 @@ def test_read_remote_json_survives_wrapped_base64() -> None:
     assert remote_path in driver.commands[0]
 
 
+def test_read_remote_command_contains_no_physical_newlines() -> None:
+    remote_path = "~/.edge-deploy/runs/run-1/steps/stage.json"
+    payload = {"schema": "edge-deploy/step/1", "step": "stage", "exit_code": 0}
+    driver = ScriptedDriver(screens=[build_d8_screen(remote_path, payload)])
+
+    read_remote_json(driver, remote_path)
+
+    assert "\n" not in driver.commands[0]
+    assert r"\n__EDGE_RESULT_START__\n" in driver.commands[0]
+
+
+def test_read_remote_json_survives_wrapped_digest_marker() -> None:
+    remote_path = "~/.edge-deploy/runs/run-1/steps/stage.json"
+    payload = {"schema": "edge-deploy/step/1", "step": "stage", "exit_code": 0}
+    content = json.dumps(payload).encode("utf-8")
+    digest = hashlib.sha256(content).hexdigest()
+    wrapped_digest = f"{digest[:32]}\n{digest[32:]}"
+    wrapped = _wrap_base64(base64.b64encode(content).decode("ascii"))
+    screen = (
+        "\n__EDGE_RESULT_START__\n"
+        f"{wrapped}\n"
+        f"__EDGE_RESULT_SHA_{wrapped_digest}__\n"
+        "__EDGE_RESULT_END__\n"
+    )
+    driver = ScriptedDriver(screens=[screen])
+
+    assert read_remote_json(driver, remote_path) == payload
+
+
 def test_read_remote_json_digest_mismatch_raises() -> None:
     remote_path = "~/.edge-deploy/runs/run-1/steps/bad.json"
     payload = {"schema": "edge-deploy/step/1", "step": "bad", "exit_code": 1}

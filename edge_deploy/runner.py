@@ -110,6 +110,10 @@ def _read_remote_bytes(driver: RemoteTransport, remote_path: str) -> bytes:
         f"printf '\\n__EDGE_RESULT_SHA_%s__\\n' \"$(sha256sum {remote_path} | cut -d' ' -f1)\"; "
         "printf '__EDGE_RESULT_END__\\n'"
     )
+    # psmux treats embedded newlines as separate send-keys operations. Keep
+    # this protocol command on one physical line; the shell's printf expands
+    # the escaped newlines remotely.
+    assert "\n" not in command
     screen, _exit_code = driver.run_remote(command, timeout=_READ_REMOTE_TIMEOUT)
 
     start_index = screen.rfind(_RESULT_START)
@@ -125,8 +129,10 @@ def _read_remote_bytes(driver: RemoteTransport, remote_path: str) -> bytes:
         raise RunnerProtocolError(f"missing {_RESULT_SHA_PREFIX!r} in remote read for {remote_path}")
 
     b64 = re.sub(r"\s", "", result_span[:sha_index])
-    sha_match = re.search(rf"{re.escape(_RESULT_SHA_PREFIX)}([0-9a-f]{{64}})__", result_span)
-    if sha_match is None:
+    digest_span = result_span[sha_index + len(_RESULT_SHA_PREFIX) :]
+    digest_end = digest_span.find("__")
+    expected = re.sub(r"\s", "", digest_span[:digest_end]) if digest_end != -1 else ""
+    if re.fullmatch(r"[0-9a-f]{64}", expected) is None:
         raise RunnerProtocolError(f"missing digest marker in remote read for {remote_path}")
 
     try:
@@ -134,7 +140,6 @@ def _read_remote_bytes(driver: RemoteTransport, remote_path: str) -> bytes:
     except ValueError as exc:
         raise RunnerProtocolError(f"invalid base64 in remote read for {remote_path}") from exc
 
-    expected = sha_match.group(1)
     actual = hashlib.sha256(decoded).hexdigest()
     if actual != expected:
         raise RunnerProtocolError(f"remote result digest mismatch for {remote_path}")
