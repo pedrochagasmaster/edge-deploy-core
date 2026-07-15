@@ -65,7 +65,11 @@ class AuthBroker:
         except Exception:
             pass
 
-        if self._auth_mode == "pane":
+        # Windows psmux has proven unreliable for secret-bearing send-keys:
+        # the visible digits can be correct while sshd receives a rejected
+        # response. Pane transports therefore require the operator to type
+        # directly in the attached pane even when the CLI default is prompt.
+        if self._auth_mode == "pane" or getattr(driver, "requires_manual_rsa_entry", False):
             self._authenticate_via_pane(driver, node_name)
         else:
             self._authenticate_via_prompt(driver, node_name)

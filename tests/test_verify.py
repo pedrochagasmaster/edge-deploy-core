@@ -38,6 +38,18 @@ def test_run_smoke_marks_failing_command(autobench_profile, fake_tmux) -> None:
     assert "exit 3" in failed[0].message
 
 
+def test_run_smoke_preserves_redacted_failure_output(autobench_profile, fake_tmux) -> None:
+    driver = fake_tmux()
+    driver.run_remote = lambda *args, **kwargs: ("token=smoke-secret", 1)
+
+    check = run_smoke(driver, autobench_profile, level="standard")[0]
+
+    assert check.evidence is not None
+    assert "output_tail" in check.evidence
+    assert "token=***REDACTED***" in check.evidence["output_tail"]
+    assert "smoke-secret" not in check.evidence["output_tail"]
+
+
 def test_run_smoke_deep_autobench_is_noop(autobench_profile, fake_tmux) -> None:
     driver = fake_tmux()
 

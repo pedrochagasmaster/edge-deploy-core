@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 
 from edge_deploy.config import ToolProfile
 from edge_deploy.drift import check_drift
-from edge_deploy.reporting import ReportCheck
+from edge_deploy.reporting import ReportCheck, redact
 
 if TYPE_CHECKING:
     from edge_deploy.transport import RemoteTransport
@@ -36,8 +36,11 @@ def run_smoke(driver: RemoteTransport, profile: ToolProfile, *, level: str) -> l
     commands = profile.smoke.deep if level == "deep" else profile.smoke.standard
     checks: list[ReportCheck] = []
     for command in commands:
-        _screen, code = driver.run_remote(f"cd {profile.repo_path} && {command}", timeout=120)
-        checks.append(ReportCheck(f"smoke:{command}", code == 0, f"exit {code}"))
+        screen, code = driver.run_remote(f"cd {profile.repo_path} && {command}", timeout=120)
+        evidence = None
+        if code != 0:
+            evidence = {"output_tail": redact(screen[-2000:].strip())}
+        checks.append(ReportCheck(f"smoke:{command}", code == 0, f"exit {code}", evidence))
     return checks
 
 
