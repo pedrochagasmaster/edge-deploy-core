@@ -140,6 +140,20 @@ def test_broker_prompt_toggles_waiting_on_around_secret_read(fake_tmux, tmp_path
     assert waiting_states == ["operator", None]
 
 
+def test_broker_prompt_mode_requires_direct_entry_for_pane_transport(fake_tmux, tmp_path, monkeypatch) -> None:
+    driver = fake_tmux(auth_script=["accept"])
+    driver.requires_manual_rsa_entry = True
+    prompts: list[str] = []
+    monkeypatch.setattr(auth, "_prompt_for_secret", lambda prompt: prompts.append(prompt) or "unused")
+    broker, tracker = _broker(fake_tmux, tmp_path=tmp_path, auth_mode="prompt")
+
+    broker.ensure_authenticated(driver, "node04")
+
+    assert prompts == []
+    assert driver.sent_secrets == []
+    assert any("waiting for node04 RSA" in event for event in tracker.events)
+
+
 # ---------------------------------------------------------------------------
 # AuthBroker pane mode
 # ---------------------------------------------------------------------------

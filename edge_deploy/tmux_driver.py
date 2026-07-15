@@ -102,6 +102,10 @@ class TmuxDriver:
         ``dispatch_dynamic`` (robocop's dashboard-aware q/Escape), or ``none``.
     """
 
+    # AuthBroker must never relay RSA passcodes through psmux send-keys. The
+    # operator types them directly into the attached pane.
+    requires_manual_rsa_entry = True
+
     def __init__(
         self,
         host: str,
