@@ -1,21 +1,68 @@
-"""Verify phase: repository inspection, GitHub CI, and pytest gate."""
+"""Verify phase: repository inspection, GitHub CI, and tool-owned gate."""
 
 from __future__ import annotations
 
 import argparse
-import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 from edge_deploy.config import OperatorConfig, load_tool_profile
 from edge_deploy.ledger import RunLedger
+from edge_deploy.local_check import (
+    LOCAL_CHECK_RELATIVE,
+    LocalCheckUnavailableError,
+    run_local_check,
+)
 from edge_deploy.phases import PhaseSpec, enter_phase, load_run, run_repo_root
 from edge_deploy.posture import PHASE_ENDPOINTS
-from edge_deploy.python_env import repo_venv_python
+from edge_deploy.reporting import redact
 from edge_deploy.repository import RepositoryError, inspect_repository, require_successful_github_ci
 
 VERIFY_SPEC = PhaseSpec(name="verify", order=10, endpoints=PHASE_ENDPOINTS["verify"])
+VERIFY_DIAGNOSTIC = "verify-local-check.log"
+
+
+def _has_complete_tool_verification(ledger: RunLedger, commit: str) -> bool:
+    if ledger.phase_state("verify") != "passed":
+        return False
+    evidence = ledger.state["phases"]["verify"].get("evidence", {})
+    verified_at = evidence.get("verified_at")
+    return (
+        ledger.state["source_sha"] == commit
+        and evidence.get("commit") == commit
+        and evidence.get("ci") == "success"
+        and evidence.get("tests") == "passed"
+        and isinstance(verified_at, str)
+        and bool(verified_at.strip())
+        and evidence.get("verification_command") == LOCAL_CHECK_RELATIVE.as_posix()
+    )
+
+
+def _record_gate_failure(
+    ledger: RunLedger,
+    *,
+    commit: str,
+    error_type: str,
+    exit_code: int | None,
+    output_tail: str,
+) -> None:
+    redacted_tail = redact(output_tail)
+    (ledger.run_dir / VERIFY_DIAGNOSTIC).write_text(
+        redacted_tail + ("\n" if redacted_tail else ""), encoding="utf-8"
+    )
+    ledger.set_phase(
+        "verify",
+        "failed",
+        evidence={
+            "commit": commit,
+            "error_type": error_type,
+            "exit_code": exit_code,
+            "diagnostic_artifact": VERIFY_DIAGNOSTIC,
+        },
+    )
+    if redacted_tail:
+        print(redacted_tail, file=sys.stderr)
 
 
 def ensure_verified(
@@ -66,21 +113,35 @@ def ensure_verified(
                     f"{state.commit[:7]}; switch the tool checkout to the reviewed commit "
                     f"or abandon the run"
                 )
-        if (
-            not reverify
-            and ledger.phase_state("verify") == "passed"
-            and ledger.state["source_sha"] == state.commit
-        ):
+        if not reverify and _has_complete_tool_verification(ledger, state.commit):
             sha7 = state.commit[:7]
             print(f"verify: already passed for {sha7} (skipping)")
             ledger.record_event("phase_skipped", phase="verify")
             return state
         require_successful_github_ci(state)
-        python = repo_venv_python(repo_root) or Path(sys.executable)
-        pytest_command = [str(python), "-m", "pytest", "-n", "8", "--dist", "loadfile"]
-        completed = subprocess.run(pytest_command, cwd=repo_root)
-        if completed.returncode:
-            raise RuntimeError("python -m pytest -n 8 --dist loadfile failed; release blocked")
+        try:
+            result = run_local_check(repo_root)
+        except LocalCheckUnavailableError as exc:
+            _record_gate_failure(
+                ledger,
+                commit=state.commit,
+                error_type=type(exc).__name__,
+                exit_code=None,
+                output_tail="",
+            )
+            raise RuntimeError("committed tool verification gate is unavailable; release blocked") from exc
+        if result.exit_code:
+            _record_gate_failure(
+                ledger,
+                commit=state.commit,
+                error_type="LocalCheckError",
+                exit_code=result.exit_code,
+                output_tail=result.output_tail,
+            )
+            raise RuntimeError(
+                f"committed tool verification gate failed with exit code {result.exit_code}; "
+                f"see {VERIFY_DIAGNOSTIC}"
+            )
         verified_at = datetime.now(timezone.utc).isoformat()
         ledger.set_phase(
             "verify",
@@ -90,15 +151,17 @@ def ensure_verified(
                 "ci": "success",
                 "tests": "passed",
                 "verified_at": verified_at,
+                "verification_command": LOCAL_CHECK_RELATIVE.as_posix(),
             },
         )
         return state
     except Exception:
-        ledger.set_phase(
-            "verify",
-            "failed",
-            evidence={"commit": state.commit},
-        )
+        if ledger.phase_state("verify") != "failed":
+            ledger.set_phase(
+                "verify",
+                "failed",
+                evidence={"commit": state.commit},
+            )
         raise
 
 
@@ -134,7 +197,7 @@ def _cmd_verify(args: argparse.Namespace, operator: OperatorConfig) -> int:
 def register_verify(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser(
         "verify",
-        help="Verify repository state, GitHub CI, and pytest for a run",
+        help="Verify repository state, GitHub CI, and the committed tool gate for a run",
     )
     parser.add_argument("--run", required=True, help="Run id to verify")
     parser.add_argument(

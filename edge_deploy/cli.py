@@ -90,7 +90,14 @@ def build_parser() -> argparse.ArgumentParser:
     release_parser.add_argument("--auth-wait-seconds", type=float, default=300.0)
     release_parser.add_argument("--heartbeat-interval", type=float, default=30.0)
     release_parser.add_argument("--stall-threshold", type=float, default=300.0)
-    release_parser.add_argument("--no-local-check", action="store_true", help="Bypass the local_check.ps1 publish gate")
+    release_parser.add_argument(
+        "--no-local-check",
+        action="store_true",
+        help=(
+            "Bypass only a publish fallback; verify always runs the source-bound "
+            "committed tool gate"
+        ),
+    )
     release_parser.add_argument(
         "--guided",
         action="store_true",
@@ -113,7 +120,11 @@ def build_parser() -> argparse.ArgumentParser:
     publish_parser = subparsers.add_parser("publish", help="Publish one exact Tool commit to Bitbucket")
     publish_parser.add_argument("--tool", required=True, choices=TOOL_CHOICES, help="Per-tool; no 'both'")
     publish_parser.add_argument("--commit", default=None, help="Optional source override (a reviewed commit SHA)")
-    publish_parser.add_argument("--no-local-check", action="store_true", help="Bypass the local_check.ps1 gate")
+    publish_parser.add_argument(
+        "--no-local-check",
+        action="store_true",
+        help="Bypass the standalone publish local-check gate",
+    )
     publish_parser.add_argument("--remote", default="bitbucket")
 
     mirror_parser = subparsers.add_parser(
