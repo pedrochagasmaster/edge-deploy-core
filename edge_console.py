@@ -1118,16 +1118,22 @@ function nextPhase(run){
 
 function nextCommand(run, phase){
   const id = run.state.run_id;
-  if(phase === "verify")  return `py -m edge_deploy verify --run ${id}`;
-  if(phase === "publish") return `py -m edge_deploy publish-phase --run ${id}`;
-  if(phase === "deploy"){
+  let cmd;
+  if(phase === "verify")  cmd = `py -m edge_deploy verify --run ${id}`;
+  else if(phase === "publish") cmd = `py -m edge_deploy publish-phase --run ${id}`;
+  else if(phase === "deploy"){
     const pending = Object.entries(run.state.phases.deploy)
       .filter(([,n]) => n.state !== "passed").map(([name]) => name).sort();
-    return `py -m edge_deploy deploy --run ${id} --nodes ${pending.join(",")}`;
+    cmd = `py -m edge_deploy deploy --run ${id} --nodes ${pending.join(",")}`;
   }
-  if(phase === "tag_bitbucket") return `py -m edge_deploy tag-bitbucket --run ${id}`;
-  if(phase === "tag_github")    return `py -m edge_deploy tag-github --run ${id}`;
-  return "";
+  else if(phase === "tag_bitbucket") cmd = `py -m edge_deploy tag-bitbucket --run ${id}`;
+  else if(phase === "tag_github")    cmd = `py -m edge_deploy tag-github --run ${id}`;
+  else return "";
+  // load_run() falls back to cwd when the run isn't under a configured
+  // operator tool path (edge_deploy/phases/__init__.py); the console watches
+  // several checkouts, so the copied command must not assume cwd == this
+  // run's root the way a single-root console safely could.
+  return run.root ? `cd "${run.root}"; ${cmd}` : cmd;
 }
 
 function stateChip(s){

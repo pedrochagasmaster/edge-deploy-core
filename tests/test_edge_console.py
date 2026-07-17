@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from edge_console import (  # noqa: E402
     _SCHEMA,
+    PAGE,
     ToolsProber,
     _tool_name,
     build_demo_checkouts,
@@ -371,3 +372,20 @@ def test_demo_tools_show_guide_and_inflight_states() -> None:
     assert robocop["ahead"] == 3
     assert robocop["ahead_exact"] is True
     assert robocop["stale"] is False
+
+
+# ---------------------------------------------------------------------------
+# Copied next-command must not assume cwd == the run's checkout
+# ---------------------------------------------------------------------------
+
+
+def test_next_command_cds_into_the_runs_root() -> None:
+    """Regression guard: a multi-root console must never hand the operator a
+    bare 'py -m edge_deploy ...' command. load_run() falls back to cwd when a
+    run isn't under a configured operator tool path, so copying one tool's
+    command while standing in another tool's checkout fails with 'no such
+    run' — nextCommand() must cd into run.root first."""
+    assert "function nextCommand(run, phase){" in PAGE
+    body = PAGE.split("function nextCommand(run, phase){", 1)[1].split("\n}", 1)[0]
+    assert "run.root" in body
+    assert 'cd "${run.root}"' in body or "cd \\\"${run.root}\\\"" in body
