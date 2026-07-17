@@ -19,13 +19,13 @@ update your row when done.
 | 003 | CI gates: ruff, parallel pytest, honest failures (+2026-07-07 addendum: pip cache, pre-fix `runner.py:44` E501) | P1 | S | — | TODO (re-verified valid 2026-07-07) |
 | 004 | Release-ledger architecture (M1–M5) | P0 | XL | — | DONE (landed as ADR-0008/0012, v1.3.0 phases) |
 | 005 | Release-ledger PR breakdown | P0 | — | 004 | DONE (companion to 004) |
-| 006 | Paramiko persistent-SSH prototype | P2 | M | — | DONE (explored in commit `8e50cdd`; productization not yet planned — see "Direction" below) |
+| 006 | Paramiko persistent-SSH prototype | P2 | M | — | DONE (spike verdict recorded in the plan file; productized via 011) |
 | 007 | Drift → D8 file evidence + batched local hashing | P1 | M | — | TODO |
 | 008 | Coverage measurement + CI gate | P2 | S | 003 | TODO |
 | 009 | Error-path test hardening (deps delivery, ledger retry, drift globs) | P2 | M | — | TODO |
 | 010 | Transient-secret redaction registry | P2 | S–M | — | TODO |
-| 011 | Paramiko transport productization (Transport seam, M0 gates, pane fallback) | P1 | L | 006 (verdict = M0), 007 recommended first | TODO |
-| 012 | Reuse durable verification and preserve publish diagnostics | P1 | M | — | DONE |
+| 011 | Paramiko transport productization (Transport seam, M0 gates, pane fallback) | P1 | L | 006 (verdict = M0), 007 recommended first | DONE (landed as ADR-0014, v1.5.0: RemoteTransport seam, Paramiko default, pane fallback, transport-smoke; shipped before 007) |
+| 012 | Reuse durable verification and preserve publish diagnostics | P1 | M | — | DONE (landed as #34) |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
 
@@ -39,19 +39,19 @@ Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJE
   complete or abandon open runs before upgrading the installed engine.
 - 007 is unaffected by 009 and vice versa (009 documents the one overlap:
   `_glob_regex` is untouched by 007).
-- 011 is hard-gated on its M0 (probe verdict from branch
-  `explore/paramiko-ssh-transport`, policy sign-off, paramiko dependency
-  approval) and should follow 007 so the new transport never has to serve a
-  screen-scrape read. Its milestones M1–M4 are separate PRs.
+- 011 landed (ADR-0014, v1.5.0) with its M0 satisfied by the plan-006 live
+  probe. The `explore/paramiko-ssh-transport` branch is deleted; its verdict
+  and risk notes live in `006-paramiko-persistent-ssh-prototype.md`. It
+  shipped ahead of 007, so drift still reads over the pane protocol on
+  `transport: pane` nodes — 007 remains worthwhile on its own.
 
 ## Direction options (maintainer decision, not ranked against fixes)
 
 Grounded suggestions from the 2026-07-07 audit, not yet planned:
 
-1. **Productize the Paramiko transport** — now planned as
-   `011-paramiko-transport-productization.md` (2026-07-07). Gated on the
-   plan-006 live probe verdict, policy-owner confirmation, and dependency
-   approval (its M0).
+1. **Productize the Paramiko transport** — planned as
+   `011-paramiko-transport-productization.md` (2026-07-07) and landed as
+   ADR-0014 in v1.5.0.
 2. **Release-history query CLI** (`list-releases` / per-node history). The
    data already exists twice — `edge-deploy/runs/*/events.jsonl` locally and
    the redacted bundles on the Bitbucket `release-log` branch — but answering
