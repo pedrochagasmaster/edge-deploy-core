@@ -881,6 +881,20 @@ header{border-bottom:1px solid var(--line);background:var(--panel)}
 .rootline{font-family:var(--mono);font-size:11px;color:var(--faint);padding:16px 0 4px}
 .demo-flag{color:var(--warn);border:1px solid var(--warn);border-radius:3px;padding:0 6px;margin-left:8px;font-size:10px;letter-spacing:.1em}
 
+/* ---------- run filter bar: toggle chips, all-on by default ---------- */
+.filterbar{display:flex;gap:6px;flex-wrap:wrap;align-items:center;padding:2px 0 12px}
+.flabel{font-family:var(--mono);font-size:9.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--faint);margin-right:2px}
+.fchip{font-family:var(--mono);font-size:10.5px;letter-spacing:.03em;border:1px solid var(--line);border-radius:4px;padding:2.5px 9px;color:var(--dim);background:none;cursor:pointer;line-height:1.4}
+.fchip:hover{border-color:var(--faint);color:var(--ink)}
+.fchip:focus-visible{outline:2px solid var(--gh);outline-offset:1px}
+.fchip.off{color:var(--faint);text-decoration:line-through;opacity:.6}
+.fchip.tool.on{color:var(--ink);border-color:var(--faint)}
+.fchip.status.open.on{color:var(--pass);border-color:var(--pass)}
+.fchip.status.complete.on{color:var(--gh);border-color:var(--gh)}
+.fchip.status.abandoned.on{color:var(--fail);border-color:var(--fail)}
+.fchip.clear{color:var(--faint);border-style:dashed}
+.fcount{font-family:var(--mono);font-size:10px;color:var(--faint);margin-left:2px}
+
 /* ---------- tool cards: deployed-state divergence + start-a-release guide ---------- */
 .toolcard{border:1px solid var(--line);border-radius:8px;background:var(--panel);margin-top:14px;overflow:hidden}
 .toolhead{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:baseline;padding:12px 16px 4px}
@@ -1027,6 +1041,7 @@ footer code{font-family:var(--mono)}
 <main class="wrap">
   <div class="rootline" id="rootline"></div>
   <div id="tools"></div>
+  <div class="filterbar" id="filterbar" aria-label="filter runs by tool and status"></div>
   <div id="runs"></div>
   <footer>TCP reachability is informational: the corporate proxy accepts connects in every
   posture, and TCP cannot see GitHub write (baseline vs firewall-off) — only each phase's
@@ -1445,28 +1460,113 @@ function toolCardHtml(t){
   </article>`;
 }
 
+/* ---------- run filter: tool + status toggle chips, all-on by default ---------- */
+const STATUS_ORDER = ["open", "complete", "abandoned"];
+const FILTER_STORAGE_KEY = "edge-console-filter-v1";
+
+function loadFilterState(){
+  try{
+    const raw = localStorage.getItem(FILTER_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    return {
+      excludedTools: new Set(Array.isArray(parsed.excludedTools) ? parsed.excludedTools : []),
+      excludedStatuses: new Set(Array.isArray(parsed.excludedStatuses) ? parsed.excludedStatuses : []),
+    };
+  }catch(_e){
+    return {excludedTools: new Set(), excludedStatuses: new Set()};
+  }
+}
+function saveFilterState(){
+  try{
+    localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify({
+      excludedTools: [...filterState.excludedTools],
+      excludedStatuses: [...filterState.excludedStatuses],
+    }));
+  }catch(_e){ /* private mode / storage disabled: filter still works this session */ }
+}
+let filterState = loadFilterState();
+
+function passesFilter(run){
+  const st = run.state;
+  if(filterState.excludedStatuses.has(st.status)) return false;
+  if(filterState.excludedTools.has(st.tool)) return false;
+  return true;
+}
+
+function filterBarHtml(allRuns){
+  if(!allRuns.length) return "";
+  const tools = [...new Set(allRuns.map(r => r.state.tool))].sort();
+  const countOf = (kind, value) => allRuns.filter(r =>
+    kind === "tool" ? r.state.tool === value : r.state.status === value).length;
+  const chip = (kind, value, label) => {
+    const on = kind === "tool" ? !filterState.excludedTools.has(value) : !filterState.excludedStatuses.has(value);
+    const cls = kind === "tool" ? "tool" : `status ${value}`;
+    return `<button class="fchip ${cls} ${on ? "on" : "off"}" data-kind="${kind}" data-value="${esc(value)}"
+      aria-pressed="${on}">${esc(label)} <span class="fcount">${countOf(kind, value)}</span></button>`;
+  };
+  const toolChips = tools.map(t => chip("tool", t, t)).join("");
+  const statusChips = STATUS_ORDER.map(s => chip("status", s, s)).join("");
+  const active = filterState.excludedTools.size || filterState.excludedStatuses.size;
+  const shown = allRuns.filter(passesFilter).length;
+  const clear = active
+    ? `<button class="fchip clear" id="filter-clear">clear</button><span class="fcount">${shown}/${allRuns.length} shown</span>`
+    : "";
+  return `<span class="flabel">tool</span>${toolChips}
+          <span class="flabel">status</span>${statusChips}${clear}`;
+}
+
+document.addEventListener("click", ev => {
+  if(ev.target.closest("#filter-clear, #filter-clear-empty")){
+    filterState.excludedTools.clear();
+    filterState.excludedStatuses.clear();
+    saveFilterState();
+    renderRuns();
+    return;
+  }
+  const chipBtn = ev.target.closest(".fchip[data-kind]");
+  if(!chipBtn) return;
+  const set = chipBtn.dataset.kind === "tool" ? filterState.excludedTools : filterState.excludedStatuses;
+  if(set.has(chipBtn.dataset.value)) set.delete(chipBtn.dataset.value); else set.add(chipBtn.dataset.value);
+  saveFilterState();
+  renderRuns();
+});
+
 /* ---------- polling ---------- */
-let lastRuns = "";
+let runsData = null, lastRuns = "";
+function renderRuns(){
+  if(!runsData) return;
+  const data = runsData;
+  document.getElementById("rootline").innerHTML =
+    `watching ${data.roots.map(esc).join(`<span style="color:var(--line)"> · </span>`)}` +
+    (data.demo ? `<span class="demo-flag">demo data</span>` : "");
+  document.getElementById("filterbar").innerHTML = filterBarHtml(data.runs);
+  const openLogs = new Set([...document.querySelectorAll("details.log[open]")].map(d => d.dataset.key));
+  const el = document.getElementById("runs");
+  if(!data.runs.length){
+    el.innerHTML = `<div class="empty">No runs under the watched checkouts.<br><br>
+      Use a <b>start a release</b> panel above, or run
+      <code>py -m edge_deploy release --guided</code> from a tool checkout.</div>`;
+    return;
+  }
+  const filtered = data.runs.filter(passesFilter);
+  if(!filtered.length){
+    el.innerHTML = `<div class="empty">${data.runs.length} run${data.runs.length === 1 ? "" : "s"}
+      hidden by the filter above.<br><br><button class="fchip clear" id="filter-clear-empty">clear filter</button></div>`;
+    return;
+  }
+  el.innerHTML = filtered.map(runHtml).join("");
+  for(const d of el.querySelectorAll("details.log")) if(openLogs.has(d.dataset.key)) d.open = true;
+}
+
 async function pollRuns(){
   try{
     const res = await fetch("/api/runs");
     const data = await res.json();
     const raw = JSON.stringify(data);
-    document.getElementById("rootline").innerHTML =
-      `watching ${data.roots.map(esc).join(`<span style="color:var(--line)"> · </span>`)}` +
-      (data.demo ? `<span class="demo-flag">demo data</span>` : "");
+    runsData = data;
     if(raw === lastRuns) return;
     lastRuns = raw;
-    const openLogs = new Set([...document.querySelectorAll("details.log[open]")].map(d => d.dataset.key));
-    const el = document.getElementById("runs");
-    if(!data.runs.length){
-      el.innerHTML = `<div class="empty">No runs under the watched checkouts.<br><br>
-        Use a <b>start a release</b> panel above, or run
-        <code>py -m edge_deploy release --guided</code> from a tool checkout.</div>`;
-      return;
-    }
-    el.innerHTML = data.runs.map(runHtml).join("");
-    for(const d of el.querySelectorAll("details.log")) if(openLogs.has(d.dataset.key)) d.open = true;
+    renderRuns();
   }catch(_e){ /* server briefly gone; keep last render */ }
 }
 
