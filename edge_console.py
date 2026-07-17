@@ -1,22 +1,34 @@
 """edge_console — read-only posture console for edge-deploy runs.
 
-A single-file, zero-dependency local web UI over the run ledger
-(``edge-deploy/runs/``). It renders each Run as a rail through the five
-workstation postures (ADR-0013): stations are tinted by the capability they
-need (bitbucket, edge, github write), VPN joins are soft boundaries, and the
-one hard wall — dropping both VPNs for firewall-off before ``tag_github`` —
-is drawn as a hazard gate. Per-node deploy state, the exact next command,
-and the tail of the run's event log sit under each rail.
+A single-file, zero-dependency local web UI over one or more run ledgers
+(``<checkout>/edge-deploy/runs/``). It renders each Run as a rail through the
+five workstation postures (ADR-0013): stations are tinted by the capability
+they need (bitbucket, edge, github write), VPN joins are soft boundaries, and
+the one hard wall — dropping both VPNs for firewall-off before ``tag_github``
+— is drawn as a hazard gate. Per-node deploy state (each node's compact
+rollout report: drift, smoke, and the state a failure left behind), the live
+operation from ``release-progress.json`` (auth waits, rollouts, and verified
+binary transfers over the Paramiko transport — ADR-0014), the exact next
+command, and the tail of the run's event log sit under each rail.
+
+Above the runs, one card per watched tool checkout answers "should I
+release?": it compares the last completed run's source SHA (what the Edge
+Nodes are believed to hold) against the checkout's HEAD and against GitHub
+``main`` (``git ls-remote`` — GitHub read works in every posture), flags
+undeployed commits and stale checkouts, and — when no Run is open — walks the
+operator through starting one (posture to hold, optional ``preflight`` /
+``transport-smoke``, then ``py -m edge_deploy release --guided``). Git use is
+strictly read-only, matching the console's no-writes contract.
 
 Deliberately standalone: Engine Identity (ADR-0008) hashes every ``*.py``
 inside the ``edge_deploy`` package, so UI code must live outside the engine
 or every open Run would be orphaned. This file never writes to the ledger.
 
-Usage (from the tool checkout being released, where runs live):
+Usage:
 
-    python edge_console.py                 # serve http://127.0.0.1:7643
-    python edge_console.py --root D:\\path  # ledger root elsewhere
-    python edge_console.py --demo          # fabricated runs, no probes
+    py edge_console.py                              # watch the cwd checkout
+    py edge_console.py --root D:\\ab --root D:\\rc    # watch several checkouts
+    py edge_console.py --demo                       # fabricated checkouts, no probes
 
 Posture probes are TCP-only and labelled as such in the UI: the corporate
 proxy accepts TCP connects in every posture, and TCP cannot see GitHub write
@@ -29,7 +41,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import socket
+import subprocess
 import tempfile
 import threading
 import time
@@ -101,6 +115,20 @@ def collect_runs(runs_root: Path) -> list[dict]:
     )
     open_runs = [r for r in runs if r["state"].get("status") == "open"]
     closed = [r for r in runs if r["state"].get("status") != "open"]
+    closed.sort(key=lambda r: r["state"].get("created_at", ""), reverse=True)
+    return open_runs + closed[:20]
+
+
+def collect_runs_multi(roots: list[Path]) -> list[dict]:
+    """Merge runs from several tool checkouts, tagging each run with its root."""
+    merged: list[dict] = []
+    for root in roots:
+        for run in collect_runs(root / "edge-deploy" / "runs"):
+            run["root"] = str(root)
+            merged.append(run)
+    open_runs = [r for r in merged if r["state"].get("status") == "open"]
+    open_runs.sort(key=lambda r: r["state"].get("created_at", ""))
+    closed = [r for r in merged if r["state"].get("status") != "open"]
     closed.sort(key=lambda r: r["state"].get("created_at", ""), reverse=True)
     return open_runs + closed[:20]
 
@@ -183,43 +211,117 @@ class PostureProber:
 
 
 # ---------------------------------------------------------------------------
-# Demo ledger (fabricated runs so the console renders without a real release)
+# Demo checkouts (fabricated runs so the console renders without a real release)
 # ---------------------------------------------------------------------------
 
 def _demo_phase(state: str, at: str, evidence: dict | None = None) -> dict:
     return {"state": state, "updated_at": at, "evidence": evidence or {}}
 
 
-def build_demo_ledger() -> Path:
-    root = Path(tempfile.mkdtemp(prefix="edge-console-demo-")) / "edge-deploy" / "runs"
-    engine = {"version": "1.4.0", "package_dir": "(demo)", "content_sha256": "d3m0" + "0" * 60}
+# Fabricated git answers for the demo checkouts, keyed by directory name:
+# autobench's HEAD is the open run's source (five commits past the June
+# rollback); robocop has three reviewed commits merged since its release.
+_DEMO_HEAD_BY_TOOL = {
+    "autobench": "9c4f2ae8d1b06f3a7c5e2d4b8a1f0c9e6d3b7a52",
+    "robocop": "7fa9e21c3d5b8a0f2e4c6d8b1a3f5c7e9d2b4a6c",
+}
+_DEMO_AHEAD_BY_TOOL = {"autobench": "5", "robocop": "3"}
 
-    def write(run: dict, events: list[dict]) -> None:
-        run_dir = root / run["run_id"]
+
+def _demo_git(root: Path, *args: str, timeout: float | None = None) -> str | None:
+    del timeout
+    head = _DEMO_HEAD_BY_TOOL.get(root.name)
+    if head is None or not args:
+        return None
+    if args[0] == "rev-parse":
+        return head
+    if args[0] == "ls-remote":
+        return f"{head}\trefs/heads/main"
+    if args[0] == "rev-list":
+        return _DEMO_AHEAD_BY_TOOL.get(root.name)
+    return None
+
+
+def build_demo_checkouts() -> list[Path]:
+    """Two fabricated tool checkouts (autobench, robocop), each with its own ledger."""
+    base = Path(tempfile.mkdtemp(prefix="edge-console-demo-"))
+    try:  # standalone by design (ADR-0008); demo just mirrors the installed version
+        from edge_deploy import __version__ as engine_version
+    except Exception:
+        engine_version = "unknown"
+    engine = {"version": engine_version, "package_dir": "(demo)", "content_sha256": "d3m0" + "0" * 60}
+
+    checkouts: dict[str, Path] = {}
+    for tool in ("autobench", "robocop"):
+        checkout = base / tool
+        (checkout / "edge-deploy" / "runs").mkdir(parents=True)
+        (checkout / "edge_deploy.yaml").write_text(f"tool: {tool}\n", encoding="utf-8")
+        checkouts[tool] = checkout
+
+    def write(
+        run: dict,
+        events: list[dict],
+        *,
+        lock: dict | None = None,
+        progress: dict | None = None,
+    ) -> None:
+        run_dir = checkouts[run["tool"]] / "edge-deploy" / "runs" / run["run_id"]
         run_dir.mkdir(parents=True)
         (run_dir / "state.json").write_text(json.dumps(run, indent=2), encoding="utf-8")
         lines = "".join(json.dumps(e) + "\n" for e in events)
         (run_dir / "events.jsonl").write_text(lines, encoding="utf-8")
+        if lock:
+            (run_dir / "run.lock").write_text(json.dumps(lock), encoding="utf-8")
+        if progress:
+            (run_dir / "release-progress.json").write_text(
+                json.dumps(progress, indent=2), encoding="utf-8"
+            )
 
-    # 1) Open autobench release, mid-deploy: one node failed smoke.
+    def rollout_evidence(tool: str, node: str, status: str, sha: str, **overrides: object) -> dict:
+        # Mirrors release._compact_rollout: the deploy phase stores each
+        # node's compact rollout report verbatim as ledger evidence.
+        evidence: dict = {
+            "tool": tool,
+            "node": node,
+            "status": status,
+            "state_left": "",
+            "deployment_commit": sha,
+            "previous_remote_commit": "5f01d77c2a9b4e6d8f3a1c5b7e9d2f4a6c8b0d1e",
+            "sensitive_changed": [],
+            "drift": "passed",
+            "smoke": "passed",
+            "report_path": f"(demo)/rollout-{tool}-{node}.json",
+            "dependency": None,
+        }
+        evidence.update(overrides)
+        return evidence
+
+    # 1) Open autobench release, mid-deploy: one node rolled out but failed
+    #    verification, one is mid-rollout with a dependency bundle streaming
+    #    over SFTP (ADR-0014) — so the lock is held and progress is live.
     sha_a = "9c4f2ae8d1b06f3a7c5e2d4b8a1f0c9e6d3b7a52"
-    snap_a = "9c4f2ae8d1b06f3a7c5e2d4b8a1f0c9e6d3b7a52"
+    snap_a = sha_a
     write(
         {
             "schema": _SCHEMA,
             "run_id": "run-20260707T131512Z-9c4f2ae",
             "tool": "autobench",
             "source_sha": sha_a,
-            "operator": "pedro.chagas",
+            "operator": "pedro.chagas@mastercard.com",
             "created_at": "2026-07-07T13:15:12+00:00",
             "kind": "release",
             "rollback_tag": None,
             "engine": engine,
-            "nodes": ["03", "04", "05"],
+            "nodes": ["node03", "node04", "node05"],
             "status": "open",
             "abandon_reason": None,
             "phases": {
-                "verify": _demo_phase("passed", "2026-07-07T13:16:02+00:00"),
+                "verify": _demo_phase(
+                    "passed",
+                    "2026-07-07T13:16:02+00:00",
+                    {"commit": sha_a, "ci": "success", "tests": "passed",
+                     "verified_at": "2026-07-07T13:16:02+00:00"},
+                ),
                 "publish": _demo_phase(
                     "passed",
                     "2026-07-07T13:31:44+00:00",
@@ -230,100 +332,188 @@ def build_demo_ledger() -> Path:
                     },
                 ),
                 "deploy": {
-                    "03": _demo_phase(
+                    "node03": _demo_phase(
                         "passed",
                         "2026-07-07T13:40:19+00:00",
-                        {"final_commit": snap_a, "drift": "clean", "smoke": "passed"},
+                        rollout_evidence("autobench", "node03", "rolled_out", snap_a),
                     ),
-                    "04": _demo_phase(
+                    "node04": _demo_phase(
                         "failed",
                         "2026-07-07T13:44:51+00:00",
-                        {"step": "smoke", "detail": "standard smoke exited 2 (hive connectivity)"},
+                        rollout_evidence(
+                            "autobench", "node04", "failed", snap_a,
+                            state_left="rolled out but verification failed: smoke:hive_connectivity",
+                            smoke="failed",
+                        ),
                     ),
-                    "05": _demo_phase("pending", None),
+                    "node05": _demo_phase("pending", None),
                 },
                 "tag_bitbucket": _demo_phase("pending", None),
                 "tag_github": _demo_phase("pending", None),
             },
         },
+        # The engine only ledgers run_created / phase_entered / phase_skipped /
+        # lock_stolen / run_abandoned / run_completed; outcomes live in
+        # state.json phases, not the event log.
         [
             {"ts": "2026-07-07T13:15:12+00:00", "event": "run_created", "phase": None, "node": None},
-            {"ts": "2026-07-07T13:16:02+00:00", "event": "phase_passed", "phase": "verify", "node": None},
-            {"ts": "2026-07-07T13:29:10+00:00", "event": "posture_ok", "phase": "publish", "node": None},
-            {"ts": "2026-07-07T13:31:44+00:00", "event": "phase_passed", "phase": "publish", "node": None},
-            {"ts": "2026-07-07T13:40:19+00:00", "event": "phase_passed", "phase": "deploy", "node": "03"},
-            {"ts": "2026-07-07T13:44:51+00:00", "event": "phase_failed", "phase": "deploy", "node": "04",
-             "detail": "smoke exited 2"},
+            {"ts": "2026-07-07T13:15:40+00:00", "event": "phase_entered", "phase": "verify", "node": None},
+            {"ts": "2026-07-07T13:29:10+00:00", "event": "phase_entered", "phase": "publish", "node": None},
+            {"ts": "2026-07-07T13:33:05+00:00", "event": "phase_entered", "phase": "deploy", "node": None},
+            {"ts": "2026-07-07T13:45:58+00:00", "event": "phase_entered", "phase": "deploy", "node": None},
         ],
+        lock={"pid": 21440, "hostname": "MC-L-OPERATOR", "acquired_at": "2026-07-07T13:45:58+00:00"},
+        progress={
+            "schema": "edge-deploy/release-progress/1",
+            "updated_at": "2026-07-07T13:47:21+00:00",
+            "elapsed_s": 83.0,
+            "active": {
+                "phase": "rollout",
+                "label": "rollout autobench/node05",
+                "tool": "autobench",
+                "node": "node05",
+                "tmux_session": None,
+                "last_meaningful_output_at": "2026-07-07T13:47:21+00:00",
+                "waiting_on": None,
+                "transfer": {
+                    "artifact": "autobench dependency bundle",
+                    "bytes_sent": 27262976,
+                    "total_bytes": 44040192,
+                    "percent": 61.9,
+                    "bytes_per_second": 419430.4,
+                    "updated_at": "2026-07-07T13:47:21+00:00",
+                },
+            },
+            "inactive_s": 1.2,
+        },
     )
 
-    # 2) Open dispatch release, waiting at the first wall crossing.
+    # 2) Completed robocop release: the deployed baseline that robocop's
+    #    divergence card is judged against (the fabricated git answers say
+    #    three reviewed commits have merged since, so with no open run the
+    #    console suggests a release and shows the start-a-release guide).
     sha_b = "41d9b0c7e2f5a8d1b4c7e0f3a6d9b2c5e8f1a4d7"
+    tag_b = "release-20260707T153012Z-41d9b0c"
     write(
         {
             "schema": _SCHEMA,
             "run_id": "run-20260707T140233Z-41d9b0c",
-            "tool": "dispatch",
+            "tool": "robocop",
             "source_sha": sha_b,
-            "operator": "pedro.chagas",
+            "operator": "pedro.chagas@mastercard.com",
             "created_at": "2026-07-07T14:02:33+00:00",
             "kind": "release",
             "rollback_tag": None,
             "engine": engine,
-            "nodes": ["03", "04"],
-            "status": "open",
+            "nodes": ["node03", "node04"],
+            "status": "complete",
             "abandon_reason": None,
             "phases": {
-                "verify": _demo_phase("passed", "2026-07-07T14:03:20+00:00"),
-                "publish": _demo_phase("pending", None),
+                "verify": _demo_phase(
+                    "passed",
+                    "2026-07-07T14:03:20+00:00",
+                    {"commit": sha_b, "ci": "success", "tests": "passed",
+                     "verified_at": "2026-07-07T14:03:20+00:00"},
+                ),
+                "publish": _demo_phase(
+                    "passed",
+                    "2026-07-07T14:21:08+00:00",
+                    {
+                        "snapshot_sha": sha_b,
+                        "source_commit": sha_b,
+                        "previous_remote_commit": "b82c1f04a7d3e6b9c2f5a8d1e4b7c0f3a6d9b2c5",
+                    },
+                ),
                 "deploy": {
-                    "03": _demo_phase("pending", None),
-                    "04": _demo_phase("pending", None),
+                    "node03": _demo_phase(
+                        "passed", "2026-07-07T14:39:47+00:00",
+                        rollout_evidence("robocop", "node03", "rolled_out", sha_b),
+                    ),
+                    "node04": _demo_phase(
+                        "passed", "2026-07-07T14:52:30+00:00",
+                        rollout_evidence("robocop", "node04", "rolled_out", sha_b),
+                    ),
                 },
-                "tag_bitbucket": _demo_phase("pending", None),
-                "tag_github": _demo_phase("pending", None),
+                "tag_bitbucket": _demo_phase(
+                    "passed", "2026-07-07T14:58:11+00:00", {"tag": tag_b, "pushed_sha": sha_b}
+                ),
+                "tag_github": _demo_phase(
+                    "passed", "2026-07-07T15:30:12+00:00", {"tag": tag_b, "pushed_sha": sha_b}
+                ),
             },
         },
         [
             {"ts": "2026-07-07T14:02:33+00:00", "event": "run_created", "phase": None, "node": None},
-            {"ts": "2026-07-07T14:03:20+00:00", "event": "phase_passed", "phase": "verify", "node": None},
-            {"ts": "2026-07-07T14:05:41+00:00", "event": "posture_blocked", "phase": "publish", "node": None,
-             "detail": "bitbucket unreachable; awaiting posture switch"},
+            {"ts": "2026-07-07T14:02:41+00:00", "event": "phase_entered", "phase": "verify", "node": None},
+            {"ts": "2026-07-07T14:19:52+00:00", "event": "phase_entered", "phase": "publish", "node": None},
+            {"ts": "2026-07-07T14:23:31+00:00", "event": "phase_entered", "phase": "deploy", "node": None},
+            {"ts": "2026-07-07T14:57:48+00:00", "event": "phase_entered", "phase": "tag_bitbucket", "node": None},
+            {"ts": "2026-07-07T15:29:40+00:00", "event": "phase_entered", "phase": "tag_github", "node": None},
+            {"ts": "2026-07-07T15:30:12+00:00", "event": "run_completed", "phase": None, "node": None},
         ],
     )
 
-    # 3) Completed rollback.
+    # 3) Completed rollback. Publish is seeded "passed" at run creation (the
+    #    rollback tag supplies the snapshot); verify is entered, then skipped.
     sha_c = "5f01d77c2a9b4e6d8f3a1c5b7e9d2f4a6c8b0d1e"
+    rollback_tag = "release-20260622T110402Z-5f01d77"
+    minted_tag = "release-20260630T094001Z-5f01d77"
     write(
         {
             "schema": _SCHEMA,
             "run_id": "run-20260630T091501Z-5f01d77",
             "tool": "autobench",
             "source_sha": sha_c,
-            "operator": "pedro.chagas",
+            "operator": "pedro.chagas@mastercard.com",
             "created_at": "2026-06-30T09:15:01+00:00",
             "kind": "rollback",
-            "rollback_tag": "release-20260622T110402Z-5f01d77",
+            "rollback_tag": rollback_tag,
             "engine": engine,
-            "nodes": ["03", "04", "05"],
+            "nodes": ["node03", "node04", "node05"],
             "status": "complete",
             "abandon_reason": None,
             "phases": {
-                "verify": _demo_phase("skipped", "2026-06-30T09:15:20+00:00"),
+                "verify": _demo_phase(
+                    "skipped",
+                    "2026-06-30T09:15:20+00:00",
+                    {
+                        "reason": "rollback tag provides reviewed source and snapshot SHA",
+                        "rollback_tag": rollback_tag,
+                        "source_sha": sha_c,
+                    },
+                ),
                 "publish": _demo_phase(
-                    "passed", "2026-06-30T09:22:10+00:00", {"snapshot_sha": sha_c, "source_commit": sha_c}
+                    "passed", "2026-06-30T09:15:01+00:00", {"snapshot_sha": sha_c, "source_commit": sha_c}
                 ),
                 "deploy": {
-                    "03": _demo_phase("passed", "2026-06-30T09:30:05+00:00", {"final_commit": sha_c}),
-                    "04": _demo_phase("passed", "2026-06-30T09:33:41+00:00", {"final_commit": sha_c}),
-                    "05": _demo_phase("passed", "2026-06-30T09:37:12+00:00", {"final_commit": sha_c}),
+                    "node03": _demo_phase(
+                        "passed", "2026-06-30T09:30:05+00:00",
+                        rollout_evidence("autobench", "node03", "rolled_out", sha_c),
+                    ),
+                    "node04": _demo_phase(
+                        "passed", "2026-06-30T09:33:41+00:00",
+                        rollout_evidence("autobench", "node04", "rolled_out", sha_c),
+                    ),
+                    "node05": _demo_phase(
+                        "passed", "2026-06-30T09:37:12+00:00",
+                        rollout_evidence("autobench", "node05", "rolled_out", sha_c),
+                    ),
                 },
-                "tag_bitbucket": _demo_phase("passed", "2026-06-30T09:40:02+00:00"),
-                "tag_github": _demo_phase("passed", "2026-06-30T09:55:47+00:00"),
+                "tag_bitbucket": _demo_phase(
+                    "passed", "2026-06-30T09:40:02+00:00", {"tag": minted_tag, "pushed_sha": sha_c}
+                ),
+                "tag_github": _demo_phase(
+                    "passed", "2026-06-30T09:55:47+00:00", {"tag": minted_tag, "pushed_sha": sha_c}
+                ),
             },
         },
         [
             {"ts": "2026-06-30T09:15:01+00:00", "event": "run_created", "phase": None, "node": None},
+            {"ts": "2026-06-30T09:15:12+00:00", "event": "phase_entered", "phase": "verify", "node": None},
+            {"ts": "2026-06-30T09:15:20+00:00", "event": "phase_skipped", "phase": "verify", "node": None},
+            {"ts": "2026-06-30T09:21:44+00:00", "event": "phase_entered", "phase": "deploy", "node": None},
+            {"ts": "2026-06-30T09:39:30+00:00", "event": "phase_entered", "phase": "tag_bitbucket", "node": None},
+            {"ts": "2026-06-30T09:55:02+00:00", "event": "phase_entered", "phase": "tag_github", "node": None},
             {"ts": "2026-06-30T09:55:47+00:00", "event": "run_completed", "phase": None, "node": None},
         ],
     )
@@ -333,22 +523,22 @@ def build_demo_ledger() -> Path:
         {
             "schema": _SCHEMA,
             "run_id": "run-20260629T160248Z-b82c1f0",
-            "tool": "dispatch",
+            "tool": "robocop",
             "source_sha": "b82c1f04a7d3e6b9c2f5a8d1e4b7c0f3a6d9b2c5",
-            "operator": "pedro.chagas",
+            "operator": "pedro.chagas@mastercard.com",
             "created_at": "2026-06-29T16:02:48+00:00",
             "kind": "release",
             "rollback_tag": None,
-            "engine": {**engine, "version": "1.3.0"},
-            "nodes": ["03", "04"],
+            "engine": {**engine, "version": "1.4.0"},
+            "nodes": ["node03", "node04"],
             "status": "abandoned",
-            "abandon_reason": "engine identity changed (1.3.0 -> 1.4.0); recreate the run",
+            "abandon_reason": f"engine identity changed (1.4.0 -> {engine_version}); recreate the run",
             "phases": {
                 "verify": _demo_phase("passed", "2026-06-29T16:03:30+00:00"),
                 "publish": _demo_phase("pending", None),
                 "deploy": {
-                    "03": _demo_phase("pending", None),
-                    "04": _demo_phase("pending", None),
+                    "node03": _demo_phase("pending", None),
+                    "node04": _demo_phase("pending", None),
                 },
                 "tag_bitbucket": _demo_phase("pending", None),
                 "tag_github": _demo_phase("pending", None),
@@ -356,11 +546,187 @@ def build_demo_ledger() -> Path:
         },
         [
             {"ts": "2026-06-29T16:02:48+00:00", "event": "run_created", "phase": None, "node": None},
+            {"ts": "2026-06-29T16:03:02+00:00", "event": "phase_entered", "phase": "verify", "node": None},
             {"ts": "2026-06-30T08:58:12+00:00", "event": "run_abandoned", "phase": None, "node": None,
-             "reason": "engine identity changed"},
+             "reason": f"engine identity changed (1.4.0 -> {engine_version})"},
         ],
     )
-    return root
+    return [checkouts["autobench"], checkouts["robocop"]]
+
+
+# ---------------------------------------------------------------------------
+# Release guidance: which tools have drifted from the deployed state.
+# Read-only git, matching the console's no-writes contract: rev-parse and
+# rev-list stay local; ls-remote asks GitHub main, which is a github-read
+# action and so works in every posture (ADR-0013).
+# ---------------------------------------------------------------------------
+
+_GIT_TIMEOUT = 10.0
+_TOOLS_CACHE_SECONDS = 30.0
+_TOOL_NAME_RE = re.compile(r"^tool:\s*[\"']?([A-Za-z0-9_-]+)", re.MULTILINE)
+
+
+def _git(root: Path, *args: str, timeout: float = _GIT_TIMEOUT) -> str | None:
+    """Run one read-only git command; None on any failure (never raises)."""
+    env = dict(os.environ)
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")  # never block on a credential prompt
+    env.setdefault("GCM_INTERACTIVE", "never")
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip() or None
+
+
+def _tool_name(root: Path, runs: list[dict]) -> str:
+    """The checkout's tool: its committed profile, else the ledger, else the directory."""
+    try:
+        match = _TOOL_NAME_RE.search((root / "edge_deploy.yaml").read_text(encoding="utf-8"))
+    except OSError:
+        match = None
+    if match:
+        return match.group(1)
+    dated = sorted(runs, key=lambda r: r["state"].get("created_at", ""), reverse=True)
+    for run in dated:
+        tool = run["state"].get("tool")
+        if tool:
+            return str(tool)
+    return root.name
+
+
+def _last_deployed(runs: list[dict]) -> dict | None:
+    """The newest complete run: what the Edge Nodes are believed to hold.
+
+    Rollbacks count — a completed rollback's source_sha *is* the deployed state.
+    """
+    complete = [r["state"] for r in runs if r["state"].get("status") == "complete"]
+    if not complete:
+        return None
+    last = max(complete, key=lambda s: s.get("created_at", ""))
+    return {
+        "sha": last.get("source_sha", ""),
+        "run_id": last.get("run_id", ""),
+        "kind": last.get("kind", "release"),
+        "created_at": last.get("created_at", ""),
+    }
+
+
+def probe_divergence(root: Path, runs: list[dict], *, git=_git) -> dict:
+    """Compare the last-deployed source SHA to checkout HEAD and GitHub main.
+
+    Two independent comparisons: deployed-vs-HEAD says whether a release would
+    ship something new; HEAD-vs-origin/main says whether the checkout and
+    GitHub disagree. Any git failure degrades that fact to None — the UI shows
+    what it cannot know rather than guessing.
+
+    ``ahead`` counts locally (rev-list), so it is exact only when the live
+    ls-remote proves the checkout holds all of GitHub main (``ahead_exact``);
+    when the checkout is stale the count is a lower bound — still exactly what
+    a release would ship right now, since a release ships checkout HEAD.
+
+    When stale, ``stale_direction`` says which side is ahead — but only when
+    GitHub main's commit object exists locally (a prior fetch), because both
+    range counts need it: "local_behind" (pull), "local_ahead" (unpushed work:
+    push/PR first — verify needs green GitHub CI on HEAD), "forked" (both
+    moved), or None when git cannot tell.
+    """
+    deployed = _last_deployed(runs)
+    head = git(root, "rev-parse", "HEAD", timeout=5.0)
+    ls = git(root, "ls-remote", "origin", "refs/heads/main")
+    origin_main = ls.split()[0] if ls else None
+    ahead = None
+    if deployed and deployed["sha"] and head:
+        count = git(root, "rev-list", "--count", f"{deployed['sha']}..HEAD", timeout=5.0)
+        if count and count.isdigit():
+            ahead = int(count)
+    stale = bool(head and origin_main and head != origin_main)
+    ahead_exact = bool(head and origin_main and head == origin_main)
+    stale_direction = None
+    behind_origin = None
+    ahead_of_origin = None
+    if stale:
+        behind_raw = git(root, "rev-list", "--count", f"HEAD..{origin_main}", timeout=5.0)
+        ahead_raw = git(root, "rev-list", "--count", f"{origin_main}..HEAD", timeout=5.0)
+        if behind_raw and behind_raw.isdigit() and ahead_raw and ahead_raw.isdigit():
+            behind_origin = int(behind_raw)
+            ahead_of_origin = int(ahead_raw)
+            if behind_origin and not ahead_of_origin:
+                stale_direction = "local_behind"
+            elif ahead_of_origin and not behind_origin:
+                stale_direction = "local_ahead"
+            elif behind_origin and ahead_of_origin:
+                stale_direction = "forked"
+    if head is None:
+        verdict = "unknown"
+    elif deployed is None:
+        verdict = "never_released"
+    elif head != deployed["sha"]:
+        verdict = "diverged"
+    elif stale:
+        verdict = "checkout_stale"
+    else:
+        verdict = "up_to_date"
+    return {
+        "verdict": verdict,
+        "deployed": deployed,
+        "head": head,
+        "origin_main": origin_main,
+        "ahead": ahead,
+        "ahead_exact": ahead_exact,
+        "stale": stale,
+        "stale_direction": stale_direction,
+        "behind_origin": behind_origin,
+        "ahead_of_origin": ahead_of_origin,
+    }
+
+
+def probe_tool(root: Path, *, git=_git) -> dict:
+    """Everything the tool card needs: identity, open run, nodes, divergence."""
+    runs = collect_runs(root / "edge-deploy" / "runs")
+    open_run = next(
+        (r["state"]["run_id"] for r in runs if r["state"].get("status") == "open"), None
+    )
+    dated = sorted(runs, key=lambda r: r["state"].get("created_at", ""), reverse=True)
+    nodes = list(dated[0]["state"].get("nodes") or []) if dated else []
+    entry = {
+        "root": str(root),
+        "tool": _tool_name(root, runs),
+        "open_run_id": open_run,
+        "nodes": nodes,
+    }
+    entry.update(probe_divergence(root, runs, git=git))
+    return entry
+
+
+class ToolsProber:
+    """Cached per-checkout divergence probe (ls-remote hits the network)."""
+
+    def __init__(self, roots: list[Path], demo: bool) -> None:
+        self._roots = roots
+        self._git = _demo_git if demo else _git
+        self._lock = threading.Lock()
+        self._cached: dict | None = None
+        self._cached_at = 0.0
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            if self._cached and time.monotonic() - self._cached_at < _TOOLS_CACHE_SECONDS:
+                return self._cached
+        with ThreadPoolExecutor(max_workers=max(1, len(self._roots))) as pool:
+            tools = list(pool.map(lambda root: probe_tool(root, git=self._git), self._roots))
+        result = {"probed_at": time.strftime("%H:%M:%SZ", time.gmtime()), "tools": tools}
+        with self._lock:
+            self._cached = result
+            self._cached_at = time.monotonic()
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -369,8 +735,9 @@ def build_demo_ledger() -> Path:
 
 class ConsoleHandler(BaseHTTPRequestHandler):
     server_version = "edge-console"
-    runs_root: Path
+    roots: list[Path]
     prober: PostureProber
+    tools_prober: ToolsProber
     demo: bool
 
     def log_message(self, *args: object) -> None:  # keep the terminal quiet
@@ -393,11 +760,13 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         elif self.path == "/api/runs":
             self._send_json(
                 {
-                    "root": str(self.runs_root),
+                    "roots": [str(root) for root in self.roots],
                     "demo": self.demo,
-                    "runs": collect_runs(self.runs_root),
+                    "runs": collect_runs_multi(self.roots),
                 }
             )
+        elif self.path == "/api/tools":
+            self._send_json({"demo": self.demo, **self.tools_prober.snapshot()})
         elif self.path == "/api/posture":
             self._send_json(self.prober.snapshot())
         else:
@@ -406,24 +775,31 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Read-only posture console for edge-deploy runs")
-    parser.add_argument("--root", default=".", help="Checkout containing edge-deploy/runs (default: cwd)")
+    parser.add_argument(
+        "--root",
+        action="append",
+        default=None,
+        help="Tool checkout containing edge-deploy/runs; repeat to watch several (default: cwd)",
+    )
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 7643)))
-    parser.add_argument("--demo", action="store_true", help="Serve fabricated runs; no network probes")
+    parser.add_argument("--demo", action="store_true", help="Serve fabricated checkouts; no network probes")
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
 
     if args.demo:
-        runs_root = build_demo_ledger()
+        roots = build_demo_checkouts()
     else:
-        runs_root = Path(args.root).resolve() / "edge-deploy" / "runs"
+        roots = [Path(raw).resolve() for raw in (args.root or ["."])]
 
-    ConsoleHandler.runs_root = runs_root
+    ConsoleHandler.roots = roots
     ConsoleHandler.prober = PostureProber(demo=args.demo)
+    ConsoleHandler.tools_prober = ToolsProber(roots, demo=args.demo)
     ConsoleHandler.demo = args.demo
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), ConsoleHandler)
     url = f"http://127.0.0.1:{args.port}/"
-    print(f"edge-console: watching {runs_root}")
+    for root in roots:
+        print(f"edge-console: watching {root / 'edge-deploy' / 'runs'}")
     print(f"edge-console: {url}  (read-only; Ctrl+C to stop)")
     if not args.no_browser:
         webbrowser.open(url)
@@ -465,6 +841,7 @@ PAGE = r"""<!doctype html>
   --pass:#79c98f;
   --fail:#e2685c;
   --pend:#77828f;
+  --warn:#d8a35a;
   --hazard-a:#43371f;
   --hazard-b:#1b1712;
   --mono:"Cascadia Code","Cascadia Mono",Consolas,"SF Mono",ui-monospace,monospace;
@@ -502,7 +879,38 @@ header{border-bottom:1px solid var(--line);background:var(--panel)}
 
 /* ---------- run cards ---------- */
 .rootline{font-family:var(--mono);font-size:11px;color:var(--faint);padding:16px 0 4px}
-.demo-flag{color:var(--corp);border:1px solid var(--corp);border-radius:3px;padding:0 6px;margin-left:8px;font-size:10px;letter-spacing:.1em}
+.demo-flag{color:var(--warn);border:1px solid var(--warn);border-radius:3px;padding:0 6px;margin-left:8px;font-size:10px;letter-spacing:.1em}
+
+/* ---------- tool cards: deployed-state divergence + start-a-release guide ---------- */
+.toolcard{border:1px solid var(--line);border-radius:8px;background:var(--panel);margin-top:14px;overflow:hidden}
+.toolhead{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:baseline;padding:12px 16px 4px}
+.toolname{font-family:var(--mono);font-size:13px;font-weight:600;letter-spacing:.08em;text-transform:uppercase}
+.toolroot{font-family:var(--mono);font-size:10.5px;color:var(--faint);margin-left:auto}
+.verdict{font-size:10px;letter-spacing:.14em;text-transform:uppercase;border:1px solid var(--line);border-radius:3px;padding:1.5px 7px;color:var(--dim)}
+.verdict.ok{color:var(--pass);border-color:var(--pass)}
+.verdict.warn{color:var(--warn);border-color:var(--warn)}
+.verdict.dim{color:var(--faint)}
+.divline{padding:2px 16px 0;font-family:var(--mono);font-size:11px;color:var(--dim)}
+.divline:last-of-type{padding-bottom:12px}
+.divline .warn{color:var(--warn)}
+.divline .ok{color:var(--pass)}
+.divline .sep2{color:var(--faint);padding:0 6px}
+.inflight{padding:2px 16px 12px;font-family:var(--mono);font-size:11px;color:var(--pass)}
+details.guide{border-top:1px solid var(--line)}
+details.guide summary{padding:9px 16px;font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--dim);cursor:pointer;font-weight:600;list-style:none}
+details.guide summary::before{content:"▸ ";color:var(--faint)}
+details.guide[open] summary::before{content:"▾ "}
+details.guide summary:focus-visible{outline:2px solid var(--gh);outline-offset:-2px}
+.gstep{display:flex;gap:10px;align-items:center;padding:6px 16px;flex-wrap:wrap}
+.gstep:last-child{padding-bottom:14px}
+.gstep .gnum{font-family:var(--mono);font-size:11px;color:var(--faint);flex:none;width:14px;text-align:right}
+.gstep .gtext{font-size:12px;color:var(--dim);flex:0 1 auto}
+.gstep .gtext b{color:var(--ink);font-weight:600}
+.gstep code{font-family:var(--mono);font-size:11.5px;background:var(--void);border:1px solid var(--line);border-radius:5px;padding:5px 9px;flex:1 1 300px;overflow-x:auto;white-space:nowrap;scrollbar-width:thin}
+.gstep .opt{font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);border:1px dashed var(--faint);border-radius:3px;padding:1px 5px;flex:none}
+.gstep .readiness{font-family:var(--mono);font-size:10px;color:var(--faint)}
+.gstep .readiness.ok{color:var(--pass)}
+.gstep .readiness.blocked{color:var(--fail)}
 .run{border:1px solid var(--line);border-radius:8px;background:var(--panel);margin-top:18px;overflow:hidden}
 .run.closed{opacity:.62}
 .run.closed:hover{opacity:1}
@@ -513,7 +921,7 @@ header{border-bottom:1px solid var(--line);background:var(--panel)}
 .chip.open{color:var(--pass);border-color:var(--pass)}
 .chip.complete{color:var(--gh);border-color:var(--gh)}
 .chip.abandoned{color:var(--fail);border-color:var(--fail)}
-.chip.lock{color:var(--corp);border-color:var(--corp)}
+.chip.lock{color:var(--warn);border-color:var(--warn)}
 .runmeta{font-family:var(--mono);font-size:11px;color:var(--dim);margin-left:auto}
 
 /* ---------- the posture rail (signature) ---------- */
@@ -550,7 +958,18 @@ header{border-bottom:1px solid var(--line);background:var(--panel)}
 @keyframes gatepulse{0%,100%{outline-color:var(--bb)}50%{outline-color:transparent}}
 @media (prefers-reduced-motion: reduce){.gate.hot{animation:none}}
 
-/* ---------- next command / details ---------- */
+/* ---------- live operation / next command / details ---------- */
+.activeop{display:flex;gap:10px;align-items:center;padding:9px 16px;border-top:1px solid var(--line);flex-wrap:wrap;font-family:var(--mono);font-size:11px;color:var(--dim)}
+.activeop .op-dot{width:8px;height:8px;border-radius:50%;flex:none;background:var(--edge);animation:oppulse 1.6s ease-in-out infinite}
+.activeop.waiting .op-dot{background:var(--warn)}
+.activeop.stalled .op-dot{background:var(--fail);animation:none}
+.activeop .op-label{color:var(--ink)}
+.activeop .op-note{color:var(--dim)}
+.activeop.waiting .op-note{color:var(--warn);letter-spacing:.1em;text-transform:uppercase;font-size:10px;font-weight:600}
+.activeop.stalled .op-note{color:var(--fail)}
+.activeop .op-when{margin-left:auto;color:var(--faint)}
+@keyframes oppulse{0%,100%{opacity:1}50%{opacity:.35}}
+@media (prefers-reduced-motion: reduce){.activeop .op-dot{animation:none}}
 .transfer{display:flex;gap:10px;align-items:center;padding:9px 16px;border-top:1px solid var(--line);flex-wrap:wrap;font-family:var(--mono);font-size:11px;color:var(--dim)}
 .transfer-artifact{flex:none}
 .transfer-bar{flex:1 1 160px;height:6px;background:var(--void);border:1px solid var(--line);border-radius:3px;overflow:hidden}
@@ -607,10 +1026,13 @@ footer code{font-family:var(--mono)}
 
 <main class="wrap">
   <div class="rootline" id="rootline"></div>
+  <div id="tools"></div>
   <div id="runs"></div>
   <footer>TCP reachability is informational: the corporate proxy accepts connects in every
   posture, and TCP cannot see GitHub write (baseline vs firewall-off) — only each phase's
-  git-protocol probe is authoritative (ADR-0012/0013). This console never writes to the ledger.</footer>
+  git-protocol probe is authoritative (ADR-0012/0013). Divergence facts come from read-only
+  git (rev-parse / rev-list locally; ls-remote for GitHub main, a github-read action that
+  works in every posture). This console never writes to the ledger or the checkout.</footer>
 </main>
 
 <script>
@@ -681,15 +1103,15 @@ function nextPhase(run){
 
 function nextCommand(run, phase){
   const id = run.state.run_id;
-  if(phase === "verify")  return `python -m edge_deploy verify --run ${id}`;
-  if(phase === "publish") return `python -m edge_deploy publish-phase --run ${id}`;
+  if(phase === "verify")  return `py -m edge_deploy verify --run ${id}`;
+  if(phase === "publish") return `py -m edge_deploy publish-phase --run ${id}`;
   if(phase === "deploy"){
     const pending = Object.entries(run.state.phases.deploy)
       .filter(([,n]) => n.state !== "passed").map(([name]) => name).sort();
-    return `python -m edge_deploy deploy --run ${id} --nodes ${pending.join(",")}`;
+    return `py -m edge_deploy deploy --run ${id} --nodes ${pending.join(",")}`;
   }
-  if(phase === "tag_bitbucket") return `python -m edge_deploy tag-bitbucket --run ${id}`;
-  if(phase === "tag_github")    return `python -m edge_deploy tag-github --run ${id}`;
+  if(phase === "tag_bitbucket") return `py -m edge_deploy tag-bitbucket --run ${id}`;
+  if(phase === "tag_github")    return `py -m edge_deploy tag-github --run ${id}`;
   return "";
 }
 
@@ -703,12 +1125,21 @@ function stationHtml(run, phase, next){
   const cls = phase === next ? "station next" : "station";
   let body;
   if(phase === "deploy"){
+    // Deploy node keys are operator-config names ("node03"), and evidence is
+    // the node's compact rollout report (release._compact_rollout):
+    // state_left says what a failure left behind; drift/smoke are
+    // "passed" | "failed" | "not_run".
     const nodes = run.state.phases.deploy;
     body = `<div class="nodes">` + Object.keys(nodes).sort().map(name => {
       const n = nodes[name];
-      const detail = n.state === "failed" && n.evidence && n.evidence.detail
-        ? ` title="${esc(n.evidence.detail)}"` : "";
-      return `<span class="state ${esc(n.state)}"${detail}><span class="dot"></span>node ${esc(name)} · ${esc(n.state)}</span>`;
+      const ev = n.evidence || {};
+      const hint = [
+        ev.state_left,
+        ev.drift && ev.drift !== "not_run" ? `drift ${ev.drift}` : "",
+        ev.smoke && ev.smoke !== "not_run" ? `smoke ${ev.smoke}` : "",
+      ].filter(Boolean).join(" · ");
+      const title = hint ? ` title="${esc(hint)}"` : "";
+      return `<span class="state ${esc(n.state)}"${title}><span class="dot"></span>${esc(name)} · ${esc(n.state)}</span>`;
     }).join("") + `</div>`;
   } else {
     const p = run.state.phases[phase];
@@ -744,7 +1175,7 @@ function railHtml(run){
 function eventsHtml(run){
   if(!run.events.length) return "";
   const rows = run.events.slice().reverse().map(e => {
-    const cls = /failed|refused|blocked|abandoned/.test(e.event) ? "ev-failed"
+    const cls = /failed|refused|blocked|abandoned|stolen/.test(e.event) ? "ev-failed"
               : /passed|completed|ok/.test(e.event) ? "ev-passed" : "";
     const where = [e.phase, e.node && `node ${e.node}`].filter(Boolean).join(" · ");
     const extra = Object.entries(e)
@@ -760,20 +1191,43 @@ function eventsHtml(run){
     <div class="events">${rows}</div></details>`;
 }
 
-function transferHtml(run){
+// The live operation from release-progress.json (ADR-0014): the tracker
+// records what the engine is doing right now (auth <node>, publish <tool>,
+// rollout <tool>/<node>, verify <tool>/<node>), whether it is waiting on the
+// operator (RSA prompt), a stall warning, and any in-flight verified binary
+// transfer. active is null once the engine finishes; a crashed process can
+// leave it stale, so the last-update time is always shown.
+function progressHtml(run){
   const progress = run.progress;
-  if(!progress || !progress.active) return "";
-  const transfer = progress.active.transfer;
-  if(!transfer) return "";
-  const percent = Math.max(0, Math.min(100, transfer.percent));
-  const mibSent = (transfer.bytes_sent / (1024*1024)).toFixed(1);
-  const mibTotal = (transfer.total_bytes / (1024*1024)).toFixed(1);
-  const rate = (transfer.bytes_per_second / (1024*1024)).toFixed(2);
-  return `<div class="transfer">
-    <span class="transfer-artifact">${esc(transfer.artifact)}</span>
-    <div class="transfer-bar"><div class="transfer-fill" style="width:${percent}%"></div></div>
-    <span class="transfer-stats">${esc(mibSent)}/${esc(mibTotal)} MiB · ${esc(percent.toFixed(1))}% · ${esc(rate)} MiB/s</span>
+  if(!progress || !progress.active || run.state.status !== "open") return "";
+  const a = progress.active;
+  let cls = "activeop", note = "";
+  if(a.waiting_on === "operator"){
+    cls += " waiting";
+    note = "waiting for operator";
+  } else if(progress.stall_warning){
+    cls += " stalled";
+    note = `stalled · no activity for ${Math.round(progress.inactive_s || 0)}s`;
+  }
+  let html = `<div class="${cls}">
+    <span class="op-dot"></span>
+    <span class="op-label">${esc(a.label || a.phase || "working")}</span>` +
+    (note ? `<span class="op-note">${esc(note)}</span>` : "") +
+    `<span class="op-when">updated ${esc(shortTs(progress.updated_at))}</span>
   </div>`;
+  const transfer = a.transfer;
+  if(transfer){
+    const percent = Math.max(0, Math.min(100, transfer.percent));
+    const mibSent = (transfer.bytes_sent / (1024*1024)).toFixed(1);
+    const mibTotal = (transfer.total_bytes / (1024*1024)).toFixed(1);
+    const rate = (transfer.bytes_per_second / (1024*1024)).toFixed(2);
+    html += `<div class="transfer">
+      <span class="transfer-artifact">${esc(transfer.artifact)}</span>
+      <div class="transfer-bar"><div class="transfer-fill" style="width:${percent}%"></div></div>
+      <span class="transfer-stats">${esc(mibSent)}/${esc(mibTotal)} MiB · ${esc(percent.toFixed(1))}% · ${esc(rate)} MiB/s</span>
+    </div>`;
+  }
+  return html;
 }
 
 function runHtml(run){
@@ -811,7 +1265,7 @@ function runHtml(run){
       <span class="runmeta">source ${esc(st.source_sha.slice(0,7))} · ${esc(st.operator)} · engine ${esc(st.engine && st.engine.version || "?")} · ${esc(shortDate(st.created_at))}</span>
     </div>
     ${railHtml(run)}
-    ${transferHtml(run)}
+    ${progressHtml(run)}
     ${tail}
     ${eventsHtml(run)}
   </article>`;
@@ -874,6 +1328,123 @@ function readinessHtml(req){
             : `<span class="readiness blocked">switch needed</span>`;
 }
 
+/* ---------- tool cards: divergence verdict + start-a-release guide ---------- */
+const VERDICT_CHIP = {
+  up_to_date:     ["up to date", "ok"],
+  diverged:       ["release suggested", "warn"],
+  checkout_stale: ["pull needed", "warn"],
+  never_released: ["never released", "warn"],
+  unknown:        ["no git", "dim"],
+};
+
+function sha7(sha){ return sha ? String(sha).slice(0, 7) : "?"; }
+
+// Which way the checkout and GitHub main disagree, when git can tell.
+function staleReadHtml(t){
+  const commits = c => `${c} commit${c === 1 ? "" : "s"}`;
+  if(t.stale_direction === "local_ahead")
+    return `${commits(t.ahead_of_origin)} not on github main yet — push/PR first (verify needs green CI on HEAD)`;
+  if(t.stale_direction === "local_behind")
+    return `github main is ahead by ${commits(t.behind_origin)} — pull for the full picture`;
+  if(t.stale_direction === "forked")
+    return `checkout and github main have forked (${commits(t.ahead_of_origin)} local-only, ` +
+           `${commits(t.behind_origin)} remote-only) — reconcile first`;
+  return `github main differs — sync the checkout (git can't tell which side is ahead without a fetch)`;
+}
+
+function divergenceHtml(t){
+  const facts = [
+    t.deployed
+      ? `deployed ${sha7(t.deployed.sha)} (${t.deployed.kind} · ${shortDate(t.deployed.created_at)})`
+      : "deployed: no completed run",
+    `checkout ${sha7(t.head)}`,
+    t.origin_main ? `github main ${sha7(t.origin_main)}` : "github main unreachable",
+  ];
+  let read;
+  if(t.verdict === "unknown")
+    read = `<span>git state unavailable — is this directory a checkout?</span>`;
+  else if(t.verdict === "up_to_date")
+    read = `<span class="ok">deployed = checkout = github main — nothing to release</span>`;
+  else if(t.verdict === "never_released")
+    read = `<span class="warn">no completed release recorded — a first release would set the baseline</span>`;
+  else if(t.verdict === "checkout_stale")
+    read = `<span class="warn">checkout matches deployed, but github main differs — ${staleReadHtml(t)}</span>`;
+  else {
+    const n = t.ahead == null ? "commits" : `${t.ahead} commit${t.ahead === 1 ? "" : "s"}`;
+    if(t.stale && t.stale_direction === "local_ahead"){
+      // All of GitHub main is contained in HEAD, so the count is complete —
+      // but part of it is unpushed, and verify needs GitHub CI on HEAD.
+      read = `<span class="warn">${esc(n)} undeployed — release suggested</span>` +
+             `<span class="sep2">·</span><span class="warn">${staleReadHtml(t)}</span>`;
+    } else if(t.stale){
+      // Lower bound: remote-only commits are uncountable without a fetch,
+      // but vs-HEAD is exactly what a release would ship right now.
+      read = `<span class="warn">≥ ${esc(n)} undeployed (vs checkout) — release suggested</span>` +
+             `<span class="sep2">·</span><span class="warn">${staleReadHtml(t)}</span>`;
+    } else {
+      read = `<span class="warn">${esc(n)} undeployed — release suggested</span>`;
+      if(t.ahead != null && t.ahead_exact)
+        read += `<span class="sep2">·</span><span class="ok">count is live — checkout in sync with github main</span>`;
+    }
+  }
+  return `<div class="divline">${facts.map(esc).join(`<span class="sep2">·</span>`)}</div>
+          <div class="divline">${read}</div>`;
+}
+
+// The start-a-release guide (release-workflow.md distilled): shown only when
+// the tool has no open run — an open run's rail already owns "what next".
+function guideHtml(t){
+  if(t.open_run_id)
+    return `<div class="inflight">release in flight — ${esc(t.open_run_id)} (rail below)</div>`;
+  const node = (t.nodes && t.nodes[0]) || "<node>";
+  const suggest = ["diverged", "checkout_stale", "never_released"].includes(t.verdict);
+  const steps = [];
+  let n = 1;
+  const step = (text, cmd, opt) => steps.push(
+    `<div class="gstep"><span class="gnum">${n++}</span>` +
+    (opt ? `<span class="opt">optional</span>` : "") +
+    `<span class="gtext">${text}</span>` +
+    (cmd ? `<code>${esc(cmd)}</code><button class="copy" data-cmd="${esc(cmd)}">copy</button>` : "") +
+    `</div>`);
+  if(t.stale || t.verdict === "checkout_stale"){
+    if(t.stale_direction === "local_ahead")
+      step(`push the local commits through review — release verify requires HEAD on github main with green CI`,
+           `cd "${t.root}"; git push origin main`, false);
+    else if(t.stale_direction === "forked")
+      step(`reconcile — checkout and github main have forked`,
+           `cd "${t.root}"; git pull --rebase origin main`, false);
+    else
+      step(`pull — github main ${t.stale_direction === "local_behind" ? "is ahead of" : "differs from"} the checkout`,
+           `cd "${t.root}"; git pull origin main`, false);
+  }
+  step(`switch posture to <b>both-vpns</b> — the guided release then needs exactly one more
+        switch (firewall-off, for tag-github) ${readinessHtml("both")}`, null, false);
+  step(`check the node is reachable`,
+       `py -m edge_deploy preflight --node ${node}`, true);
+  step(`smoke the Paramiko transport before trusting the node`,
+       `py -m edge_deploy transport-smoke --node ${node}`, true);
+  step(`start the guided release — one command that walks every posture switch and RSA prompt`,
+       `cd "${t.root}"; py -m edge_deploy release --guided`, false);
+  return `<details class="guide" data-key="${esc(t.tool)}" data-suggest="${suggest ? 1 : 0}">
+    <summary>start a release · ${suggest ? "suggested" : "when needed"}</summary>
+    ${steps.join("")}</details>`;
+}
+
+function toolCardHtml(t){
+  let [chipText, chipCls] = VERDICT_CHIP[t.verdict] || ["?", "dim"];
+  if(t.verdict === "checkout_stale" && t.stale_direction === "local_ahead")
+    [chipText, chipCls] = ["push needed", "warn"];
+  return `<article class="toolcard">
+    <div class="toolhead">
+      <span class="toolname">${esc(t.tool)}</span>
+      <span class="verdict ${chipCls}">${esc(chipText)}</span>
+      <span class="toolroot">${esc(t.root)}</span>
+    </div>
+    ${divergenceHtml(t)}
+    ${guideHtml(t)}
+  </article>`;
+}
+
 /* ---------- polling ---------- */
 let lastRuns = "";
 async function pollRuns(){
@@ -882,30 +1453,46 @@ async function pollRuns(){
     const data = await res.json();
     const raw = JSON.stringify(data);
     document.getElementById("rootline").innerHTML =
-      `watching ${esc(data.root)}` + (data.demo ? `<span class="demo-flag">demo data</span>` : "");
+      `watching ${data.roots.map(esc).join(`<span style="color:var(--line)"> · </span>`)}` +
+      (data.demo ? `<span class="demo-flag">demo data</span>` : "");
     if(raw === lastRuns) return;
     lastRuns = raw;
     const openLogs = new Set([...document.querySelectorAll("details.log[open]")].map(d => d.dataset.key));
     const el = document.getElementById("runs");
     if(!data.runs.length){
-      el.innerHTML = `<div class="empty">No runs under <code>${esc(data.root)}</code>.<br><br>
-        Start one from the tool checkout: <code>python -m edge_deploy release --tool autobench</code></div>`;
+      el.innerHTML = `<div class="empty">No runs under the watched checkouts.<br><br>
+        Use a <b>start a release</b> panel above, or run
+        <code>py -m edge_deploy release --guided</code> from a tool checkout.</div>`;
       return;
     }
     el.innerHTML = data.runs.map(runHtml).join("");
     for(const d of el.querySelectorAll("details.log")) if(openLogs.has(d.dataset.key)) d.open = true;
-    for(const b of el.querySelectorAll("button.copy")){
-      b.addEventListener("click", async () => {
-        try{ await navigator.clipboard.writeText(b.dataset.cmd); }
-        catch(_e){
-          const t = document.createElement("textarea");
-          t.value = b.dataset.cmd; document.body.appendChild(t); t.select();
-          document.execCommand("copy"); t.remove();
-        }
-        b.textContent = "copied"; setTimeout(() => { b.textContent = "copy"; }, 1400);
-      });
-    }
   }catch(_e){ /* server briefly gone; keep last render */ }
+}
+
+// Tool cards re-render on data change (30s cadence: git + ls-remote are
+// cached server-side) and on posture change (the guide's readiness marker).
+// A guide the operator opened or closed stays that way; a "suggested" guide
+// opens itself only on the first render.
+let toolsData = null, lastTools = "";
+function renderTools(){
+  const el = document.getElementById("tools");
+  if(!toolsData || !toolsData.tools || !toolsData.tools.length){ el.innerHTML = ""; return; }
+  const openKeys = new Set([...el.querySelectorAll("details.guide[open]")].map(d => d.dataset.key));
+  const firstRender = !el.childElementCount;
+  el.innerHTML = toolsData.tools.map(toolCardHtml).join("");
+  for(const d of el.querySelectorAll("details.guide")){
+    if(openKeys.has(d.dataset.key) || (firstRender && d.dataset.suggest === "1")) d.open = true;
+  }
+}
+async function pollTools(){
+  try{
+    const res = await fetch("/api/tools");
+    const data = await res.json();
+    const raw = JSON.stringify(data);
+    toolsData = data;
+    if(raw !== lastTools){ lastTools = raw; renderTools(); }
+  }catch(_e){ /* keep last render */ }
 }
 
 async function pollPosture(){
@@ -918,13 +1505,27 @@ async function pollPosture(){
     document.getElementById("posture").innerHTML = postureHtml(p);
     document.getElementById("pstrip").innerHTML = pstripHtml(inf);
     document.getElementById("pnote").innerHTML = postureNote(p, inf);
-    if(capsChanged){ lastRuns = ""; pollRuns(); }  // refresh readiness markers
+    if(capsChanged){ lastRuns = ""; pollRuns(); renderTools(); }  // refresh readiness markers
   }catch(_e){ /* ignore */ }
 }
 
-pollRuns(); pollPosture();
+// One delegated copy handler outlives every re-render.
+document.addEventListener("click", async ev => {
+  const b = ev.target.closest("button.copy");
+  if(!b) return;
+  try{ await navigator.clipboard.writeText(b.dataset.cmd); }
+  catch(_e){
+    const t = document.createElement("textarea");
+    t.value = b.dataset.cmd; document.body.appendChild(t); t.select();
+    document.execCommand("copy"); t.remove();
+  }
+  b.textContent = "copied"; setTimeout(() => { b.textContent = "copy"; }, 1400);
+});
+
+pollRuns(); pollPosture(); pollTools();
 setInterval(pollRuns, 3000);
 setInterval(pollPosture, 20000);
+setInterval(pollTools, 30000);
 </script>
 </body>
 </html>

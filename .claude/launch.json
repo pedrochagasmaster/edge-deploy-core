@@ -18,6 +18,17 @@
       "runtimeExecutable": "python",
       "runtimeArgs": ["edge_console.py", "--root", "D:\\Projects\\autobench", "--no-browser"],
       "autoPort": true
+    },
+    {
+      "name": "edge-console-real",
+      "runtimeExecutable": "python",
+      "runtimeArgs": [
+        "edge_console.py",
+        "--root", "D:\\Projects\\autobench",
+        "--root", "D:\\Projects\\robocop",
+        "--no-browser"
+      ],
+      "autoPort": true
     }
   ]
 }
