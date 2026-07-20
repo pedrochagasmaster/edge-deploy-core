@@ -16,7 +16,7 @@ update your row when done.
 |------|-------|----------|--------|------------|--------|
 | 001 | Hermetic money-path tests in CI | P1 | M | — | DONE (absorbed by PR-16 fake-driver rework) |
 | 002 | Stage-evidence linewrap | P1 | M | — | DONE (absorbed by PR-14/16; D8 protocol replaced screen parsing) |
-| 003 | CI gates: ruff, parallel pytest, honest failures (+2026-07-07 addendum: pip cache, pre-fix `runner.py:44` E501) | P1 | S | — | TODO (re-verified valid 2026-07-07) |
+| 003 | CI gates: ruff, parallel pytest, honest failures (+2026-07-07 addendum: pip cache, pre-fix `runner.py:44` E501) | P1 | S | — | REJECTED (parallel release-gate premise superseded by 013; replan remaining Ruff/cache work separately) |
 | 004 | Release-ledger architecture (M1–M5) | P0 | XL | — | DONE (landed as ADR-0008/0012, v1.3.0 phases) |
 | 005 | Release-ledger PR breakdown | P0 | — | 004 | DONE (companion to 004) |
 | 006 | Paramiko persistent-SSH prototype | P2 | M | — | DONE (spike verdict recorded in the plan file; productized via 011) |
@@ -26,6 +26,7 @@ update your row when done.
 | 010 | Transient-secret redaction registry | P2 | S–M | — | TODO |
 | 011 | Paramiko transport productization (Transport seam, M0 gates, pane fallback) | P1 | L | 006 (verdict = M0), 007 recommended first | DONE (landed as ADR-0014, v1.5.0: RemoteTransport seam, Paramiko default, pane fallback, transport-smoke; shipped before 007) |
 | 012 | Reuse durable verification and preserve publish diagnostics | P1 | M | — | DONE (landed as #34) |
+| 013 | Tool-owned deterministic Windows verification | P0 | L | 012 (done) | DONE (Robocop + edge-deploy-core implementation branches ready for review) |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
 
@@ -44,6 +45,11 @@ Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJE
   and risk notes live in `006-paramiko-persistent-ssh-prototype.md`. It
   shipped ahead of 007, so drift still reads over the pane protocol on
   `transport: pane` nodes — 007 remains worthwhile on its own.
+- 013 supersedes Plan 003's recommendation to make parallel pytest the
+  release/CI parity command. The 2026-07-17 Robocop release attempt proved
+  that engine-owned `-n 8` flags diverge from the tool's committed Windows
+  gate and can hang after CI passes. Treat Plan 003 as stale until its Ruff
+  and pip-cache pieces are extracted into a verification-neutral plan.
 
 ## Direction options (maintainer decision, not ranked against fixes)
 

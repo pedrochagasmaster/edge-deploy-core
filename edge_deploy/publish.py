@@ -22,9 +22,7 @@ shared :func:`~edge_deploy.reporting.redact` masks ``token=`` for defence in dep
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
-import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -32,14 +30,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from edge_deploy.config import ToolProfile
-from edge_deploy.python_env import repo_venv_python
+from edge_deploy.local_check import LocalCheckUnavailableError
+from edge_deploy.local_check import run_local_check as execute_local_check
 
 # A git seam: takes an argv (without the leading ``git``) and returns stdout, raising
 # :class:`PublishError` on a nonzero exit. Injectable so tests never shell out to git.
 GitRunner = Callable[[Sequence[str]], str]
 
-LOCAL_CHECK_RELATIVE = Path("tools") / "dev" / "local_check.ps1"
-LOCAL_CHECK_OUTPUT_TAIL_LINES = 20
 AMBIGUOUS_PUSH_FAILURE_MARKERS = (
     "connection was reset",
     "unexpected disconnect",
@@ -97,20 +94,6 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _resolve_powershell() -> str | None:
-    """Return the first available PowerShell binary: ``pwsh`` (cross-platform) then ``powershell``."""
-    for candidate in ("pwsh", "powershell"):
-        path = shutil.which(candidate)
-        if path:
-            return path
-    return None
-
-
-def _output_tail_text(text: str, *, limit: int = LOCAL_CHECK_OUTPUT_TAIL_LINES) -> str:
-    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
-    return "\n".join(lines[-limit:])
-
-
 def _is_generated_release_report_status(line: str) -> bool:
     return line.startswith("?? edge-deploy/reports/")
 
@@ -149,44 +132,10 @@ def run_local_check_ps1(repo_root: Path) -> int:
     and **fails loudly** (rather than silently skipping the gate) when neither shell or the
     script is present — a silent skip would let an unverified build publish (Risk #6).
     """
-    return _run_local_check_ps1(repo_root)[0]
-
-
-def _run_local_check_ps1(repo_root: Path) -> tuple[int, str]:
-    repo_root = Path(repo_root)
-    script = repo_root / LOCAL_CHECK_RELATIVE
-    if not script.is_file():
-        raise PublishError(
-            f"local_check gate script not found: {script}. "
-            "Commit tools/dev/local_check.ps1 or pass --no-local-check to bypass the gate."
-        )
-    shell = _resolve_powershell()
-    if shell is None:
-        raise PublishError(
-            "Cannot run the local_check gate: neither 'pwsh' nor 'powershell' is on PATH. "
-            "Install PowerShell or pass --no-local-check to bypass the gate."
-        )
-    venv_python = repo_venv_python(repo_root)
-    shim_dir: Path | None = None
-    env = os.environ.copy()
-    if venv_python is not None:
-        shim_dir = Path(tempfile.mkdtemp(prefix="edge-deploy-pyshim-", dir=repo_root))
-        shim = shim_dir / "py.cmd"
-        shim.write_text(f'@"{venv_python}" %*\n', encoding="utf-8")
-        env["PATH"] = str(shim_dir) + os.pathsep + env.get("PATH", "")
     try:
-        completed = subprocess.run(
-            [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
-            cwd=str(repo_root),
-            capture_output=True,
-            text=True,
-            env=env,
-        )
-        output_tail = _output_tail_text(completed.stdout + completed.stderr)
-        return completed.returncode, output_tail
-    finally:
-        if shim_dir is not None:
-            shutil.rmtree(shim_dir, ignore_errors=True)
+        return execute_local_check(repo_root).exit_code
+    except LocalCheckUnavailableError as exc:
+        raise PublishError(f"{exc}; pass --no-local-check to bypass the publish gate") from exc
 
 
 def _default_git_runner(repo_root: str | Path) -> GitRunner:
@@ -267,7 +216,14 @@ def publish_snapshot(
     local_check_output_tail = ""
     if run_local_check:
         if local_check_runner is run_local_check_ps1:
-            code, local_check_output_tail = _run_local_check_ps1(repo_root)
+            try:
+                result = execute_local_check(repo_root)
+            except LocalCheckUnavailableError as exc:
+                raise PublishError(
+                    f"{exc}; pass --no-local-check to bypass the publish gate"
+                ) from exc
+            code = result.exit_code
+            local_check_output_tail = result.output_tail
         else:
             code = local_check_runner(repo_root)
         local_check_passed = code == 0

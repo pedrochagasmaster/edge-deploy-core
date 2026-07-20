@@ -20,8 +20,9 @@ Releases are **run-ledger state machines** (ADR-0008) advanced by posture-scoped
 phase commands:
 
 1. Create or resume a run under `edge-deploy/runs/<run-id>/`.
-2. `verify` — clean local `main`, GitHub CI, pytest (once per SHA unless
-   `--reverify`).
+2. `verify` — bind the exact source SHA, require its GitHub CI, then run the
+   source-bound `tools/dev/local_check.ps1` once (unless explicitly
+   `--reverify`; ADR-0016).
 3. `publish-phase` — tree-equivalent snapshot to Bitbucket `main` (ADR-0007).
 4. `deploy` — per node: auth broker → dependency bundle → checkout update →
    install → smoke → drift (ADR-0009 runner file evidence).
@@ -49,6 +50,8 @@ until continued (`--run`), abandoned, or completed.
 - `remote_paths.py`: canonical `~/.edge-deploy` release-owned remote paths
 - `runner.py`: on-node step executor and D8 read protocol
 - `repository.py`: canonical checkout and GitHub CI gates
+- `local_check.py`: shared PowerShell resolution, repo-venv shim, and bounded
+  output capture for the tool-owned verification gate
 - `publish.py`: exact-SHA, fast-forward-only Bitbucket Publish
 - `auth.py`: `AuthBroker` interactive secret boundary (deploy only)
 - `release.py`: per-node deploy orchestration inside the deploy phase
@@ -64,4 +67,5 @@ synchronization uses an isolated temporary worktree and the explicit refspec
 See [adr/0008-run-ledger-and-posture-phases.md](adr/0008-run-ledger-and-posture-phases.md),
 [adr/0009-on-node-runner-file-evidence.md](adr/0009-on-node-runner-file-evidence.md),
 [adr/0011-pane-safe-remote-transport.md](adr/0011-pane-safe-remote-transport.md),
-and [adr/0014-paramiko-release-transport.md](adr/0014-paramiko-release-transport.md).
+[adr/0014-paramiko-release-transport.md](adr/0014-paramiko-release-transport.md),
+and [adr/0016-tool-owned-verification.md](adr/0016-tool-owned-verification.md).

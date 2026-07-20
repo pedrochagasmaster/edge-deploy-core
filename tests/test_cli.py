@@ -1023,6 +1023,21 @@ def test_release_command_forwards_no_local_check(tmp_path, monkeypatch) -> None:
     _patch_inspect_repository(monkeypatch, commit=SOURCE_SHA)
     _patch_all_phases_pass(monkeypatch)
 
+    def fake_verify(operator, profile, repo_root, ledger, **kwargs):
+        captured["verify_kwargs"] = kwargs
+        ledger.set_phase(
+            "verify",
+            "passed",
+            evidence={
+                "commit": SOURCE_SHA,
+                "ci": "success",
+                "tests": "passed",
+                "verified_at": "2026-07-17T12:00:00+00:00",
+                "verification_command": "tools/dev/local_check.ps1",
+            },
+        )
+        return SimpleNamespace(commit=SOURCE_SHA)
+
     def fake_publish(ledger, operator, repo_root, **kwargs):
         captured["no_local_check"] = kwargs.get("no_local_check")
         ledger.set_phase(
@@ -1033,6 +1048,7 @@ def test_release_command_forwards_no_local_check(tmp_path, monkeypatch) -> None:
         return 0
 
     monkeypatch.setattr(cli, "run_publish_phase", fake_publish)
+    monkeypatch.setattr(cli, "ensure_verified", fake_verify)
     _autobench_repo_root(tmp_path)
 
     rc = cli.main(
@@ -1048,6 +1064,7 @@ def test_release_command_forwards_no_local_check(tmp_path, monkeypatch) -> None:
 
     assert rc == 0
     assert captured["no_local_check"] is True
+    assert "no_local_check" not in captured["verify_kwargs"]
 
 
 def test_release_command_nonzero_exit_on_failure(tmp_path, monkeypatch) -> None:

@@ -204,6 +204,18 @@ incomplete or legacy ledger safely falls back to the local check; standalone
 `publish-<tool>.json` record `verification_source` and `local_check_ran` so a
 reused gate is never reported as though the script executed.
 
+Verify itself always runs the exact source checkout's committed
+`tools/dev/local_check.ps1` after GitHub CI succeeds. The tool owns test
+selection, parallelism, temporary isolation, and platform setup; the engine
+owns ordering and evidence. Only a successful exit records passed tests. A
+failure writes a redacted tail to `verify-local-check.log` and blocks every
+later phase. Because the Release Operator is on Windows, each tool must run
+this authoritative gate in Windows CI as well as retaining its supported
+Linux jobs.
+
+`--no-local-check` bypasses only a publish fallback; verify always runs the
+source-bound committed tool gate. It is not a verification bypass.
+
 If the fallback local check fails, publish becomes `failed` and writes its
 redacted output tail to `publish-local-check.log` in the run directory. Inspect
 that artifact, correct the failure, and retry the same `publish-phase` command;
@@ -280,6 +292,8 @@ See [docs/DESIGN.md](DESIGN.md) for module boundaries,
 for architecture decisions,
 [docs/adr/0015-source-bound-verification-reuse.md](adr/0015-source-bound-verification-reuse.md)
 for the durable publish verification contract,
+[docs/adr/0016-tool-owned-verification.md](adr/0016-tool-owned-verification.md)
+for tool-owned source verification,
 [docs/adr/0010-guided-posture-loop.md](adr/0010-guided-posture-loop.md) for
 guided mode and cross-posture resume, and
 [docs/adr/0014-paramiko-release-transport.md](adr/0014-paramiko-release-transport.md)

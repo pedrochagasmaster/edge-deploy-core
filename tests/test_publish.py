@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -13,6 +12,7 @@ import pytest
 
 from edge_deploy import publish
 from edge_deploy.config import ToolProfile
+from edge_deploy.local_check import LocalCheckResult, LocalCheckUnavailableError
 from edge_deploy.publish import LocalCheckError, PublishError, publish_snapshot
 
 TOKEN = "s3cr3t-bearer-token"
@@ -292,8 +292,8 @@ def test_local_check_failure_preserves_exit_code_and_output_tail(monkeypatch) ->
     git = FakeGit()
     monkeypatch.setattr(
         publish,
-        "_run_local_check_ps1",
-        lambda root: (7, "first detail\nfinal failure detail"),
+        "execute_local_check",
+        lambda root: LocalCheckResult(7, "first detail\nfinal failure detail"),
     )
 
     with pytest.raises(LocalCheckError) as raised:
@@ -305,6 +305,17 @@ def test_local_check_failure_preserves_exit_code_and_output_tail(monkeypatch) ->
     assert not any(
         "fetch" in call or "push" in call or "commit" in call for call in git.calls
     )
+
+
+def test_publish_runner_preserves_publish_error_compatibility(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        publish,
+        "execute_local_check",
+        lambda root: (_ for _ in ()).throw(LocalCheckUnavailableError("missing gate")),
+    )
+
+    with pytest.raises(PublishError, match="pass --no-local-check to bypass the publish gate"):
+        publish.run_local_check_ps1(tmp_path)
 
 
 def test_publish_runs_local_check_by_default() -> None:
@@ -348,55 +359,6 @@ def test_publish_requires_token() -> None:
         publish_snapshot(
             AUTOBENCH, repo_root="/x", git_runner=git, run_local_check=False, token_env="MISSING_TOKEN_ENV"
         )
-
-
-# ---------------------------------------------------------------------------
-# local_check.ps1 runner (shell resolution, fail loudly)
-# ---------------------------------------------------------------------------
-
-
-def test_run_local_check_missing_script_raises(tmp_path) -> None:
-    with pytest.raises(PublishError, match="local_check gate script not found"):
-        publish.run_local_check_ps1(tmp_path)
-
-
-def test_run_local_check_no_powershell_raises(tmp_path, monkeypatch) -> None:
-    script = tmp_path / "tools" / "dev" / "local_check.ps1"
-    script.parent.mkdir(parents=True)
-    script.write_text("exit 0\n", encoding="utf-8")
-    monkeypatch.setattr(publish, "_resolve_powershell", lambda: None)
-
-    with pytest.raises(PublishError, match="neither 'pwsh' nor 'powershell'"):
-        publish.run_local_check_ps1(tmp_path)
-
-
-def test_run_local_check_prepends_repo_venv_py_shim(tmp_path, monkeypatch) -> None:
-    script = tmp_path / "tools" / "dev" / "local_check.ps1"
-    script.parent.mkdir(parents=True)
-    script.write_text("py -m pytest\n", encoding="utf-8")
-    venv_python = tmp_path / ".venv" / "Scripts" / "python.exe"
-    venv_python.parent.mkdir(parents=True)
-    venv_python.write_text("", encoding="utf-8")
-    monkeypatch.setattr(publish, "_resolve_powershell", lambda: "pwsh")
-    seen: dict[str, object] = {}
-
-    def fake_run(argv, *, cwd, capture_output, text, env):
-        shim_dir = Path(str(env["PATH"]).split(os.pathsep)[0])
-        shim = shim_dir / "py.cmd"
-        seen["argv"] = argv
-        seen["cwd"] = cwd
-        seen["shim_text"] = shim.read_text(encoding="utf-8")
-        seen["path_head"] = shim_dir
-        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
-
-    monkeypatch.setattr(publish.subprocess, "run", fake_run)
-
-    assert publish.run_local_check_ps1(tmp_path) == 0
-
-    assert seen["argv"] == ["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)]
-    assert seen["cwd"] == str(tmp_path)
-    assert str(venv_python) in str(seen["shim_text"])
-    assert Path(seen["path_head"]).parent == tmp_path
 
 
 # ---------------------------------------------------------------------------

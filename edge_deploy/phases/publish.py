@@ -196,7 +196,10 @@ def register_publish_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument(
         "--no-local-check",
         action="store_true",
-        help="Skip local_check.ps1 before publishing",
+        help=(
+            "Bypass only a publish fallback; verify always runs the source-bound "
+            "committed tool gate"
+        ),
     )
     parser.add_argument(
         "--force-lock",
