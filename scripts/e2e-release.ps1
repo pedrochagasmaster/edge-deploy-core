@@ -15,7 +15,7 @@ $ErrorActionPreference = 'Stop'
 
 $script:RunId = $null
 $script:SourceSha = $null
-$script:ExpectedEngineVersion = '1.5.2'
+$script:ExpectedEngineVersion = '1.5.3'
 $script:PublishedEngineTag = 'v1.4.0'
 
 function Assert-CommandPassed {
