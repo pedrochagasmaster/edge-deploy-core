@@ -41,3 +41,15 @@ operator configuration must never enter GitHub.
 - Published release tags are immutable; never move or re-point a published tag — publish a new version instead.
 - The release engine fingerprint is a content hash of the package, so any source edit changes the engine identity; open runs must be finished with the engine that created them or abandoned.
 - Both tools (autobench and robocop/dispatch) pin `edge-deploy-core` by git version tag in their `pyproject.toml`; releasing a new engine version requires bumping that pinned dependency in each tool via a normal GitHub PR, only after the new engine tag is published.
+
+## Cursor Cloud specific instructions
+
+The Cursor Cloud VM is Linux (unlike the Windows PowerShell controller the rest of
+this guide targets). The `py` launcher does not exist here and `python` is not on
+`PATH`; the startup update script provisions a `.venv/`, so invoke tools through it
+(`.venv/bin/python`, `.venv/bin/ruff`) or activate the venv first.
+
+- Lint: `.venv/bin/ruff check .` (config in `pyproject.toml`).
+- Test: `.venv/bin/python -m pytest` (standard commands are in `CONTRIBUTING.md` / `README.md`; `-n 4 --dist loadfile` for parallelism). ~100 tests are skipped by design — they need Bitbucket/Edge/SSH/Kerberos/RSA access that does not exist in this environment.
+- CLI: `.venv/bin/python -m edge_deploy status` and `--help` work fully offline. The `release`/`publish`/`rollout`/`drift`/`preflight`/`transport-smoke`/`mirror`/`rollback` commands need operator config plus Bitbucket/Edge network and interactive credentials, so they cannot run end-to-end here.
+- Console: `edge_console.py` is a standalone, zero-dependency read-only web UI that lives outside the `edge_deploy` package on purpose (Engine Identity hashes every package `*.py`). Run it fully offline with `.venv/bin/python edge_console.py --demo --no-browser` (serves fabricated runs on `http://127.0.0.1:7643`, override with `--port`). Without `--demo` it needs real tool checkouts under `--root .../edge-deploy/runs`.
