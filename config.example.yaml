@@ -1,17 +1,26 @@
-# Copy to %APPDATA%/edge-deploy/config.yaml and keep the real file private.
-# BB_TOKEN remains an environment variable.
+# OperatorConfig shape. Zero-state operators: pass a private onboarding source
+# to `py -m edge_deploy onboard --config …` (do not commit that file). Onboard
+# installs %APPDATA%/edge-deploy/config.yaml from it.
 #
-# Private onboarding source (passed to `py -m edge_deploy onboard --config …`)
-# may include the OperatorConfig fields below plus staging-only keys:
+# Private onboarding source requirements:
+#   Required: operator_email, nodes, bitbucket_remotes.core, and one
+#     bitbucket_remotes.<canonical-tool> entry per selected tool
+#     (autobench and/or robocop).
+#   Optional: checkout_root only (defaults to %USERPROFILE%/edge-deploy).
+#   CLI `--tool dispatch` maps to canonical tool id robocop — supply
+#     bitbucket_remotes.robocop; there is no bitbucket_remotes.dispatch key.
+# Staging-only keys (not stored in onboarding-state.json; fingerprint only):
 #   checkout_root: C:/edge-deploy
 #   bitbucket_remotes:
 #     core: https://bitbucket.example/scm/project/edge-deploy-core.git
 #     autobench: https://bitbucket.example/scm/project/autobench.git
 #     robocop: https://bitbucket.example/scm/project/robocop.git
-# Those staging keys are consumed by onboard and are not stored in
-# onboarding-state.json (only a fingerprint of the private file is).
 # Credentials (BB_TOKEN, RSA, Kerberos) must never appear in YAML.
+# BB_TOKEN remains an environment variable.
 # Replace example hosts/remotes with your private values outside Git.
+#
+# Legacy/manual (not using onboard): copy this file to
+# %APPDATA%/edge-deploy/config.yaml and keep it private.
 
 operator_email: operator@example.com
 audit_repo: C:/path/to/edge-deploy-core

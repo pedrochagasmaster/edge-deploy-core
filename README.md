@@ -40,10 +40,14 @@ Use the tag equal to the package version (`v` + `__version__` /
 via `bootstrap_core_root()`; it does not clone core again.
 
 2. Prepare a **private** onboarding source YAML outside every Git repository
-   (never commit it). Use neutral placeholders for hosts and remotes; put
-   `BB_TOKEN` in the environment only. See [config.example.yaml](config.example.yaml)
-   for the allowlisted shape (`operator_email`, `nodes`, optional
-   `checkout_root`, `bitbucket_remotes`).
+   (never commit it). Required: `operator_email`, `nodes`,
+   `bitbucket_remotes.core`, and one `bitbucket_remotes.<tool>` entry per
+   selected **canonical** tool (`autobench` and/or `robocop`). Optional:
+   `checkout_root` only (defaults to `%USERPROFILE%\edge-deploy`). Selecting
+   `--tool dispatch` still requires the `robocop` remote key — there is no
+   `bitbucket_remotes.dispatch`. Put `BB_TOKEN` in the environment only. See
+   [config.example.yaml](config.example.yaml) for the allowlisted shape with
+   neutral placeholders.
 
 3. Run onboarding:
 
@@ -52,7 +56,8 @@ py -m edge_deploy onboard --config C:\secure\operator.yaml
 ```
 
 Omit `--tool` to choose Autobench and/or Dispatch interactively, or select
-explicitly (`dispatch` is a CLI alias for canonical tool id `robocop`):
+explicitly (`dispatch` is a CLI alias that maps to canonical tool id
+`robocop`):
 
 ```powershell
 py -m edge_deploy onboard `
@@ -91,7 +96,12 @@ py -m edge_deploy release --guided --tool autobench
 (That real guided release later needs one `both-vpns → firewall-off` switch for
 `tag_github`; onboarding itself never requires it.)
 
-## Operator configuration
+## Operator configuration (legacy / manual)
+
+Zero-state operators should use `onboard` above: it installs
+`%APPDATA%\edge-deploy\config.yaml` from the private source. The manual copy
+below is only for operators who are **not** using `onboard` and already have
+checkouts and remotes prepared.
 
 Copy [config.example.yaml](config.example.yaml) to:
 
@@ -99,9 +109,8 @@ Copy [config.example.yaml](config.example.yaml) to:
 %APPDATA%\edge-deploy\config.yaml
 ```
 
-Onboarding installs this path from the private source. Keep the real file
-private. `BB_TOKEN` remains an environment variable and interactive RSA or
-Kerberos responses are never persisted.
+Keep the real file private. `BB_TOKEN` remains an environment variable and
+interactive RSA or Kerberos responses are never persisted.
 
 Each tool repository contains `edge_deploy.yaml`, which describes only its
 node-independent deployment contract.

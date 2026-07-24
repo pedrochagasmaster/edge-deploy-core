@@ -4,10 +4,15 @@
 
 A new Release Operator historically assembled first-time setup from the README,
 release workflow, private operator knowledge, and tool repositories. Missing
-host keys, unusable audit remotes, and unauthenticated `gh` access often
-appeared only after a real release started. There was no resumable setup state
-and no safe practice path that taught the guided phase sequence without remote
-mutation.
+host keys, unusable audit remotes, and failed readiness often appeared only
+after a real release started. There was no resumable setup state and no safe
+practice path that taught the guided phase sequence without remote mutation.
+
+Onboarding readiness treats authenticated GitHub CLI access (`gh auth`) as its
+own check, separate from the console's GitHub **write** capability indicator.
+That indicator (and posture gating) uses the non-mutating
+`git push --dry-run` write-path probe from ADR-0012 — not `gh` auth and not
+TCP/read reachability.
 
 The five-posture model (ADR-0013) already makes routine operator work possible
 in `both-vpns`: GitHub read, Bitbucket, and Edge are available together. GitHub

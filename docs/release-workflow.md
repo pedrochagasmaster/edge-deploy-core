@@ -20,8 +20,10 @@ py -m pip install -e ".[dev]"
 ```
 
 Core installs with `.[dev]` only (no core `release` extra). Keep a private
-onboarding source outside Git (see [config.example.yaml](../config.example.yaml)),
-set `BB_TOKEN` in the environment, then:
+onboarding source outside Git (see [config.example.yaml](../config.example.yaml)):
+require `bitbucket_remotes.core` plus one remote per selected canonical tool
+(`autobench` / `robocop`; `--tool dispatch` still uses the `robocop` key);
+only `checkout_root` is optional. Set `BB_TOKEN` in the environment, then:
 
 ```powershell
 py -m edge_deploy onboard --config C:\secure\operator.yaml
