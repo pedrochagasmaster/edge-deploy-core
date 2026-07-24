@@ -47,14 +47,15 @@ def _normalize_url(value: str) -> str:
     return value.strip().removesuffix("/").removesuffix(".git").lower()
 
 
+def _remote_names(run: CommandRunner) -> set[str]:
+    output = run(["git", "remote"])
+    return {line.strip() for line in output.splitlines() if line.strip()}
+
+
 def _remote_url(run: CommandRunner, name: str) -> str | None:
-    try:
-        return run(["git", "remote", "get-url", name]).strip()
-    except RuntimeError as exc:
-        message = str(exc).lower()
-        if "no such remote" in message or "missing" in message:
-            return None
-        raise
+    if name not in _remote_names(run):
+        return None
+    return run(["git", "remote", "get-url", name]).strip()
 
 
 def _ensure_bitbucket_remote(run: CommandRunner, *, bitbucket_url: str) -> None:

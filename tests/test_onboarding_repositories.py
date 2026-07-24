@@ -20,6 +20,9 @@ class FakeGit:
         self.origin = TOOL_MANIFESTS["autobench"].github_url
         self.bitbucket = ""
         self.head_tag = approved_engine_tag()
+        self.head_sha = "a" * 40
+        self.tag_sha = "a" * 40
+        self.get_url_errors: dict[str, Exception] = {}
 
     def __call__(self, args: list[str]) -> str:
         self.calls.append(list(args))
@@ -35,23 +38,52 @@ class FakeGit:
                 encoding="utf-8",
             )
             return ""
+        if args == ["git", "remote"]:
+            names = ["origin"]
+            if self.bitbucket:
+                names.append("bitbucket")
+            return "\n".join(names) + "\n"
         if args[:3] == ["git", "remote", "get-url"]:
-            if args[3] == "origin":
+            name = args[3]
+            if name in self.get_url_errors:
+                raise self.get_url_errors[name]
+            if name == "origin":
                 return self.origin + "\n"
-            if args[3] == "bitbucket":
+            if name == "bitbucket":
                 if not self.bitbucket:
-                    raise RuntimeError("bitbucket missing")
+                    raise RuntimeError("fatal: No such remote 'bitbucket'")
                 return self.bitbucket + "\n"
+            raise RuntimeError(f"fatal: No such remote '{name}'")
         if args[:3] == ["git", "remote", "add"]:
-            self.bitbucket = args[4]
+            if args[3] == "bitbucket":
+                self.bitbucket = args[4]
             return ""
         if args[:2] == ["git", "status"]:
             return ""
         if args[:3] == ["git", "describe", "--tags"]:
+            if not self.head_tag:
+                raise RuntimeError("fatal: no tag exactly matches 'HEAD'")
             return self.head_tag + "\n"
         if args[:2] == ["git", "rev-parse"]:
-            return "a" * 40 + "\n"
+            target = args[2]
+            if target == "HEAD":
+                return self.head_sha + "\n"
+            if target.endswith("^{}"):
+                return self.tag_sha + "\n"
+            return self.head_sha + "\n"
         return ""
+
+
+def _seed_tool_checkout(dest: Path) -> None:
+    dest.mkdir(parents=True)
+    (dest / ".git").mkdir()
+    (dest / "edge_deploy.yaml").write_text("tool: autobench\n", encoding="utf-8")
+    (dest / "tools" / "dev").mkdir(parents=True)
+    (dest / "tools" / "dev" / "local_check.ps1").write_text("# ok\n", encoding="utf-8")
+    (dest / "pyproject.toml").write_text(
+        f"edge-deploy-core @ git+https://example/@{approved_engine_tag()}\n",
+        encoding="utf-8",
+    )
 
 
 def _tool_pyproject(*, tag: str, extras: bool = True) -> str:
@@ -186,3 +218,95 @@ def test_install_tool_dependencies_requires_declared_extras(tmp_path: Path) -> N
         install_tool_dependencies(tool, runner=lambda args: calls.append(list(args)) or "")
 
     assert calls == []
+
+
+def test_wrong_bitbucket_remote_refused_without_private_urls(tmp_path: Path) -> None:
+    dest = tmp_path / "autobench"
+    _seed_tool_checkout(dest)
+    existing = "https://bitbucket.example/wrong-existing.git"
+    configured = "https://bitbucket.example/ab.git"
+    fake = FakeGit()
+    fake.bitbucket = existing
+    with pytest.raises(RuntimeError, match="bitbucket remote") as exc_info:
+        provision_tool_checkout(
+            dest,
+            TOOL_MANIFESTS["autobench"],
+            bitbucket_url=configured,
+            runner=fake,
+        )
+    message = str(exc_info.value)
+    assert existing not in message
+    assert configured not in message
+    assert "bitbucket.example" not in message
+    assert not any(c[:3] == ["git", "remote", "add"] for c in fake.calls)
+    assert not any(c[:2] == ["git", "clone"] for c in fake.calls)
+
+
+def test_reuse_correct_existing_checkout_without_clone(tmp_path: Path) -> None:
+    dest = tmp_path / "autobench"
+    _seed_tool_checkout(dest)
+    configured = "https://bitbucket.example/ab.git"
+    fake = FakeGit()
+    fake.bitbucket = configured
+    result = provision_tool_checkout(
+        dest,
+        TOOL_MANIFESTS["autobench"],
+        bitbucket_url=configured,
+        runner=fake,
+    )
+    assert result.action == "reused"
+    assert result.path == dest.resolve()
+    assert not any(c[:2] == ["git", "clone"] for c in fake.calls)
+    assert not any(c[:3] == ["git", "remote", "add"] for c in fake.calls)
+
+
+def test_unrelated_get_url_error_containing_missing_is_not_swallowed(tmp_path: Path) -> None:
+    dest = tmp_path / "autobench"
+    _seed_tool_checkout(dest)
+    configured = "https://bitbucket.example/ab.git"
+    fake = FakeGit()
+    fake.bitbucket = configured
+    fake.get_url_errors["bitbucket"] = RuntimeError("credential helper missing for bitbucket")
+    with pytest.raises(RuntimeError, match="credential helper missing"):
+        provision_tool_checkout(
+            dest,
+            TOOL_MANIFESTS["autobench"],
+            bitbucket_url=configured,
+            runner=fake,
+        )
+    assert not any(c[:3] == ["git", "remote", "add"] for c in fake.calls)
+    assert any(c == ["git", "remote"] for c in fake.calls)
+
+
+def test_origin_mismatch_refused(tmp_path: Path) -> None:
+    dest = tmp_path / "autobench"
+    _seed_tool_checkout(dest)
+    fake = FakeGit()
+    fake.origin = "https://github.com/other/autobench.git"
+    with pytest.raises(RuntimeError, match="origin points to unexpected"):
+        provision_tool_checkout(
+            dest,
+            TOOL_MANIFESTS["autobench"],
+            bitbucket_url="https://bitbucket.example/ab.git",
+            runner=fake,
+        )
+    assert not any(c[:2] == ["git", "clone"] for c in fake.calls)
+
+
+def test_bootstrap_tag_mismatch_refused(tmp_path: Path) -> None:
+    core = tmp_path / "edge-deploy-core"
+    core.mkdir()
+    (core / ".git").mkdir()
+    fake = FakeGit()
+    fake.origin = CORE_GITHUB_URL
+    fake.head_tag = "v0.0.1"
+    fake.head_sha = "a" * 40
+    fake.tag_sha = "b" * 40
+    with pytest.raises(RuntimeError, match="HEAD is not exactly tag"):
+        validate_bootstrap_core(
+            core,
+            bitbucket_url="https://bitbucket.example/core.git",
+            expected_tag=approved_engine_tag(),
+            runner=fake,
+        )
+    assert not any(c[:2] == ["git", "clone"] for c in fake.calls)
