@@ -164,3 +164,29 @@ def test_acquire_lock_same_pid_other_host_still_raises(tmp_path: Path) -> None:
     (ledger.run_dir / "run.lock").write_text(json.dumps(lock_payload), encoding="utf-8")
     with pytest.raises(RunLockError):
         ledger.acquire_lock()
+
+
+def test_create_disambiguates_same_second_identical_source_sha(tmp_path: Path) -> None:
+    """Training (and any same-second recreate) must not collide on run_id."""
+    runs_root = tmp_path / "runs"
+    first = RunLedger.create(
+        runs_root,
+        tool="autobench",
+        source_sha="0" * 40,
+        nodes=["node03"],
+        operator="op@example.com",
+        kind="training",
+        training=True,
+    )
+    second = RunLedger.create(
+        runs_root,
+        tool="autobench",
+        source_sha="0" * 40,
+        nodes=["node03"],
+        operator="op@example.com",
+        kind="training",
+        training=True,
+    )
+    assert first.state["run_id"] != second.state["run_id"]
+    assert first.run_dir != second.run_dir
+    assert first.run_dir.is_dir() and second.run_dir.is_dir()

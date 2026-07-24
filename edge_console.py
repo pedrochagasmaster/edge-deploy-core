@@ -1,6 +1,6 @@
 """edge_console — read-only posture console for edge-deploy runs.
 
-A single-file, zero-dependency local web UI over one or more run ledgers
+A single-file local web UI over one or more run ledgers
 (``<checkout>/edge-deploy/runs/``). It renders each Run as a rail through the
 five workstation postures (ADR-0013): stations are tinted by the capability
 they need (bitbucket, edge, github write), VPN joins are soft boundaries, and
@@ -17,23 +17,27 @@ Nodes are believed to hold) against the checkout's HEAD and against GitHub
 ``main`` (``git ls-remote`` — GitHub read works in every posture), flags
 undeployed commits and stale checkouts, and — when no Run is open — walks the
 operator through starting one (posture to hold, optional ``preflight`` /
-``transport-smoke``, then ``py -m edge_deploy release --guided``). Git use is
-strictly read-only, matching the console's no-writes contract.
+``transport-smoke``, then ``py -m edge_deploy release --guided``).
 
-Deliberately standalone: Engine Identity (ADR-0008) hashes every ``*.py``
-inside the ``edge_deploy`` package, so UI code must live outside the engine
-or every open Run would be orphaned. This file never writes to the ledger.
+Deliberately outside the ``edge_deploy`` package: Engine Identity (ADR-0008)
+hashes every package ``*.py``, so UI code must live here or every open Run
+would be orphaned. This file never writes to the ledger. It imports a few
+engine helpers for probe argv and Edge endpoints only.
 
 Usage:
 
     py edge_console.py                              # watch the cwd checkout
     py edge_console.py --root D:\\ab --root D:\\rc    # watch several checkouts
+    py edge_console.py --root D:\\training\\ab \\
+        --github-write-root D:\\ab                   # training ledgers + real write probes
     py edge_console.py --demo                       # fabricated checkouts, no probes
 
-Posture probes are TCP-only and labelled as such in the UI: the corporate
-proxy accepts TCP connects in every posture, and TCP cannot see GitHub write
-(baseline and firewall-off look identical), so only the phases' own
-git-protocol probes are authoritative (ADR-0012/0013).
+Posture probes: Bitbucket and Edge remain TCP-only and labelled as such. The
+GitHub capability light is a per-watched-tool ``git push --dry-run`` write
+probe (same argv as posture gating); it never updates a remote ref. Write
+probes use ``--github-write-root`` when set, otherwise the same paths as
+``--root``. Divergence facts still use read-only git on ``--root`` checkouts
+(``ls-remote`` for GitHub main); training roots may lack git on purpose.
 """
 
 from __future__ import annotations
@@ -52,13 +56,17 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, load_operator_config
+from edge_deploy.posture import git_probe_command
+from edge_deploy.preflight import endpoint_from_node
+
 _SCHEMA = "edge-deploy/run/1"
 _EVENT_TAIL = 60
 _PROBE_TIMEOUT = 1.5
 _PROBE_CACHE_SECONDS = 10.0
+GITHUB_WRITE_STATUSES = frozenset({"ok", "fail", "unknown"})
 
 _STATIC_GROUPS: dict[str, list[tuple[str, int]]] = {
-    "github": [("github.com", 443), ("api.github.com", 443)],
     "bitbucket": [("scm.mastercard.int", 443)],
 }
 
@@ -137,12 +145,91 @@ def collect_runs_multi(roots: list[Path]) -> list[dict]:
 # TCP posture probes (informational only — see ADR-0012)
 # ---------------------------------------------------------------------------
 
-def _edge_endpoints() -> list[tuple[str, int]]:
-    """Edge node endpoints from the operator config, if the engine is importable."""
-    try:
-        from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, load_operator_config
-        from edge_deploy.preflight import endpoint_from_node
+_GITHUB_WRITE_TIMEOUT = 20.0
 
+
+def github_write_command() -> list[str]:
+    """Exact write-path argv used by posture gating (ADR-0012)."""
+    return list(git_probe_command("origin", "write"))
+
+
+def _default_github_write_runner(command: list[str], repo_root: Path, *, timeout: float) -> int:
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "never"
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=repo_root,
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return -1
+    except OSError:
+        return -1
+    return completed.returncode
+
+
+def probe_github_write(
+    root: Path,
+    *,
+    runner=None,
+    timeout: float = _GITHUB_WRITE_TIMEOUT,
+) -> dict:
+    """Non-mutating GitHub write probe for one watched checkout.
+
+    Status is ``ok`` (exit 0), ``fail`` (definitive non-zero), or ``unknown``
+    (missing checkout, timeout, or runner cannot execute). Never guesses the
+    failure cause (posture vs credentials vs authz).
+    """
+    root = Path(root)
+    tool = root.name
+    if not (root.is_dir() and (root / ".git").exists()):
+        return {
+            "tool": tool,
+            "root": str(root),
+            "status": "unknown",
+            "detail": "checkout missing or not a git repository",
+        }
+    command = github_write_command()
+    if runner is None:
+        code = _default_github_write_runner(command, root, timeout=timeout)
+    else:
+        code = runner(command, root)
+    if code == 0:
+        status = "ok"
+        detail = "git push --dry-run write probe passed"
+    elif code < 0:
+        status = "unknown"
+        detail = f"write probe timed out or could not run (code {code})"
+    else:
+        status = "fail"
+        detail = f"write probe exited {code}"
+    return {
+        "tool": tool,
+        "root": str(root),
+        "status": status,
+        "detail": detail,
+        "command": command,
+    }
+
+
+def aggregate_github_write(tool_results: list[dict]) -> str:
+    if not tool_results:
+        return "unknown"
+    statuses = [str(item.get("status") or "unknown") for item in tool_results]
+    if any(status == "fail" for status in statuses):
+        return "fail"
+    if any(status != "ok" for status in statuses):
+        return "unknown"
+    return "ok"
+
+
+def _edge_endpoints() -> list[tuple[str, int]]:
+    """Edge node endpoints from the operator config; empty if config cannot be loaded."""
+    try:
         operator = load_operator_config(DEFAULT_OPERATOR_CONFIG_PATH)
         endpoints = []
         for name in sorted(operator.nodes):
@@ -162,21 +249,36 @@ def _probe_one(host: str, port: int) -> bool:
 
 
 class PostureProber:
-    def __init__(self, demo: bool) -> None:
+    def __init__(self, demo: bool, roots: list[Path] | None = None) -> None:
         self._demo = demo
+        self._roots = list(roots or [])
         self._lock = threading.Lock()
         self._cached: dict | None = None
         self._cached_at = 0.0
 
     def snapshot(self) -> dict:
         if self._demo:
+            tools = [
+                {
+                    "tool": "autobench",
+                    "root": "(demo)/autobench",
+                    "status": "fail",
+                    "detail": "demo: GitHub write unavailable outside firewall-off",
+                },
+                {
+                    "tool": "robocop",
+                    "root": "(demo)/robocop",
+                    "status": "fail",
+                    "detail": "demo: GitHub write unavailable outside firewall-off",
+                },
+            ]
             return {
                 "probed_at": time.strftime("%H:%M:%SZ", time.gmtime()),
                 "groups": {
-                    "github": [
-                        {"endpoint": "github.com:443", "reachable": True},
-                        {"endpoint": "api.github.com:443", "reachable": True},
-                    ],
+                    "github": {
+                        "aggregate": aggregate_github_write(tools),
+                        "tools": tools,
+                    },
                     "bitbucket": [
                         {"endpoint": "scm.mastercard.int:443", "reachable": True},
                     ],
@@ -194,8 +296,8 @@ class PostureProber:
         if edge:
             groups["edge"] = edge
         flat = [(name, host, port) for name, eps in groups.items() for host, port in eps]
-        with ThreadPoolExecutor(max_workers=max(1, len(flat))) as pool:
-            reachable = list(pool.map(lambda item: _probe_one(item[1], item[2]), flat))
+        with ThreadPoolExecutor(max_workers=max(1, len(flat) or 1)) as pool:
+            reachable = list(pool.map(lambda item: _probe_one(item[1], item[2]), flat)) if flat else []
         result: dict = {
             "probed_at": time.strftime("%H:%M:%SZ", time.gmtime()),
             "groups": {},
@@ -204,6 +306,22 @@ class PostureProber:
             result["groups"].setdefault(name, []).append(
                 {"endpoint": f"{host}:{port}", "reachable": ok}
             )
+        with ThreadPoolExecutor(max_workers=max(1, len(self._roots) or 1)) as pool:
+            write_tools = list(pool.map(probe_github_write, self._roots)) if self._roots else []
+        # Strip command from API payload (argv is an implementation detail).
+        api_tools = [
+            {
+                "tool": row["tool"],
+                "root": row["root"],
+                "status": row["status"],
+                "detail": row["detail"],
+            }
+            for row in write_tools
+        ]
+        result["groups"]["github"] = {
+            "aggregate": aggregate_github_write(api_tools),
+            "tools": api_tools,
+        }
         with self._lock:
             self._cached = result
             self._cached_at = time.monotonic()
@@ -569,8 +687,8 @@ _TOOL_NAME_RE = re.compile(r"^tool:\s*[\"']?([A-Za-z0-9_-]+)", re.MULTILINE)
 def _git(root: Path, *args: str, timeout: float = _GIT_TIMEOUT) -> str | None:
     """Run one read-only git command; None on any failure (never raises)."""
     env = dict(os.environ)
-    env.setdefault("GIT_TERMINAL_PROMPT", "0")  # never block on a credential prompt
-    env.setdefault("GCM_INTERACTIVE", "never")
+    env["GIT_TERMINAL_PROMPT"] = "0"  # never block on a credential prompt
+    env["GCM_INTERACTIVE"] = "never"
     try:
         completed = subprocess.run(
             ["git", "-C", str(root), *args],
@@ -773,26 +891,54 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self._send(404, "text/plain; charset=utf-8", b"not found\n")
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Read-only posture console for edge-deploy runs")
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Read-only posture console for edge-deploy runs"
+    )
     parser.add_argument(
         "--root",
         action="append",
         default=None,
         help="Tool checkout containing edge-deploy/runs; repeat to watch several (default: cwd)",
     )
+    parser.add_argument(
+        "--github-write-root",
+        action="append",
+        default=None,
+        help=(
+            "Checkout used for GitHub write probes; repeat for several. "
+            "Defaults to the same paths as --root when omitted"
+        ),
+    )
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 7643)))
-    parser.add_argument("--demo", action="store_true", help="Serve fabricated checkouts; no network probes")
+    parser.add_argument(
+        "--demo", action="store_true", help="Serve fabricated checkouts; no network probes"
+    )
     parser.add_argument("--no-browser", action="store_true")
-    args = parser.parse_args()
+    return parser
+
+
+def resolve_console_roots(args: argparse.Namespace) -> tuple[list[Path], list[Path]]:
+    """Return (ledger_roots, github_write_roots). Write roots default to ledger roots."""
+    ledger_roots = [Path(raw).resolve() for raw in (args.root or ["."])]
+    if args.github_write_root:
+        write_roots = [Path(raw).resolve() for raw in args.github_write_root]
+    else:
+        write_roots = list(ledger_roots)
+    return ledger_roots, write_roots
+
+
+def main() -> int:
+    args = build_arg_parser().parse_args()
 
     if args.demo:
         roots = build_demo_checkouts()
+        write_roots = roots
     else:
-        roots = [Path(raw).resolve() for raw in (args.root or ["."])]
+        roots, write_roots = resolve_console_roots(args)
 
     ConsoleHandler.roots = roots
-    ConsoleHandler.prober = PostureProber(demo=args.demo)
+    ConsoleHandler.prober = PostureProber(demo=args.demo, roots=write_roots)
     ConsoleHandler.tools_prober = ToolsProber(roots, demo=args.demo)
     ConsoleHandler.demo = args.demo
 
@@ -800,6 +946,9 @@ def main() -> int:
     url = f"http://127.0.0.1:{args.port}/"
     for root in roots:
         print(f"edge-console: watching {root / 'edge-deploy' / 'runs'}")
+    if write_roots != roots:
+        for root in write_roots:
+            print(f"edge-console: github write probe root {root}")
     print(f"edge-console: {url}  (read-only; Ctrl+C to stop)")
     if not args.no_browser:
         webbrowser.open(url)
@@ -868,7 +1017,10 @@ header{border-bottom:1px solid var(--line);background:var(--panel)}
 .endpoint .dot{width:7px;height:7px;border-radius:50%;flex:none;background:var(--faint)}
 .endpoint.up .dot{background:var(--pass);box-shadow:0 0 5px rgba(121,201,143,.7)}
 .endpoint.down .dot{background:transparent;border:1.5px solid var(--fail)}
-.endpoint.up{color:var(--ink)}
+.endpoint.unknown .dot{background:transparent;border:1.5px solid var(--warn)}
+.endpoint.ok .dot{background:var(--pass);box-shadow:0 0 5px rgba(121,201,143,.7)}
+.endpoint.fail .dot{background:transparent;border:1.5px solid var(--fail)}
+.endpoint.up,.endpoint.ok{color:var(--ink)}
 /* five-posture strip: the inferred current posture(s) lit, the rest dim */
 .pstrip{max-width:1060px;margin:0 auto;padding:0 20px 10px;display:flex;gap:6px;flex-wrap:wrap;align-items:center}
 .pchip{font-family:var(--mono);font-size:10.5px;letter-spacing:.06em;border:1px solid var(--line);border-radius:4px;padding:2.5px 9px;color:var(--faint)}
@@ -936,10 +1088,14 @@ details.guide summary:focus-visible{outline:2px solid var(--gh);outline-offset:-
 .chip.complete{color:var(--gh);border-color:var(--gh)}
 .chip.abandoned{color:var(--fail);border-color:var(--fail)}
 .chip.lock{color:var(--warn);border-color:var(--warn)}
+.chip.training{color:var(--warn);border-color:var(--warn);letter-spacing:.18em}
 .runmeta{font-family:var(--mono);font-size:11px;color:var(--dim);margin-left:auto}
 
 /* ---------- the posture rail (signature) ---------- */
+.rail-wrap.simulated{border-top:1px solid var(--line)}
+.rail-sim-tag{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--warn);padding:7px 16px;border-bottom:1px dashed var(--warn);background:var(--panel)}
 .rail{display:flex;align-items:stretch;min-height:96px}
+.rail.simulated{opacity:.9}
 .station{flex:1 1 0;padding:12px 12px 14px;position:relative}
 .station[data-req="any"]{background:var(--panel)}
 .station[data-req="bb"]{background:var(--bb-band)}
@@ -1043,11 +1199,11 @@ footer code{font-family:var(--mono)}
   <div id="tools"></div>
   <div class="filterbar" id="filterbar" aria-label="filter runs by tool and status"></div>
   <div id="runs"></div>
-  <footer>TCP reachability is informational: the corporate proxy accepts connects in every
-  posture, and TCP cannot see GitHub write (baseline vs firewall-off) — only each phase's
-  git-protocol probe is authoritative (ADR-0012/0013). Divergence facts come from read-only
-  git (rev-parse / rev-list locally; ls-remote for GitHub main, a github-read action that
-  works in every posture). This console never writes to the ledger or the checkout.</footer>
+  <footer>Bitbucket/Edge lights are TCP-only. The GitHub light is a per-tool
+  <code>git push --dry-run</code> write probe (no ref update); green only when every
+  watched tool passes. Divergence still uses read-only <code>ls-remote</code>
+  (GitHub read works in every posture). Phase git-protocol probes remain
+  authoritative for release commands (ADR-0012/0013).</footer>
 </main>
 
 <script>
@@ -1087,6 +1243,7 @@ const RAIL = [
 // Latest TCP inference from the posture panel ("bitbucket"/"edge" up flags);
 // null until the first /api/posture answer arrives.
 let tcpCaps = null;
+let githubWriteAgg = null; // set when /api/posture arrives
 
 function esc(s){
   return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -1099,6 +1256,11 @@ function shortTs(iso){
 function shortDate(iso){
   if(!iso) return "";
   return String(iso).replace(/T(\d\d:\d\d).*$/, " $1Z");
+}
+
+// Matches edge_deploy.ledger.is_training_ledger: either marker, strict true.
+function isTrainingRun(st){
+  return st.kind === "training" || st.training === true;
 }
 
 function phasePassed(run, phase){
@@ -1117,6 +1279,9 @@ function nextPhase(run){
 }
 
 function nextCommand(run, phase){
+  // Training cards never emit a copyable production CLI (status.py parity).
+  if(isTrainingRun(run.state))
+    return "TRAINING ONLY (not a production command)";
   const id = run.state.run_id;
   let cmd;
   if(phase === "verify")  cmd = `py -m edge_deploy verify --run ${id}`;
@@ -1143,7 +1308,8 @@ function stateChip(s){
 
 function stationHtml(run, phase, next){
   const req = PHASE_REQ[phase];
-  const cls = phase === next ? "station next" : "station";
+  // Training rails stay educational: never apply the live "◀ next" cue.
+  const cls = (!isTrainingRun(run.state) && phase === next) ? "station next" : "station";
   let body;
   if(phase === "deploy"){
     // Deploy node keys are operator-config names ("node03"), and evidence is
@@ -1176,20 +1342,34 @@ function stationHtml(run, phase, next){
 
 function railHtml(run){
   const next = nextPhase(run);
+  const training = isTrainingRun(run.state);
   const parts = RAIL.map(item => {
     if(item.phase) return stationHtml(run, item.phase, next);
     if(item.gate){
       // The one hard wall: firewall-off drops both VPNs (ADR-0013). TCP
-      // cannot see github write, so this stays hot as a position marker.
-      const hot = next === item.before;
-      return `<div class="gate${hot ? " hot" : ""}" role="separator" aria-label="drop VPNs, firewall off"><span>${esc(item.gate)}</span></div>`;
+      // cannot see github write, so this stays hot as a position marker —
+      // except on training rails, which must never cue a live switch.
+      const hot = !training && next === item.before;
+      const aria = training
+        ? "simulated firewall-off boundary (do not switch posture)"
+        : "drop VPNs, firewall off";
+      return `<div class="gate${hot ? " hot" : ""}" role="separator" aria-label="${esc(aria)}"><span>${esc(item.gate)}</span></div>`;
     }
     // A VPN join only glows when the run is waiting here AND that VPN is
-    // actually down as far as TCP can see.
+    // actually down as far as TCP can see. Training never lights this.
     const missing = !tcpCaps || !tcpCaps[item.cap];
-    const hot = next === item.before && missing;
-    return `<div class="sep${hot ? " hot" : ""}" role="separator" aria-label="join ${esc(item.sep)}"><span>${esc(item.sep)}</span></div>`;
+    const hot = !training && next === item.before && missing;
+    const aria = training
+      ? `simulated ${item.sep} boundary (do not switch posture)`
+      : `join ${item.sep}`;
+    return `<div class="sep${hot ? " hot" : ""}" role="separator" aria-label="${esc(aria)}"><span>${esc(item.sep)}</span></div>`;
   });
+  if(training){
+    return `<div class="rail-wrap simulated">
+      <div class="rail-sim-tag" role="status">TRAINING ONLY · simulated posture rail — do not switch workstation posture</div>
+      <div class="rail simulated" aria-label="TRAINING ONLY simulated posture rail">${parts.join("")}</div>
+    </div>`;
+  }
   return `<div class="rail">${parts.join("")}</div>`;
 }
 
@@ -1254,27 +1434,57 @@ function progressHtml(run){
 function runHtml(run){
   const st = run.state;
   const next = nextPhase(run);
+  const training = isTrainingRun(st);
   const statusChip = `<span class="chip ${esc(st.status)}">${esc(st.status)}</span>`;
   const lockChip = run.lock
     ? `<span class="chip lock" title="acquired ${esc(run.lock.acquired_at || "")}">locked · pid ${esc(run.lock.pid)} @ ${esc(run.lock.hostname)}</span>`
     : "";
-  const kindChip = st.kind !== "release" ? `<span class="chip">${esc(st.kind)}</span>` : "";
+  // Either marker gets an explicit accessible TRAINING chip; other non-release
+  // kinds (rollback, …) keep the generic kind chip.
+  const trainingChip = training
+    ? `<span class="chip training" role="status" aria-label="TRAINING">training</span>`
+    : "";
+  const kindChip = (!training && st.kind !== "release")
+    ? `<span class="chip">${esc(st.kind)}</span>` : "";
   const rollback = st.rollback_tag
     ? `<span class="chip" title="restores this recorded release tag">→ ${esc(st.rollback_tag)}</span>` : "";
 
   let tail;
   if(st.status === "open" && next){
-    const req = PHASE_REQ[next];
-    const needText = req === "any" ? "any posture" : `needs ${REQ_POSTURE[req]}`;
-    tail = `<div class="nextcmd">
+    const cmd = nextCommand(run, next);
+    if(training){
+      // Label + guidance + copy target are all TRAINING ONLY — never a
+      // production verify/publish/deploy/tag/abandon/release command.
+      tail = `<div class="nextcmd">
+      <span class="label">TRAINING ONLY</span>
+      <span class="need any">simulated practice</span>
+      <code>${esc(cmd)}</code>
+      <button class="copy" data-cmd="${esc(cmd)}">copy</button>
+    </div>`;
+    } else {
+      const req = PHASE_REQ[next];
+      const needText = req === "any" ? "any posture" : `needs ${REQ_POSTURE[req]}`;
+      tail = `<div class="nextcmd">
       <span class="label">next</span>
       <span class="need ${req}">${esc(needText)}</span>
-      <code>${esc(nextCommand(run, next))}</code>
-      <button class="copy" data-cmd="${esc(nextCommand(run, next))}">copy</button>
+      <code>${esc(cmd)}</code>
+      <button class="copy" data-cmd="${esc(cmd)}">copy</button>
       ${readinessHtml(req)}
+    </div>`;
+    }
+  } else if(st.status === "open" && training){
+    // Open skew: phases advanced but ledger not yet complete() — do not say finished.
+    const guidance = "TRAINING ONLY — training ledger awaits completion (not a production command)";
+    tail = `<div class="nextcmd">
+      <span class="label">TRAINING ONLY</span>
+      <span class="need any">ledger open</span>
+      <code>${esc(guidance)}</code>
+      <button class="copy" data-cmd="${esc(guidance)}">copy</button>
     </div>`;
   } else if(st.status === "abandoned"){
     tail = `<div class="done-line abandoned">abandoned — ${esc(st.abandon_reason || "no reason recorded")}</div>`;
+  } else if(training){
+    tail = `<div class="done-line">complete — TRAINING ONLY practice finished (not a production release)</div>`;
   } else {
     tail = `<div class="done-line">complete — release-tagged on GitHub and Bitbucket</div>`;
   }
@@ -1282,7 +1492,7 @@ function runHtml(run){
   return `<article class="run ${st.status === "open" ? "" : "closed"}">
     <div class="runhead">
       <span class="runid">${esc(st.run_id)}</span>
-      <span class="chip tool">${esc(st.tool)}</span>${kindChip}${statusChip}${lockChip}${rollback}
+      <span class="chip tool">${esc(st.tool)}</span>${trainingChip}${kindChip}${statusChip}${lockChip}${rollback}
       <span class="runmeta">source ${esc(st.source_sha.slice(0,7))} · ${esc(st.operator)} · engine ${esc(st.engine && st.engine.version || "?")} · ${esc(shortDate(st.created_at))}</span>
     </div>
     ${railHtml(run)}
@@ -1295,10 +1505,20 @@ function runHtml(run){
 /* ---------- posture panel ---------- */
 const POSTURE_NAMES = ["baseline","edge-vpn","bitbucket-vpn","both-vpns","firewall-off"];
 
+function githubWriteHtml(g){
+  const agg = g.aggregate || "unknown";
+  const rows = (g.tools || []).map(t => {
+    const st = t.status || "unknown";
+    return `<div class="endpoint ${st}"><span class="dot"></span>${esc(t.tool)} · ${esc(st)}${t.detail ? ` · ${esc(t.detail)}` : ""}</div>`;
+  }).join("") || `<div class="endpoint unknown"><span class="dot"></span>no watched tools</div>`;
+  return `<div class="pgroup gh"><h3>github write · ${esc(agg)}</h3>${rows}</div>`;
+}
+
 function postureHtml(p){
   const order = ["github","bitbucket","edge"];
   const cls = {github:"gh", bitbucket:"bb", edge:"edge"};
   return order.filter(g => p.groups[g]).map(g => {
+    if(g === "github") return githubWriteHtml(p.groups.github);
     const rows = p.groups[g].map(e =>
       `<div class="endpoint ${e.reachable ? "up" : "down"}"><span class="dot"></span>${esc(e.endpoint)}</div>`
     ).join("");
@@ -1306,8 +1526,8 @@ function postureHtml(p){
   }).join("");
 }
 
-// TCP sees the VPNs (bitbucket, edge) but not GitHub write, so baseline and
-// firewall-off are indistinguishable here (ADR-0013).
+// VPN chips come from Bitbucket/Edge TCP only. GitHub write is a separate
+// aggregate (ADR-0013); baseline and firewall-off stay indistinguishable via TCP.
 function inferPostures(p){
   const up = g => (p.groups[g] || []).some(e => e.reachable);
   const bb = up("bitbucket"), edge = up("edge");
@@ -1328,22 +1548,27 @@ function pstripHtml(inf){
 function postureNote(p, inf){
   let read;
   if(inf.bb && inf.edge)
-    read = "<b>Both VPNs up</b> — publish, deploy, and tag-bitbucket can run; tag-github still needs the firewall off.";
+    read = "<b>Both VPNs up</b> — publish, deploy, and tag-bitbucket can run; tag-github still needs the firewall off. GitHub write aggregate is shown separately.";
   else if(inf.bb)
     read = "<b>Bitbucket VPN up</b> — publish and tag-bitbucket can run; deploy also needs the Edge VPN.";
   else if(inf.edge)
     read = "<b>Edge VPN up</b> — join the Bitbucket VPN before publish or deploy.";
   else
-    read = "<b>No VPNs reachable</b> — baseline or firewall-off; TCP cannot see GitHub write. GitHub read works in every posture.";
-  return `${read} <span style="color:var(--faint)">probed ${esc(p.probed_at)} · TCP only</span>`;
+    read = "<b>No VPNs reachable</b> — baseline or firewall-off; GitHub write aggregate is shown separately. GitHub read works in every posture.";
+  return `${read} <span style="color:var(--faint)">probed ${esc(p.probed_at)}</span>`;
 }
 
-// Small honesty marker next to the next command: can the current posture
-// (as far as TCP can see) run it?
+// Honesty marker next to the next command: TCP for VPN phases; write aggregate for gh.
 function readinessHtml(req){
   if(!tcpCaps) return "";
   if(req === "any") return `<span class="readiness ok">runs in any posture</span>`;
-  if(req === "gh")  return `<span class="readiness">tcp can't see github write</span>`;
+  if(req === "gh"){
+    if(githubWriteAgg === "ok")
+      return `<span class="readiness ok">github write ok</span>`;
+    if(githubWriteAgg === "fail")
+      return `<span class="readiness blocked">github write unavailable</span>`;
+    return `<span class="readiness">github write unknown</span>`;
+  }
   const ok = req === "bb" ? tcpCaps.bb : (tcpCaps.bb && tcpCaps.edge);
   return ok ? `<span class="readiness ok">posture ok (tcp)</span>`
             : `<span class="readiness blocked">switch needed</span>`;
@@ -1606,8 +1831,11 @@ async function pollPosture(){
     const res = await fetch("/api/posture");
     const p = await res.json();
     const inf = inferPostures(p);
-    const capsChanged = !tcpCaps || tcpCaps.bb !== inf.bb || tcpCaps.edge !== inf.edge;
+    const nextAgg = p.groups.github && p.groups.github.aggregate;
+    const capsChanged = !tcpCaps || tcpCaps.bb !== inf.bb || tcpCaps.edge !== inf.edge
+      || githubWriteAgg !== nextAgg;
     tcpCaps = {bb: inf.bb, edge: inf.edge};
+    githubWriteAgg = nextAgg;
     document.getElementById("posture").innerHTML = postureHtml(p);
     document.getElementById("pstrip").innerHTML = pstripHtml(inf);
     document.getElementById("pnote").innerHTML = postureNote(p, inf);

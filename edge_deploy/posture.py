@@ -169,8 +169,8 @@ def git_probe_command(remote: str, access: str) -> list[str]:
 def _default_git_probe_runner(command: list[str], repo_root: Path) -> int:
     env = dict(os.environ)
     # A probe must never block on an interactive credential prompt.
-    env.setdefault("GIT_TERMINAL_PROMPT", "0")
-    env.setdefault("GCM_INTERACTIVE", "never")
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "never"
     try:
         completed = subprocess.run(
             command,

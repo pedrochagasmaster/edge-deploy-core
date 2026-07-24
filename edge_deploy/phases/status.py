@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from edge_deploy.config import OperatorConfig
-from edge_deploy.ledger import RunLedger
+from edge_deploy.ledger import RunLedger, is_training_ledger
 from edge_deploy.posture import describe_phase_posture
 
 # tag_bitbucket precedes tag_github (ADR-0012/0013): it shares deploy's
@@ -76,6 +76,8 @@ def _next_command_for_phase(ledger: RunLedger, phase: str) -> str:
 
 
 def _resolve_next_line(ledger: RunLedger) -> str:
+    if is_training_ledger(ledger):
+        return "next: TRAINING ONLY (not a production command)"
     run_status = ledger.state["status"]
     if run_status == "complete":
         return "next: none (complete)"
@@ -93,9 +95,10 @@ def format_run_status(ledger: RunLedger) -> str:
     state = ledger.state
     run_id = state["run_id"]
     sha7 = state["source_sha"][:7]
+    training_mark = "  training=true" if is_training_ledger(ledger) else ""
     header = (
         f"run {run_id}  tool={state['tool']}  kind={state['kind']}  "
-        f"source={sha7}  created={state['created_at']}"
+        f"source={sha7}  created={state['created_at']}{training_mark}"
     )
     lines = [
         header,

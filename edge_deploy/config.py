@@ -24,6 +24,18 @@ DEFAULT_OPERATOR_CONFIG_PATH = (
 )
 TOOL_PROFILE_FILENAME = "edge_deploy.yaml"
 
+
+def default_operator_config_path() -> Path:
+    """Return the operator config path using the current ``APPDATA`` (or ``~/.config``).
+
+    Prefer this over :data:`DEFAULT_OPERATOR_CONFIG_PATH` when installing or loading
+    config during a command: the module-level constant is fixed at import time for
+    backward compatibility (CLI defaults, older call sites), while this helper
+    tracks runtime environment changes (tests, controller session setup).
+    """
+    base = Path(os.environ.get("APPDATA", Path.home() / ".config"))
+    return base / "edge-deploy" / "config.yaml"
+
 # Valid ``tui_exit`` strategies understood by the pane transport adapter
 # (:mod:`edge_deploy.tmux_driver`).
 VALID_TUI_EXIT = ("ctrl_c", "dispatch_dynamic", "none")

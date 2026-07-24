@@ -22,8 +22,9 @@ from edge_deploy import __version__, drift, preflight, rollout
 from edge_deploy.audit import AuditAttempt, AuditSyncError, append_audit_attempt
 from edge_deploy.auth import AuthBroker
 from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, OperatorConfig, load_tool_profile
-from edge_deploy.ledger import LedgerError, RunLedger
+from edge_deploy.ledger import LedgerError, RunLedger, is_training_ledger, reject_training_ledger
 from edge_deploy.mirror import MirrorError, mirror_release
+from edge_deploy.onboarding.runner import run_onboarding
 from edge_deploy.phases import PHASE_REGISTRY, EngineMismatchError, enter_phase
 from edge_deploy.phases.deploy import run_deploy
 from edge_deploy.phases.publish import run_publish_phase
@@ -168,6 +169,38 @@ def build_parser() -> argparse.ArgumentParser:
     abandon_parser.add_argument("--run", required=True)
     abandon_parser.add_argument("--reason", required=True)
 
+    onboard_parser = subparsers.add_parser(
+        "onboard",
+        help="Provision tools, validate both-vpns readiness, and run guided training",
+    )
+    onboard_parser.add_argument(
+        "--config",
+        required=True,
+        help="Private onboarding/operator source YAML (never commit this file)",
+    )
+    onboard_parser.add_argument("--root", default=None, help="Checkout root (overrides private file)")
+    onboard_parser.add_argument(
+        "--tool",
+        action="append",
+        choices=("autobench", "robocop", "dispatch"),
+        help="Tool to provision; repeatable. 'dispatch' is a CLI alias for robocop",
+    )
+    onboard_parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Rerun diagnostics without provisioning",
+    )
+    onboard_parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="Discard onboarding evidence only (keeps checkouts and private config)",
+    )
+    onboard_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm --restart non-interactively (valid only with --restart)",
+    )
+
     for _spec, register_fn in sorted(PHASE_REGISTRY, key=lambda item: item[0].order):
         register_fn(subparsers)
     register_status(subparsers)
@@ -252,6 +285,16 @@ def _print_open_run_refusal(run: dict) -> None:
     tool = run["tool"]
     sha7 = run["source_sha"][:7]
     created_at = run["created_at"]
+    if is_training_ledger(run):
+        print(
+            f"release refused: open training run {run_id} for {tool} "
+            f"(source {sha7}, created {created_at}) exists."
+        )
+        print(
+            "Training ledgers are practice-only under the training workspace; "
+            "do not continue or abandon them with production commands."
+        )
+        return
     print(
         f"release refused: unresolved run {run_id} for {tool} "
         f"(source {sha7}, created {created_at}) exists."
@@ -569,6 +612,7 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
             print(f"no such run: {args.run} under {runs_root}", file=sys.stderr)
             return 2
         ledger = RunLedger.load(run_dir)
+        reject_training_ledger(ledger)
         if ledger.state["status"] != "open":
             return _refuse_non_open_run("release", args.run, ledger.state["status"])
     else:
@@ -789,6 +833,7 @@ def _cmd_abandon(args: argparse.Namespace, operator: OperatorConfig) -> int:
         print(f"no such run: {args.run} under {runs_root}", file=sys.stderr)
         return 2
     ledger = RunLedger.load(run_dir)
+    reject_training_ledger(ledger)
     with ledger.locked():
         ledger.abandon(args.reason)
     print(f"abandoned {args.run}")
@@ -936,6 +981,17 @@ def main(argv: list[str] | None = None) -> int:
             return args.func(args, None)
         except (LedgerError, KeyError, ValueError) as exc:
             print(f"status failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 2
+    if args.command == "onboard":
+        # Onboarding loads a private source file via its own import path; do not
+        # require OperatorConfig.load (same early-exit class as status / mirror).
+        if args.yes and not args.restart:
+            print("error: --yes requires --restart", file=sys.stderr)
+            return 2
+        try:
+            return run_onboarding(args)
+        except (RuntimeError, ValueError, FileNotFoundError, OSError) as exc:
+            print(f"onboard failed: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 2
     try:
         operator = OperatorConfig.load(args.config)
