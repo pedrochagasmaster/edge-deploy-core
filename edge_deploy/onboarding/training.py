@@ -123,7 +123,13 @@ def _fabricate_publish(ledger: RunLedger) -> None:
 def _fabricate_deploy(ledger: RunLedger, nodes: list[str]) -> None:
     sha = ledger.state["source_sha"]
     tool = ledger.state["tool"]
-    ledger.record_event("phase_entered", phase="deploy")
+    # Partial re-entry (remaining nodes) must not duplicate phase_entered.
+    deploy_already_started = any(
+        ledger.phase_state("deploy", node=node) != "pending"
+        for node in ledger.state["nodes"]
+    )
+    if not deploy_already_started:
+        ledger.record_event("phase_entered", phase="deploy")
     for node in nodes:
         if ledger.phase_state("deploy", node=node) == "passed":
             continue

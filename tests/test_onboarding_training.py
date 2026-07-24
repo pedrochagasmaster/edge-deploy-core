@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from edge_deploy import cli
+from edge_deploy.cli import RELEASE_PHASES
 from edge_deploy.config import OperatorConfig
 from edge_deploy.ledger import (
     _VALID_PHASE_STATES,
@@ -429,27 +430,93 @@ _ROLLOUT_EVIDENCE_KEYS = frozenset(
         "dependency",
     }
 )
+_FORBIDDEN_EXECUTOR_PREFIXES = (
+    "edge_deploy.phases.publish",
+    "edge_deploy.phases.deploy",
+    "edge_deploy.phases.tag",
+    "edge_deploy.phases.verify",
+    "edge_deploy.publish",
+    "edge_deploy.rollout",
+    "edge_deploy.mirror",
+    "edge_deploy.release",
+)
+
+
+def _literal_str(node: ast.AST | None) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _is_forbidden_module(name: str) -> bool:
+    return any(
+        name == prefix or name.startswith(prefix + ".")
+        for prefix in _FORBIDDEN_EXECUTOR_PREFIXES
+    )
+
+
+def _forbidden_modules_from_source(source: str) -> set[str]:
+    """Return forbidden production executor module names referenced in source."""
+    tree = ast.parse(source)
+    found: set[str] = set()
+
+    def note(name: str | None) -> None:
+        if name and _is_forbidden_module(name):
+            found.add(name)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                note(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            base = node.module or ""
+            note(base)
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                note(f"{base}.{alias.name}" if base else alias.name)
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name) and func.id == "__import__" and node.args:
+                note(_literal_str(node.args[0]))
+            if isinstance(func, ast.Attribute) and func.attr == "import_module" and node.args:
+                note(_literal_str(node.args[0]))
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr == "__import__"
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "importlib"
+                and node.args
+            ):
+                note(_literal_str(node.args[0]))
+    return found
+
+
+def test_ast_guard_detects_aliases_prefixes_and_dynamic_imports() -> None:
+    samples = {
+        "import edge_deploy.phases.publish as pub": "edge_deploy.phases.publish",
+        "from edge_deploy.phases import deploy as d": "edge_deploy.phases.deploy",
+        "from edge_deploy.rollout.helpers import x": "edge_deploy.rollout.helpers",
+        "from edge_deploy import release": "edge_deploy.release",
+        '__import__("edge_deploy.phases.tag")': "edge_deploy.phases.tag",
+        'importlib.import_module("edge_deploy.mirror")': "edge_deploy.mirror",
+        'importlib.__import__("edge_deploy.publish")': "edge_deploy.publish",
+        'importlib.import_module("edge_deploy.phases.verify.extra")': (
+            "edge_deploy.phases.verify.extra"
+        ),
+    }
+    for source, expected in samples.items():
+        found = _forbidden_modules_from_source(source)
+        assert any(_is_forbidden_module(name) for name in found), source
+        assert expected in found or any(
+            expected == name or name.startswith(expected + ".") or expected.startswith(name + ".")
+            for name in found
+        ), (source, found)
 
 
 def test_training_module_does_not_import_production_executors() -> None:
     source = _TRAINING_MODULE.read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    imported: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported.update(alias.name for alias in node.names)
-        if isinstance(node, ast.ImportFrom) and node.module:
-            imported.add(node.module)
-    forbidden = {
-        "edge_deploy.phases.publish",
-        "edge_deploy.phases.deploy",
-        "edge_deploy.phases.tag",
-        "edge_deploy.phases.verify",
-        "edge_deploy.publish",
-        "edge_deploy.rollout",
-        "edge_deploy.mirror",
-    }
-    assert not (imported & forbidden)
+    assert _forbidden_modules_from_source(source) == set()
 
 
 def test_training_module_has_no_subprocess_or_network_calls() -> None:
@@ -555,8 +622,8 @@ def test_guided_training_console_compatible_shape_and_events(tmp_path: Path) -> 
     event_names = [event["event"] for event in events]
     assert event_names[0] == "run_created"
     assert event_names[-1] == "run_completed"
-    for phase in TRAINING_PHASES:
-        assert any(e["event"] == "phase_entered" and e["phase"] == phase for e in events)
+    entered = [e["phase"] for e in events if e["event"] == "phase_entered"]
+    assert entered == list(TRAINING_PHASES)
     assert all(event["event"] in _ENGINE_EVENTS for event in events)
 
 
@@ -578,14 +645,39 @@ def test_advance_training_rejects_out_of_order(tmp_path: Path) -> None:
 
 def test_advance_training_rerun_is_idempotent(tmp_path: Path) -> None:
     ws = create_training_workspace(tmp_path / "appdata", "autobench")
-    ledger = start_training_ledger(ws, tool="autobench", operator="op", nodes=["node03"])
+    ledger = start_training_ledger(ws, tool="autobench", operator="op", nodes=["node03", "node04"])
+    for phase in ("verify", "publish", "deploy", "tag_bitbucket", "tag_github"):
+        advance_training(ledger, phase)
+        snapshot = json.loads(json.dumps(ledger.state["phases"][phase]))
+        events_before = _events(ledger)
+        advance_training(ledger, phase)
+        assert ledger.state["phases"][phase] == snapshot
+        assert _events(ledger) == events_before
+        if phase == "deploy":
+            assert all(
+                ledger.phase_state("deploy", node=n) == "passed"
+                for n in ("node03", "node04")
+            )
+        else:
+            assert ledger.phase_state(phase) == "passed"
+
+
+def test_partial_deploy_reentry_does_not_duplicate_phase_entered(tmp_path: Path) -> None:
+    ws = create_training_workspace(tmp_path / "appdata", "autobench")
+    ledger = start_training_ledger(ws, tool="autobench", operator="op", nodes=["node03", "node04"])
     advance_training(ledger, "verify")
-    first = dict(ledger.state["phases"]["verify"])
-    events_before = len(_events(ledger))
-    advance_training(ledger, "verify")
-    assert ledger.state["phases"]["verify"] == first
-    assert len(_events(ledger)) == events_before
-    assert ledger.phase_state("verify") == "passed"
+    advance_training(ledger, "publish")
+    advance_training(ledger, "deploy", nodes=["node03"])
+    assert ledger.phase_state("deploy", node="node03") == "passed"
+    assert ledger.phase_state("deploy", node="node04") == "pending"
+    first_entered = [e for e in _events(ledger) if e["event"] == "phase_entered"]
+    assert [e["phase"] for e in first_entered] == ["verify", "publish", "deploy"]
+
+    advance_training(ledger, "deploy", nodes=["node04"])
+    assert ledger.phase_state("deploy", node="node04") == "passed"
+    entered = [e["phase"] for e in _events(ledger) if e["event"] == "phase_entered"]
+    assert entered == ["verify", "publish", "deploy"]
+    assert entered.count("deploy") == 1
 
 
 def test_advance_training_rejects_non_training_ledger(tmp_path: Path) -> None:
@@ -638,4 +730,5 @@ def test_guided_training_preserves_markers_and_stays_in_training_root(tmp_path: 
 
 
 def test_training_phases_order_matches_production() -> None:
+    assert TRAINING_PHASES == RELEASE_PHASES
     assert TRAINING_PHASES == ("verify", "publish", "deploy", "tag_bitbucket", "tag_github")
