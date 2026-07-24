@@ -59,6 +59,9 @@ from edge_deploy.onboarding.manifest import (
 from edge_deploy.onboarding.repositories import (
     assert_engine_pins_compatible,
     bootstrap_core_root,
+    collect_checkout_evidence,
+    fingerprint_remote_url,
+    inspect_bootstrap_core,
     install_tool_dependencies,
     provision_tool_checkout,
     validate_bootstrap_core,
@@ -95,28 +98,47 @@ def _command_available(name: str) -> bool:
     return shutil.which(name) is not None
 
 
-def _powershell_compatible() -> bool:
-    """True when a Windows PowerShell 5.1-compatible shell is available."""
+def _powershell_version() -> tuple[int, int] | None:
+    """Return Windows PowerShell (major, minor), or None if unavailable."""
     if _platform_name() != "win32":
-        return False
+        return None
     shell = shutil.which("powershell") or shutil.which("powershell.exe")
     if not shell:
-        return False
+        return None
     try:
         completed = subprocess.run(
             [
                 shell,
                 "-NoProfile",
                 "-Command",
-                "if ($PSVersionTable.PSVersion.Major -ge 5) { exit 0 } else { exit 1 }",
+                "$v = $PSVersionTable.PSVersion; Write-Output \"$($v.Major).$($v.Minor)\"",
             ],
             capture_output=True,
+            text=True,
             timeout=_SUBPROCESS_TIMEOUT_S,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    text = (completed.stdout or "").strip().splitlines()
+    if not text:
+        return None
+    try:
+        major_s, minor_s = text[-1].strip().split(".", 1)
+        return int(major_s), int(minor_s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _powershell_compatible() -> bool:
+    """True only for Windows PowerShell 5.1+ (not 4.x, not 7+)."""
+    version = _powershell_version()
+    if version is None:
         return False
-    return completed.returncode == 0
+    major, minor = version
+    return major == 5 and minor >= 1
 
 
 def _confirm_restart() -> bool:
@@ -264,10 +286,14 @@ def _ensure_kerberos(driver: Any, node_name: str) -> Any:
     return ensure_kerberos(driver, node_name)
 
 
-def _wire_session_runners(
+def _session_runners_for_readiness(
     operator: OperatorConfig,
 ) -> tuple[AuthRunner, TransportSmokeRunner, KerberosRunner, NodeSessionRegistry]:
-    """One registry per readiness pass: RSA → optional Kerberos → transport smoke."""
+    """Primary readiness auth seam (Task 13 / tests monkeypatch this).
+
+    Builds one ``NodeSessionRegistry`` so RSA → optional Kerberos → transport smoke
+    share a single per-node authenticated driver.
+    """
     registry = NodeSessionRegistry()
     rsa_inner, transport_runner = make_rsa_and_transport_runners(
         operator,
@@ -291,29 +317,6 @@ def _wire_session_runners(
 
     kerberos_runner = build_default_kerberos_runner(registry, ensure_fn=_ensure_kerberos)
     return rsa_runner, transport_runner, kerberos_runner, registry
-
-
-def _make_rsa_auth_runner() -> AuthRunner:
-    """Test seam / Task-13 hook; production readiness uses ``_wire_session_runners``."""
-
-    def run(node: str) -> CheckResult:
-        return CheckResult(f"rsa_auth:{node}", "failed", "RSA runner not wired", "")
-
-    return run
-
-
-def _make_transport_smoke_runner() -> TransportSmokeRunner:
-    def run(node: str) -> CheckResult:
-        return CheckResult(f"transport_smoke:{node}", "failed", "transport runner not wired", "")
-
-    return run
-
-
-def _make_kerberos_runner() -> KerberosRunner:
-    def run(node: str) -> CheckResult:
-        return CheckResult(f"kerberos:{node}", "failed", "Kerberos runner not wired", "")
-
-    return run
 
 
 def _first_real_release_commands(tools: Sequence[str]) -> list[str]:
@@ -540,6 +543,18 @@ def _stage_repositories(
                 }
             )
 
+        checkout_evidence: dict[str, dict[str, Any]] = {}
+        for tool, tool_root in zip(tools, tool_roots):
+            evidence = collect_checkout_evidence(tool_root, TOOL_MANIFESTS[tool])
+            stored = evidence.to_stored()
+            checkout_evidence[tool] = stored
+
+        core_evidence = inspect_bootstrap_core(
+            bootstrap_core_root(),
+            expected_tag=expected,
+            expected_bitbucket_fingerprint=fingerprint_remote_url(core_url),
+        )
+
         state.mark_stage(
             "repositories",
             "passed",
@@ -548,6 +563,19 @@ def _stage_repositories(
                 "root": str(root),
                 "engine_tag": expected,
                 "actions": actions,
+                "checkout_evidence": checkout_evidence,
+                "core_evidence": {
+                    key: core_evidence[key]
+                    for key in (
+                        "head_sha",
+                        "exact_tag",
+                        "origin_fingerprint",
+                        "bitbucket_fingerprint",
+                        "dirty",
+                        "evidence_fingerprint",
+                    )
+                    if key in core_evidence
+                },
             },
             checks=checks,
         )
@@ -578,62 +606,58 @@ def _revalidate_repositories(
     tools: list[str],
     root: Path,
 ) -> None:
-    """Safely re-check existing checkouts; invalidate readiness when inputs drift."""
+    """Read-only evidence compare. Never clones, adds remotes, or installs.
+
+    Missing evidence (legacy state), missing checkouts, or fingerprint drift
+    invalidates repositories+readiness so the full repository stage can provision
+    or fail explicitly on the next pass.
+    """
+    previous = state.data["stages"]["repositories"].get("inputs") or {}
+    stored_tools = previous.get("checkout_evidence")
+    stored_core = previous.get("core_evidence")
+    if not isinstance(stored_tools, dict) or not isinstance(stored_core, dict):
+        state.invalidate_from("repositories")
+        return
+
     try:
         core_url = imported.bitbucket_remotes.get("core")
         if not core_url:
             raise RuntimeError("missing bitbucket_remotes.core")
-        validate_bootstrap_core(
+        live_core = inspect_bootstrap_core(
             bootstrap_core_root(),
-            bitbucket_url=core_url,
             expected_tag=approved_engine_tag(),
+            expected_bitbucket_fingerprint=fingerprint_remote_url(core_url),
         )
-        tool_roots: list[Path] = []
-        for tool in tools:
-            remote = imported.bitbucket_remotes.get(tool)
-            if not remote:
-                raise RuntimeError(f"missing bitbucket_remotes.{tool}")
-            result = provision_tool_checkout(
-                _tool_dest(root, tool),
-                TOOL_MANIFESTS[tool],
-                bitbucket_url=remote,
-            )
-            if result.action != "reused":
-                raise RuntimeError(f"unexpected provisioning action during revalidate: {result.action}")
-            tool_roots.append(Path(result.path))
-        assert_engine_pins_compatible(tool_roots, expected_tag=approved_engine_tag())
-        previous = state.data["stages"]["repositories"].get("inputs") or {}
-        current_inputs = {
-            "tools": list(tools),
-            "root": str(root),
-            "engine_tag": approved_engine_tag(),
-        }
+        if live_core.get("evidence_fingerprint") != stored_core.get("evidence_fingerprint"):
+            raise RuntimeError("bootstrap core evidence drifted")
+
         if (
-            previous.get("tools") != current_inputs["tools"]
-            or previous.get("root") != current_inputs["root"]
-            or previous.get("engine_tag") != current_inputs["engine_tag"]
+            list(previous.get("tools") or []) != list(tools)
+            or str(previous.get("root") or "") != str(root)
+            or str(previous.get("engine_tag") or "") != approved_engine_tag()
         ):
-            state.invalidate_from("readiness")
-            state.data["stages"]["repositories"]["inputs"] = {
-                **current_inputs,
-                "actions": {tool: "reused" for tool in tools},
-            }
+            raise RuntimeError("repository selection inputs changed")
+
+        for tool in tools:
+            stored = stored_tools.get(tool)
+            if not isinstance(stored, dict):
+                raise RuntimeError(f"missing stored evidence for {tool}")
+            expected_bb = imported.bitbucket_remotes.get(tool)
+            if not expected_bb:
+                raise RuntimeError(f"missing bitbucket_remotes.{tool}")
+            live = collect_checkout_evidence(_tool_dest(root, tool), TOOL_MANIFESTS[tool])
+            if live.bitbucket_fingerprint != fingerprint_remote_url(expected_bb):
+                raise RuntimeError(f"bitbucket remote fingerprint mismatch for {tool}")
+            if live.origin_fingerprint != fingerprint_remote_url(
+                TOOL_MANIFESTS[tool].github_url
+            ):
+                raise RuntimeError(f"origin fingerprint mismatch for {tool}")
+            if live.engine_pin != approved_engine_tag() or not live.required_files_ok:
+                raise RuntimeError(f"pin or required files invalid for {tool}")
+            if not live.matches_stored(stored):
+                raise RuntimeError(f"checkout evidence drifted for {tool}")
     except Exception:
-        state.invalidate_from("readiness")
-        state.mark_stage(
-            "repositories",
-            "failed",
-            inputs={"tools": list(tools), "root": str(root)},
-            checks=[
-                {
-                    "id": "repositories_revalidate",
-                    "outcome": "failed",
-                    "summary": "existing checkouts failed revalidation",
-                    "remediation": "Correct repository state, then re-run onboard (not --check).",
-                    "evidence_fingerprint": None,
-                }
-            ],
-        )
+        state.invalidate_from("repositories")
 
 
 def _validate_existing_for_check(
@@ -721,8 +745,8 @@ def _stage_readiness(
             if not path.is_dir():
                 raise RuntimeError(f"missing tool checkout for {tool} at {path}")
 
-        rsa_runner, transport_runner, kerberos_runner, registry = _wire_session_runners(
-            operator
+        rsa_runner, transport_runner, kerberos_runner, registry = (
+            _session_runners_for_readiness(operator)
         )
 
         ctx = ReadinessContext(
@@ -959,13 +983,11 @@ def _run_stages(
         if state.data["stages"]["config"]["outcome"] != "passed":
             return 1
 
+    if state.data["stages"]["repositories"]["outcome"] == "passed":
+        _revalidate_repositories(state, imported=imported, tools=tools, root=root)
+        state.save()
     if state.data["stages"]["repositories"]["outcome"] != "passed":
         _stage_repositories(state, imported=imported, tools=tools, root=root)
-        state.save()
-        if state.data["stages"]["repositories"]["outcome"] != "passed":
-            return 1
-    else:
-        _revalidate_repositories(state, imported=imported, tools=tools, root=root)
         state.save()
         if state.data["stages"]["repositories"]["outcome"] != "passed":
             return 1
@@ -998,6 +1020,10 @@ def run_onboarding(args: argparse.Namespace) -> int:
     state_path = default_state_path()
     app_dir = state_path.parent
 
+    # Validate private source before any evidence reset so bad --restart cannot
+    # discard a good state when the new config is unusable.
+    imported = load_private_onboarding_source(Path(args.config))
+
     if args.restart:
         if not (args.yes or _confirm_restart()):
             print("restart cancelled")
@@ -1007,7 +1033,6 @@ def run_onboarding(args: argparse.Namespace) -> int:
             state.reset_evidence()
             state.save()
 
-    imported = load_private_onboarding_source(Path(args.config))
     raw_tools = args.tool if args.tool is not None else _prompt_tools()
     tools = _canonicalize_tools(raw_tools)
     root = Path(args.root) if args.root else _default_checkout_root(imported)

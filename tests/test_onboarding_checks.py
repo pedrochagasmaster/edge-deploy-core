@@ -690,6 +690,29 @@ def test_conditional_kerberos_only_when_require_deep_smoke(tmp_path: Path) -> No
     assert not any(s.id.startswith("kerberos:") for s in shallow)
 
 
+def test_transport_smoke_depends_on_kerberos_when_deep_else_rsa(tmp_path: Path) -> None:
+    deep = build_readiness_specs(_ctx(tmp_path, require_deep_smoke=True))
+    deep_smoke = next(s for s in deep if s.id == "transport_smoke:node03")
+    assert deep_smoke.depends_on == ("kerberos:node03",)
+
+    shallow = build_readiness_specs(_ctx(tmp_path, require_deep_smoke=False))
+    shallow_smoke = next(s for s in shallow if s.id == "transport_smoke:node03")
+    assert shallow_smoke.depends_on == ("rsa_auth:node03",)
+
+
+def test_deep_smoke_blocks_transport_when_kerberos_fails(tmp_path: Path) -> None:
+    ctx = _ctx(
+        tmp_path,
+        require_deep_smoke=True,
+        kerberos_runner=lambda node: CheckResult(
+            f"kerberos:{node}", "failed", "Kerberos failed", "fix ticket"
+        ),
+    )
+    results = {r.id: r for r in run_checks(build_readiness_specs(ctx))}
+    assert results["kerberos:node03"].outcome == "failed"
+    assert results["transport_smoke:node03"].outcome == "blocked"
+
+
 # ---------------------------------------------------------------------------
 # Review-fix coverage (host-safe errors, defaults, registry ownership)
 # ---------------------------------------------------------------------------

@@ -210,10 +210,13 @@ def build_readiness_specs(ctx: ReadinessContext) -> list[CheckSpec]:
                     lambda node=node: ctx.kerberos_runner(node),
                 )
             )
+            smoke_deps: tuple[str, ...] = (f"kerberos:{node}",)
+        else:
+            smoke_deps = (f"rsa_auth:{node}",)
         specs.append(
             CheckSpec(
                 f"transport_smoke:{node}",
-                (f"rsa_auth:{node}",),
+                smoke_deps,
                 lambda node=node: ctx.transport_smoke_runner(node),
             )
         )

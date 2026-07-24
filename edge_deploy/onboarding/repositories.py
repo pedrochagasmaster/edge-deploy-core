@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
 import re
 import subprocess
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,6 +18,8 @@ CommandRunner = Callable[[Sequence[str]], str]
 
 _ENGINE_PIN_RE = re.compile(r"@(v\d+\.\d+\.\d+)")
 _REQUIRED_OPERATOR_EXTRAS = ("dev", "release")
+GIT_COMMAND_TIMEOUT_S = 20.0
+PIP_COMMAND_TIMEOUT_S = 600.0
 
 
 @dataclass(frozen=True)
@@ -26,14 +30,102 @@ class ProvisionResult:
     message: str
 
 
+@dataclass(frozen=True)
+class CheckoutEvidence:
+    """Non-secret checkout snapshot for resume/revalidation."""
+
+    tool_id: str
+    head_sha: str
+    dirty: bool
+    origin_fingerprint: str
+    bitbucket_fingerprint: str | None
+    engine_pin: str
+    required_files_ok: bool
+
+    def fingerprint(self) -> str:
+        payload = "|".join(
+            [
+                self.tool_id,
+                self.head_sha,
+                "1" if self.dirty else "0",
+                self.origin_fingerprint,
+                self.bitbucket_fingerprint or "",
+                self.engine_pin,
+                "1" if self.required_files_ok else "0",
+            ]
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def to_stored(self) -> dict:
+        return {
+            "tool_id": self.tool_id,
+            "head_sha": self.head_sha,
+            "dirty": self.dirty,
+            "origin_fingerprint": self.origin_fingerprint,
+            "bitbucket_fingerprint": self.bitbucket_fingerprint,
+            "engine_pin": self.engine_pin,
+            "required_files_ok": self.required_files_ok,
+            "evidence_fingerprint": self.fingerprint(),
+        }
+
+    def matches_stored(self, stored: Mapping[str, object]) -> bool:
+        live = self.to_stored()
+        keys = (
+            "tool_id",
+            "head_sha",
+            "dirty",
+            "origin_fingerprint",
+            "bitbucket_fingerprint",
+            "engine_pin",
+            "required_files_ok",
+        )
+        return all(live.get(key) == stored.get(key) for key in keys)
+
+
+def fingerprint_remote_url(url: str) -> str:
+    return hashlib.sha256(_normalize_url(url).encode("utf-8")).hexdigest()
+
+
+def _prompt_free_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
+    env = dict(base if base is not None else os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "never"
+    env.setdefault("GIT_ASKPASS", "")
+    env.setdefault("GH_PROMPT_DISABLED", "1")
+    return env
+
+
+def _timeout_for(args: Sequence[str]) -> float:
+    if not args:
+        return GIT_COMMAND_TIMEOUT_S
+    name = Path(args[0]).name.lower()
+    if name.startswith("pip"):
+        return PIP_COMMAND_TIMEOUT_S
+    if len(args) >= 3 and args[1] == "-m" and args[2] == "pip":
+        return PIP_COMMAND_TIMEOUT_S
+    return GIT_COMMAND_TIMEOUT_S
+
+
 def default_runner(root: Path) -> CommandRunner:
     root = Path(root)
 
     def run(args: Sequence[str]) -> str:
-        completed = subprocess.run(list(args), cwd=root, capture_output=True, text=True)
+        command = list(args)
+        label = Path(command[0]).name if command else "command"
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=_timeout_for(command),
+                env=_prompt_free_env(),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"{label} timed out") from exc
         if completed.returncode:
-            detail = (completed.stderr or completed.stdout).strip()
-            raise RuntimeError(f"{args[0]} failed: {detail}")
+            # Host-safe: never interpolate stderr/stdout (may contain private URLs/tokens).
+            raise RuntimeError(f"{label} failed (exit {completed.returncode})")
         return completed.stdout
 
     return run
@@ -82,6 +174,11 @@ def _head_matches_tag(run: CommandRunner, expected_tag: str) -> bool:
     return head == tagged and bool(head)
 
 
+def _is_dirty(run: CommandRunner) -> bool:
+    status = run(["git", "status", "--porcelain", "--untracked-files=all"])
+    return any(line.strip() for line in status.splitlines())
+
+
 def validate_bootstrap_core(
     core_root: Path,
     *,
@@ -98,7 +195,7 @@ def validate_bootstrap_core(
     run = runner if runner is not None else default_runner(core_root)
     origin = _remote_url(run, "origin")
     if origin is None or _normalize_url(origin) != _normalize_url(CORE_GITHUB_URL):
-        raise RuntimeError(f"origin points to unexpected repository: {origin or '(missing)'}")
+        raise RuntimeError("origin points to unexpected repository")
     if not _head_matches_tag(run, expected_tag):
         raise RuntimeError(
             f"bootstrap core HEAD is not exactly tag {expected_tag}; "
@@ -110,6 +207,87 @@ def validate_bootstrap_core(
         path=core_root.resolve(),
         action="validated",
         message=f"validated bootstrap core at {core_root}",
+    )
+
+
+def inspect_bootstrap_core(
+    core_root: Path,
+    *,
+    expected_tag: str,
+    expected_bitbucket_fingerprint: str,
+    runner: CommandRunner | None = None,
+) -> dict:
+    """Read-only core validation. Never clones or adds remotes."""
+    core_root = Path(core_root)
+    if not (core_root / ".git").exists():
+        raise RuntimeError("bootstrap core checkout missing")
+    run = runner if runner is not None else default_runner(core_root)
+    origin = _remote_url(run, "origin")
+    if origin is None or _normalize_url(origin) != _normalize_url(CORE_GITHUB_URL):
+        raise RuntimeError("origin points to unexpected repository")
+    if not _head_matches_tag(run, expected_tag):
+        raise RuntimeError(f"bootstrap core HEAD is not exactly tag {expected_tag}")
+    bitbucket = _remote_url(run, "bitbucket")
+    if bitbucket is None:
+        raise RuntimeError("bitbucket remote missing on bootstrap core")
+    bb_fp = fingerprint_remote_url(bitbucket)
+    if bb_fp != expected_bitbucket_fingerprint:
+        raise RuntimeError("bitbucket remote fingerprint mismatch on bootstrap core")
+    head_sha = run(["git", "rev-parse", "HEAD"]).strip()
+    payload = {
+        "head_sha": head_sha,
+        "exact_tag": expected_tag,
+        "origin_fingerprint": fingerprint_remote_url(origin),
+        "bitbucket_fingerprint": bb_fp,
+        "dirty": _is_dirty(run),
+    }
+    digest = hashlib.sha256(
+        "|".join(
+            [
+                payload["head_sha"],
+                payload["exact_tag"],
+                payload["origin_fingerprint"],
+                payload["bitbucket_fingerprint"],
+                "1" if payload["dirty"] else "0",
+            ]
+        ).encode("utf-8")
+    ).hexdigest()
+    payload["evidence_fingerprint"] = digest
+    return payload
+
+
+def collect_checkout_evidence(
+    dest: Path,
+    manifest: ToolManifest,
+    *,
+    runner: CommandRunner | None = None,
+) -> CheckoutEvidence:
+    """Read-only checkout snapshot. Never clones or adds remotes."""
+    dest = Path(dest)
+    if not (dest / ".git").exists():
+        raise RuntimeError(f"checkout missing at {dest}")
+    run = runner if runner is not None else default_runner(dest)
+    head_sha = run(["git", "rev-parse", "HEAD"]).strip()
+    dirty = _is_dirty(run)
+    origin = _remote_url(run, "origin")
+    if origin is None:
+        raise RuntimeError("origin remote missing")
+    bitbucket = _remote_url(run, "bitbucket")
+    profile = dest / manifest.profile_filename
+    local_check = dest / manifest.local_check_relative
+    required_files_ok = profile.is_file() and local_check.is_file()
+    try:
+        pin = read_engine_pin(dest)
+    except RuntimeError:
+        pin = ""
+    return CheckoutEvidence(
+        tool_id=manifest.tool_id,
+        head_sha=head_sha,
+        dirty=dirty,
+        origin_fingerprint=fingerprint_remote_url(origin),
+        bitbucket_fingerprint=fingerprint_remote_url(bitbucket) if bitbucket else None,
+        engine_pin=pin,
+        required_files_ok=required_files_ok,
     )
 
 
@@ -133,7 +311,7 @@ def provision_tool_checkout(
     run = runner if runner is not None else default_runner(dest)
     origin = _remote_url(run, "origin")
     if origin is None or _normalize_url(origin) != _normalize_url(manifest.github_url):
-        raise RuntimeError(f"origin points to unexpected repository: {origin or '(missing)'}")
+        raise RuntimeError("origin points to unexpected repository")
     _ensure_bitbucket_remote(run, bitbucket_url=bitbucket_url)
 
     profile = dest / manifest.profile_filename

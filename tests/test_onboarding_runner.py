@@ -635,6 +635,7 @@ def test_pin_before_install_ordering(tmp_path: Path, monkeypatch) -> None:
         "edge_deploy.onboarding.runner.install_tool_dependencies",
         fake_install,
     )
+    _stub_repo_evidence(monkeypatch)
 
     # Skip readiness/practice with stubs after repos
     _pass_all_readiness(monkeypatch)
@@ -663,6 +664,39 @@ def test_pin_before_install_ordering(tmp_path: Path, monkeypatch) -> None:
     assert all(events.index(p) < pin_idx for p in events if p.startswith("provision:"))
 
 
+def _stub_repo_evidence(monkeypatch, *, bb_url: str = "https://bitbucket.example/ab.git") -> None:
+    from edge_deploy.onboarding.manifest import TOOL_MANIFESTS
+    from edge_deploy.onboarding.repositories import CheckoutEvidence, fingerprint_remote_url
+
+    def fake_collect(dest, manifest, **kwargs):
+        return CheckoutEvidence(
+            tool_id=manifest.tool_id,
+            head_sha="a" * 40,
+            dirty=False,
+            origin_fingerprint=fingerprint_remote_url(TOOL_MANIFESTS[manifest.tool_id].github_url),
+            bitbucket_fingerprint=fingerprint_remote_url(bb_url),
+            engine_pin=approved_engine_tag(),
+            required_files_ok=True,
+        )
+
+    def fake_core(*_args, **_kwargs):
+        return {
+            "head_sha": "a" * 40,
+            "exact_tag": approved_engine_tag(),
+            "origin_fingerprint": fingerprint_remote_url(
+                "https://github.com/pedrochagasmaster/edge-deploy-core.git"
+            ),
+            "bitbucket_fingerprint": fingerprint_remote_url(
+                "https://bitbucket.example/core.git"
+            ),
+            "dirty": False,
+            "evidence_fingerprint": "c" * 64,
+        }
+
+    monkeypatch.setattr("edge_deploy.onboarding.runner.collect_checkout_evidence", fake_collect)
+    monkeypatch.setattr("edge_deploy.onboarding.runner.inspect_bootstrap_core", fake_core)
+
+
 def test_second_identical_run_skips_clone_and_install(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("APPDATA", str(tmp_path / "app"))
     private = _private_yaml(tmp_path)
@@ -671,7 +705,7 @@ def test_second_identical_run_skips_clone_and_install(tmp_path: Path, monkeypatc
     monkeypatch.setattr("edge_deploy.onboarding.runner._command_available", lambda _n: True)
     monkeypatch.setattr("edge_deploy.onboarding.runner._powershell_compatible", lambda: True)
 
-    counts = {"clone": 0, "install": 0, "remote_add": 0}
+    counts = {"clone": 0, "install": 0, "remote_add": 0, "provision": 0}
 
     monkeypatch.setattr(
         "edge_deploy.onboarding.runner.validate_bootstrap_core",
@@ -679,10 +713,12 @@ def test_second_identical_run_skips_clone_and_install(tmp_path: Path, monkeypatc
     )
 
     def provision(dest, manifest, **kwargs):
+        counts["provision"] += 1
         dest = Path(dest)
         if dest.exists():
             return ProvisionResult(manifest.tool_id, dest, "reused", "reused")
         counts["clone"] += 1
+        counts["remote_add"] += 1
         _seed_tool_tree(dest, manifest.tool_id)
         return ProvisionResult(manifest.tool_id, dest, "cloned", "cloned")
 
@@ -695,6 +731,7 @@ def test_second_identical_run_skips_clone_and_install(tmp_path: Path, monkeypatc
         "edge_deploy.onboarding.runner.install_tool_dependencies",
         lambda *a, **k: counts.__setitem__("install", counts["install"] + 1),
     )
+    _stub_repo_evidence(monkeypatch)
     _pass_all_readiness(monkeypatch)
     monkeypatch.setattr(
         "edge_deploy.onboarding.runner._stage_practice",
@@ -715,12 +752,17 @@ def test_second_identical_run_skips_clone_and_install(tmp_path: Path, monkeypatc
     assert run_onboarding(args) == 0
     assert counts["clone"] == 1
     assert counts["install"] == 1
+    assert counts["remote_add"] == 1
+    loaded = OnboardingState.load(default_state_path())
+    assert "checkout_evidence" in loaded.data["stages"]["repositories"]["inputs"]
     first_launches = len(console_launches)
+    first_provision = counts["provision"]
 
     assert run_onboarding(args) == 0
     assert counts["clone"] == 1
     assert counts["install"] == 1
-    # practice skipped → no extra console
+    assert counts["remote_add"] == 1
+    assert counts["provision"] == first_provision
     assert len(console_launches) == first_launches
 
 
@@ -1094,6 +1136,7 @@ def test_state_never_persists_private_config_values(tmp_path: Path, monkeypatch)
         "edge_deploy.onboarding.runner.install_tool_dependencies",
         lambda *a, **k: None,
     )
+    _stub_repo_evidence(monkeypatch)
     _pass_all_readiness(monkeypatch)
     monkeypatch.setattr(
         "edge_deploy.onboarding.runner._stage_practice",
@@ -1138,3 +1181,405 @@ def test_restart_resets_evidence_only(tmp_path: Path, monkeypatch) -> None:
     assert loaded.data["root"] == str(tmp_path / "root")
     assert loaded.data["stages"]["prerequisites"]["outcome"] == "pending"
     assert loaded.data["practice"] == {"completed": False, "run_id": None}
+
+
+def test_bad_config_before_restart_leaves_state_unchanged(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "app"))
+    private = _private_yaml(tmp_path)
+    imported = load_private_onboarding_source(private)
+    state = OnboardingState.create_new(
+        path=default_state_path(),
+        tools=["autobench"],
+        root=str(tmp_path / "root"),
+        config_fingerprint=imported.fingerprint,
+    )
+    state.mark_stage("prerequisites", "passed", inputs={"kept": True})
+    state.mark_stage("config", "passed", inputs={"fingerprint": imported.fingerprint})
+    state.data["practice"] = {"completed": True, "run_id": "keep-me"}
+    state.save()
+    before = default_state_path().read_bytes()
+
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("bb_token: leaked\noperator_email: x@y.com\nnodes: {}\n", encoding="utf-8")
+    try:
+        run_onboarding(_args(bad, restart=True, yes=True))
+        raised = False
+    except ValueError:
+        raised = True
+    assert raised
+    assert default_state_path().read_bytes() == before
+
+
+def test_powershell_rejects_wrong_versions(tmp_path: Path, monkeypatch) -> None:
+    from edge_deploy.onboarding import runner as runner_mod
+
+    monkeypatch.setattr(runner_mod, "_platform_name", lambda: "win32")
+    monkeypatch.setattr(runner_mod, "_powershell_version", lambda: (5, 0))
+    assert runner_mod._powershell_compatible() is False
+    monkeypatch.setattr(runner_mod, "_powershell_version", lambda: (7, 4))
+    assert runner_mod._powershell_compatible() is False
+    monkeypatch.setattr(runner_mod, "_powershell_version", lambda: (5, 1))
+    assert runner_mod._powershell_compatible() is True
+    monkeypatch.setattr(runner_mod, "_powershell_version", lambda: None)
+    assert runner_mod._powershell_compatible() is False
+
+
+def test_deleted_checkout_invalidates_repositories(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "app"))
+    private = _private_yaml(tmp_path)
+    imported = load_private_onboarding_source(private)
+    root = tmp_path / "root"
+    state = OnboardingState.create_new(
+        path=default_state_path(),
+        tools=["autobench"],
+        root=str(root),
+        config_fingerprint=imported.fingerprint,
+    )
+    for stage in ("prerequisites", "config", "repositories", "readiness"):
+        state.mark_stage(stage, "passed", inputs={})
+    from edge_deploy.onboarding.manifest import TOOL_MANIFESTS
+    from edge_deploy.onboarding.repositories import fingerprint_remote_url
+
+    state.data["stages"]["repositories"]["inputs"] = {
+        "tools": ["autobench"],
+        "root": str(root),
+        "engine_tag": approved_engine_tag(),
+        "checkout_evidence": {
+            "autobench": {
+                "tool_id": "autobench",
+                "head_sha": "a" * 40,
+                "dirty": False,
+                "origin_fingerprint": fingerprint_remote_url(
+                    TOOL_MANIFESTS["autobench"].github_url
+                ),
+                "bitbucket_fingerprint": fingerprint_remote_url(
+                    "https://bitbucket.example/ab.git"
+                ),
+                "engine_pin": approved_engine_tag(),
+                "required_files_ok": True,
+                "evidence_fingerprint": "e" * 64,
+            }
+        },
+        "core_evidence": {"evidence_fingerprint": "c" * 64},
+    }
+    state.save()
+
+    def missing_collect(dest, manifest, **kwargs):
+        raise RuntimeError("checkout missing")
+
+    monkeypatch.setattr(
+        "edge_deploy.onboarding.runner.collect_checkout_evidence",
+        missing_collect,
+    )
+    monkeypatch.setattr(
+        "edge_deploy.onboarding.runner.inspect_bootstrap_core",
+        lambda *_a, **_k: state.data["stages"]["repositories"]["inputs"]["core_evidence"],
+    )
+
+    from edge_deploy.onboarding import runner as runner_mod
+
+    runner_mod._revalidate_repositories(
+        state, imported=imported, tools=["autobench"], root=root
+    )
+    assert state.data["stages"]["repositories"]["outcome"] == "pending"
+    assert state.data["stages"]["readiness"]["outcome"] == "pending"
+
+
+def test_head_or_dirty_drift_invalidates_repositories(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "app"))
+    private = _private_yaml(tmp_path)
+    imported = load_private_onboarding_source(private)
+    root = tmp_path / "root"
+    from edge_deploy.onboarding.manifest import TOOL_MANIFESTS
+    from edge_deploy.onboarding.repositories import CheckoutEvidence, fingerprint_remote_url
+
+    stored = {
+        "tool_id": "autobench",
+        "head_sha": "a" * 40,
+        "dirty": False,
+        "origin_fingerprint": fingerprint_remote_url(TOOL_MANIFESTS["autobench"].github_url),
+        "bitbucket_fingerprint": fingerprint_remote_url("https://bitbucket.example/ab.git"),
+        "engine_pin": approved_engine_tag(),
+        "required_files_ok": True,
+        "evidence_fingerprint": "e" * 64,
+    }
+    state = OnboardingState.create_new(
+        path=default_state_path(),
+        tools=["autobench"],
+        root=str(root),
+        config_fingerprint=imported.fingerprint,
+    )
+    state.mark_stage("prerequisites", "passed", inputs={})
+    state.mark_stage("config", "passed", inputs={})
+    state.mark_stage(
+        "repositories",
+        "passed",
+        inputs={
+            "tools": ["autobench"],
+            "root": str(root),
+            "engine_tag": approved_engine_tag(),
+            "checkout_evidence": {"autobench": stored},
+            "core_evidence": {"evidence_fingerprint": "c" * 64},
+        },
+    )
+    state.mark_stage("readiness", "passed", inputs={})
+
+    def drifted(dest, manifest, **kwargs):
+        return CheckoutEvidence(
+            tool_id="autobench",
+            head_sha="b" * 40,
+            dirty=True,
+            origin_fingerprint=stored["origin_fingerprint"],
+            bitbucket_fingerprint=stored["bitbucket_fingerprint"],
+            engine_pin=approved_engine_tag(),
+            required_files_ok=True,
+        )
+
+    monkeypatch.setattr("edge_deploy.onboarding.runner.collect_checkout_evidence", drifted)
+    monkeypatch.setattr(
+        "edge_deploy.onboarding.runner.inspect_bootstrap_core",
+        lambda *_a, **_k: {"evidence_fingerprint": "c" * 64},
+    )
+    from edge_deploy.onboarding import runner as runner_mod
+
+    runner_mod._revalidate_repositories(
+        state, imported=imported, tools=["autobench"], root=root
+    )
+    assert state.data["stages"]["repositories"]["outcome"] == "pending"
+    assert state.data["stages"]["readiness"]["outcome"] == "pending"
+
+
+def test_missing_or_wrong_remote_invalidates_repositories(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "app"))
+    private = _private_yaml(tmp_path)
+    imported = load_private_onboarding_source(private)
+    root = tmp_path / "root"
+    from edge_deploy.onboarding.manifest import TOOL_MANIFESTS
+    from edge_deploy.onboarding.repositories import CheckoutEvidence, fingerprint_remote_url
+
+    origin_fp = fingerprint_remote_url(TOOL_MANIFESTS["autobench"].github_url)
+    stored = {
+        "tool_id": "autobench",
+        "head_sha": "a" * 40,
+        "dirty": False,
+        "origin_fingerprint": origin_fp,
+        "bitbucket_fingerprint": fingerprint_remote_url("https://bitbucket.example/ab.git"),
+        "engine_pin": approved_engine_tag(),
+        "required_files_ok": True,
+        "evidence_fingerprint": "e" * 64,
+    }
+    state = OnboardingState.create_new(
+        path=default_state_path(),
+        tools=["autobench"],
+        root=str(root),
+        config_fingerprint=imported.fingerprint,
+    )
+    state.mark_stage("prerequisites", "passed", inputs={})
+    state.mark_stage("config", "passed", inputs={})
+    state.mark_stage(
+        "repositories",
+        "passed",
+        inputs={
+            "tools": ["autobench"],
+            "root": str(root),
+            "engine_tag": approved_engine_tag(),
+            "checkout_evidence": {"autobench": stored},
+            "core_evidence": {"evidence_fingerprint": "c" * 64},
+        },
+    )
+    state.mark_stage("readiness", "passed", inputs={})
+
+    def wrong_remote(dest, manifest, **kwargs):
+        return CheckoutEvidence(
+            tool_id="autobench",
+            head_sha="a" * 40,
+            dirty=False,
+            origin_fingerprint=origin_fp,
+            bitbucket_fingerprint=None,
+            engine_pin=approved_engine_tag(),
+            required_files_ok=True,
+        )
+
+    monkeypatch.setattr(
+        "edge_deploy.onboarding.runner.collect_checkout_evidence",
+        wrong_remote,
+    )
+    monkeypatch.setattr(
+        "edge_deploy.onboarding.runner.inspect_bootstrap_core",
+        lambda *_a, **_k: {"evidence_fingerprint": "c" * 64},
+    )
+    from edge_deploy.onboarding import runner as runner_mod
+
+    runner_mod._revalidate_repositories(
+        state, imported=imported, tools=["autobench"], root=root
+    )
+    assert state.data["stages"]["repositories"]["outcome"] == "pending"
+
+
+def test_legacy_state_without_evidence_invalidates_safely(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "app"))
+    private = _private_yaml(tmp_path)
+    imported = load_private_onboarding_source(private)
+    state = OnboardingState.create_new(
+        path=default_state_path(),
+        tools=["autobench"],
+        root=str(tmp_path / "root"),
+        config_fingerprint=imported.fingerprint,
+    )
+    state.mark_stage("prerequisites", "passed", inputs={})
+    state.mark_stage("config", "passed", inputs={})
+    state.mark_stage(
+        "repositories",
+        "passed",
+        inputs={"tools": ["autobench"], "root": str(tmp_path / "root")},
+    )
+    state.mark_stage("readiness", "passed", inputs={})
+    from edge_deploy.onboarding import runner as runner_mod
+
+    runner_mod._revalidate_repositories(
+        state,
+        imported=imported,
+        tools=["autobench"],
+        root=tmp_path / "root",
+    )
+    assert state.data["stages"]["repositories"]["outcome"] == "pending"
+    assert state.data["stages"]["readiness"]["outcome"] == "pending"
+
+
+def test_check_mode_real_orchestration_no_mutations(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "app"))
+    monkeypatch.setenv("BB_TOKEN", "token=env-only")
+    private = _private_yaml(tmp_path)
+    root = tmp_path / "root"
+    tool_path = root / "autobench"
+    _seed_tool_tree(tool_path, "autobench")
+
+    from edge_deploy.onboarding.config_import import install_operator_config, merge_operator_config
+
+    imported = load_private_onboarding_source(private)
+    merged = merge_operator_config(
+        imported.operator_mapping,
+        audit_repo=str(bootstrap_core_root()),
+        tools={"autobench": str(tool_path)},
+    )
+    install_operator_config(merged)
+    config_bytes = (
+        Path(tmp_path / "app" / "edge-deploy" / "config.yaml").read_bytes()
+        if (tmp_path / "app" / "edge-deploy" / "config.yaml").is_file()
+        else None
+    )
+    # DEFAULT_OPERATOR_CONFIG_PATH uses APPDATA
+    from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH
+
+    config_bytes = DEFAULT_OPERATOR_CONFIG_PATH.read_bytes()
+
+    state = OnboardingState.create_new(
+        path=default_state_path(),
+        tools=["autobench"],
+        root=str(root),
+        config_fingerprint=imported.fingerprint,
+    )
+    state.mark_stage("prerequisites", "passed", inputs={})
+    state.mark_stage("config", "passed", inputs={"fingerprint": imported.fingerprint})
+    state.mark_stage("repositories", "passed", inputs={})
+    state.save()
+    report_path = default_state_path().parent / "onboarding-report.json"
+    assert not report_path.exists()
+
+    monkeypatch.setattr("edge_deploy.onboarding.runner._platform_name", lambda: "win32")
+    monkeypatch.setattr("edge_deploy.onboarding.runner._command_available", lambda _n: True)
+    monkeypatch.setattr("edge_deploy.onboarding.runner._powershell_compatible", lambda: True)
+
+    mutations = {
+        "install_config": 0,
+        "provision": 0,
+        "install_deps": 0,
+        "practice": 0,
+        "console": 0,
+        "complete": 0,
+    }
+    monkeypatch.setattr(
+        "edge_deploy.onboarding.runner.install_operator_config",
+        lambda *a, **k: mutations.__setitem__("install_config", mutations["install_config"] + 1),
+    )
+    monkeypatch.setattr(
+        "edge_deploy.onboarding.runner.provision_tool_checkout",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("provision in --check")),
+    )
+    monkeypatch.setattr(
+        "edge_deploy.onboarding.runner.install_tool_dependencies",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("install in --check")),
+    )
+    monkeypatch.setattr(
+        "edge_deploy.onboarding.runner.create_training_workspace",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("practice in --check")),
+    )
+    monkeypatch.setattr(
+        "edge_deploy.onboarding.runner._launch_console",
+        lambda roots: mutations.__setitem__("console", mutations["console"] + 1),
+    )
+    monkeypatch.setattr(
+        "edge_deploy.onboarding.runner._stage_complete",
+        lambda *a, **k: mutations.__setitem__("complete", mutations["complete"] + 1),
+    )
+
+    # Stub only external network/auth adapters on the runner module bindings.
+    for name, check_id, summary in (
+        ("build_default_gh_auth_runner", "gh_auth", "ok"),
+        ("build_default_github_read_runner", "github_read", "ok"),
+        ("build_default_tool_clean_main_runner", "tool_clean_main", "ok"),
+        ("build_default_bitbucket_read_runner", "bitbucket_read", "ok"),
+        ("build_default_bitbucket_write_dry_run_runner", "bitbucket_write_dry_run", "ok"),
+        ("build_default_audit_runner", "audit_release_log", "ok"),
+    ):
+        monkeypatch.setattr(
+            f"edge_deploy.onboarding.runner.{name}",
+            lambda check_id=check_id, summary=summary, **k: (
+                lambda: CheckResult(check_id, "passed", summary, "")
+            ),
+        )
+    monkeypatch.setattr(
+        "edge_deploy.onboarding.runner.build_default_edge_tcp_runner",
+        lambda *a, **k: (lambda: CheckResult("edge_tcp", "passed", "ok", "")),
+    )
+    monkeypatch.setattr(
+        "edge_deploy.onboarding.runner.build_default_known_hosts_runner",
+        lambda *a, **k: (lambda: CheckResult("known_hosts", "passed", "ok", "")),
+    )
+    monkeypatch.setattr(
+        "edge_deploy.onboarding.runner._session_runners_for_readiness",
+        lambda operator: (
+            (lambda node: CheckResult(f"rsa_auth:{node}", "passed", "ok", "")),
+            (lambda node: CheckResult(f"transport_smoke:{node}", "passed", "ok", "")),
+            (lambda node: CheckResult(f"kerberos:{node}", "passed", "ok", "")),
+            SimpleNamespace(stop_all=lambda: None),
+        ),
+    )
+    monkeypatch.setattr(
+        "edge_deploy.onboarding.runner._local_check_runner",
+        lambda root: 0,
+    )
+
+    code = run_onboarding(_args(private, root=str(root), check=True))
+    assert code == 0
+    assert mutations["install_config"] == 0
+    assert mutations["console"] == 0
+    assert mutations["complete"] == 0
+    assert DEFAULT_OPERATOR_CONFIG_PATH.read_bytes() == config_bytes
+    assert not report_path.exists()
+    loaded = OnboardingState.load(default_state_path())
+    assert loaded.data["stages"]["readiness"]["outcome"] == "passed"
+    assert loaded.data["stages"]["practice"]["outcome"] == "pending"
+    assert loaded.data["stages"]["complete"]["outcome"] == "pending"
+    assert any(
+        c["id"] == "rsa_auth:node03" for c in loaded.data["stages"]["readiness"]["checks"]
+    )
+
+
+def test_fail_stub_make_runners_removed() -> None:
+    import edge_deploy.onboarding.runner as runner_mod
+
+    assert not hasattr(runner_mod, "_make_rsa_auth_runner")
+    assert not hasattr(runner_mod, "_make_transport_smoke_runner")
+    assert not hasattr(runner_mod, "_make_kerberos_runner")
+    assert hasattr(runner_mod, "_session_runners_for_readiness")

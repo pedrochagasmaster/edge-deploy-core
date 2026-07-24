@@ -1,5 +1,7 @@
+import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -8,6 +10,9 @@ from edge_deploy.onboarding.manifest import CORE_GITHUB_URL, TOOL_MANIFESTS, app
 from edge_deploy.onboarding.repositories import (
     assert_engine_pins_compatible,
     bootstrap_core_root,
+    collect_checkout_evidence,
+    fingerprint_remote_url,
+    inspect_bootstrap_core,
     install_tool_dependencies,
     provision_tool_checkout,
     validate_bootstrap_core,
@@ -22,6 +27,7 @@ class FakeGit:
         self.head_tag = approved_engine_tag()
         self.head_sha = "a" * 40
         self.tag_sha = "a" * 40
+        self.dirty = False
         self.get_url_errors: dict[str, Exception] = {}
 
     def __call__(self, args: list[str]) -> str:
@@ -59,7 +65,7 @@ class FakeGit:
                 self.bitbucket = args[4]
             return ""
         if args[:2] == ["git", "status"]:
-            return ""
+            return " M edge_deploy.yaml\n" if self.dirty else ""
         if args[:3] == ["git", "describe", "--tags"]:
             if not self.head_tag:
                 raise RuntimeError("fatal: no tag exactly matches 'HEAD'")
@@ -310,3 +316,104 @@ def test_bootstrap_tag_mismatch_refused(tmp_path: Path) -> None:
             runner=fake,
         )
     assert not any(c[:2] == ["git", "clone"] for c in fake.calls)
+
+
+def test_collect_checkout_evidence_is_read_only_and_hashes_remotes(tmp_path: Path) -> None:
+    dest = tmp_path / "autobench"
+    _seed_tool_checkout(dest)
+    private = "https://bitbucket.example/secret-ab.git"
+    fake = FakeGit()
+    fake.bitbucket = private
+    evidence = collect_checkout_evidence(
+        dest,
+        TOOL_MANIFESTS["autobench"],
+        runner=fake,
+    )
+    stored = evidence.to_stored()
+    assert stored["head_sha"] == "a" * 40
+    assert stored["dirty"] is False
+    assert stored["origin_fingerprint"] == fingerprint_remote_url(
+        TOOL_MANIFESTS["autobench"].github_url
+    )
+    assert stored["bitbucket_fingerprint"] == fingerprint_remote_url(private)
+    assert stored["engine_pin"] == approved_engine_tag()
+    assert stored["required_files_ok"] is True
+    blob = json.dumps(stored)
+    assert private not in blob
+    assert "bitbucket.example" not in blob
+    assert not any(c[:2] == ["git", "clone"] for c in fake.calls)
+    assert not any(c[:3] == ["git", "remote", "add"] for c in fake.calls)
+
+
+def test_inspect_bootstrap_core_never_adds_remote(tmp_path: Path) -> None:
+    core = tmp_path / "edge-deploy-core"
+    core.mkdir()
+    (core / ".git").mkdir()
+    fake = FakeGit()
+    fake.origin = CORE_GITHUB_URL
+    fake.bitbucket = ""
+    with pytest.raises(RuntimeError, match="bitbucket remote missing"):
+        inspect_bootstrap_core(
+            core,
+            expected_tag=approved_engine_tag(),
+            expected_bitbucket_fingerprint=fingerprint_remote_url(
+                "https://bitbucket.example/core.git"
+            ),
+            runner=fake,
+        )
+    assert not any(c[:3] == ["git", "remote", "add"] for c in fake.calls)
+
+
+def test_collect_evidence_detects_dirty_and_missing_bitbucket(tmp_path: Path) -> None:
+    dest = tmp_path / "autobench"
+    _seed_tool_checkout(dest)
+    fake = FakeGit()
+    fake.dirty = True
+    fake.bitbucket = ""
+    evidence = collect_checkout_evidence(dest, TOOL_MANIFESTS["autobench"], runner=fake)
+    assert evidence.dirty is True
+    assert evidence.bitbucket_fingerprint is None
+
+
+def test_default_runner_uses_prompt_free_env_and_timeouts(tmp_path: Path, monkeypatch) -> None:
+    from edge_deploy.onboarding import repositories as repos
+
+    recorded: dict[str, object] = {}
+
+    def fake_run(args, **kwargs):
+        recorded["args"] = list(args)
+        recorded["kwargs"] = kwargs
+        return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(repos.subprocess, "run", fake_run)
+    run = repos.default_runner(tmp_path)
+    assert run(["git", "status"]) == "ok\n"
+    env = recorded["kwargs"]["env"]
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert env["GCM_INTERACTIVE"] == "never"
+    assert recorded["kwargs"]["text"] is True
+    assert recorded["kwargs"]["timeout"] == repos.GIT_COMMAND_TIMEOUT_S
+
+    run([sys.executable, "-m", "pip", "install", "-e", ".[dev,release]"])
+    assert recorded["kwargs"]["timeout"] == repos.PIP_COMMAND_TIMEOUT_S
+    assert recorded["kwargs"]["timeout"] > repos.GIT_COMMAND_TIMEOUT_S
+
+
+def test_default_runner_errors_are_host_safe(tmp_path: Path, monkeypatch) -> None:
+    from edge_deploy.onboarding import repositories as repos
+
+    leak = "https://bitbucket.example/secret.git token=abc123"
+
+    def fake_run(args, **kwargs):
+        return SimpleNamespace(returncode=128, stdout="", stderr=leak)
+
+    monkeypatch.setattr(repos.subprocess, "run", fake_run)
+    run = repos.default_runner(tmp_path)
+    with pytest.raises(RuntimeError) as exc_info:
+        run(["git", "ls-remote", "bitbucket"])
+    message = str(exc_info.value)
+    assert "bitbucket.example" not in message
+    assert "token=" not in message
+    assert "abc123" not in message
+    assert "exit 128" in message
+
