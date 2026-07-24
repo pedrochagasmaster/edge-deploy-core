@@ -6,12 +6,15 @@ import json
 import subprocess
 import sys
 import tempfile
+from http.client import HTTPConnection
 from pathlib import Path
+from threading import Thread
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import edge_console as edge_console_mod  # noqa: E402
 from edge_console import (  # noqa: E402
     _SCHEMA,
     PAGE,
@@ -19,12 +22,14 @@ from edge_console import (  # noqa: E402
     ToolsProber,
     _tool_name,
     aggregate_github_write,
+    build_arg_parser,
     build_demo_checkouts,
     collect_runs,
     collect_runs_multi,
     github_write_command,
     probe_divergence,
     probe_github_write,
+    resolve_console_roots,
 )
 from edge_deploy.posture import git_probe_command  # noqa: E402
 
@@ -915,3 +920,147 @@ def test_open_training_all_phases_passed_awaits_completion_not_finished() -> Non
     assert "TRAINING ONLY" in html
     for forbidden in _FORBIDDEN_PRODUCTION_COMMANDS:
         assert forbidden not in html, forbidden
+
+
+# ---------------------------------------------------------------------------
+# Final-review: --github-write-root separation
+# ---------------------------------------------------------------------------
+
+
+def test_build_arg_parser_accepts_github_write_root() -> None:
+    args = build_arg_parser().parse_args(
+        ["--root", "/training/ab", "--github-write-root", "/real/ab"]
+    )
+    assert args.root == ["/training/ab"]
+    assert args.github_write_root == ["/real/ab"]
+
+
+def test_resolve_console_roots_defaults_write_roots_to_ledger_roots(tmp_path) -> None:
+    ledger = tmp_path / "ledger"
+    ledger.mkdir()
+    args = build_arg_parser().parse_args(["--root", str(ledger)])
+    ledger_roots, write_roots = resolve_console_roots(args)
+    assert ledger_roots == [ledger.resolve()]
+    assert write_roots == [ledger.resolve()]
+
+
+def test_resolve_console_roots_separates_write_roots(tmp_path) -> None:
+    training = tmp_path / "training"
+    real = tmp_path / "real"
+    training.mkdir()
+    real.mkdir()
+    args = build_arg_parser().parse_args(
+        ["--root", str(training), "--github-write-root", str(real)]
+    )
+    ledger_roots, write_roots = resolve_console_roots(args)
+    assert ledger_roots == [training.resolve()]
+    assert write_roots == [real.resolve()]
+
+
+def test_posture_prober_uses_write_roots_not_ledger_roots(tmp_path, monkeypatch) -> None:
+    training = tmp_path / "training" / "autobench"
+    real = tmp_path / "autobench"
+    training.mkdir(parents=True)
+    real.mkdir()
+    (real / ".git").mkdir()
+    # Training has no .git — intentional divergence unknown if probed.
+    del training
+    probed: list[str] = []
+
+    def fake_probe(root, runner=None, timeout=20.0):
+        probed.append(str(root))
+        return {
+            "tool": Path(root).name,
+            "root": str(root),
+            "status": "fail",
+            "detail": "probe",
+            "command": github_write_command(),
+        }
+
+    monkeypatch.setattr("edge_console.probe_github_write", fake_probe)
+    monkeypatch.setattr("edge_console._edge_endpoints", lambda: [])
+    monkeypatch.setattr("edge_console._probe_one", lambda host, port: True)
+    snap = PostureProber(demo=False, roots=[real]).snapshot()
+    assert probed == [str(real)]
+    assert snap["groups"]["github"]["aggregate"] == "fail"
+
+
+def test_api_training_ledger_with_real_write_roots(tmp_path, monkeypatch) -> None:
+    """Training --root can render runs while write aggregate uses real roots."""
+    training = tmp_path / "training" / "autobench"
+    real = tmp_path / "autobench"
+    runs = training / "edge-deploy" / "runs" / "run-train"
+    _write_state(runs, "run-train", kind="training", training=True, status="open")
+    real.mkdir()
+    (real / ".git").mkdir()
+
+    monkeypatch.setattr(
+        "edge_console.probe_github_write",
+        lambda root, runner=None, timeout=20.0: {
+            "tool": Path(root).name,
+            "root": str(root),
+            "status": "fail",
+            "detail": "real write fail",
+            "command": github_write_command(),
+        },
+    )
+    monkeypatch.setattr("edge_console._edge_endpoints", lambda: [])
+    monkeypatch.setattr("edge_console._probe_one", lambda host, port: False)
+
+    edge_console_mod.ConsoleHandler.roots = [training]
+    edge_console_mod.ConsoleHandler.prober = PostureProber(demo=False, roots=[real])
+    edge_console_mod.ConsoleHandler.tools_prober = ToolsProber([training], demo=False)
+    edge_console_mod.ConsoleHandler.demo = False
+    server = edge_console_mod.ThreadingHTTPServer(
+        ("127.0.0.1", 0), edge_console_mod.ConsoleHandler
+    )
+    port = server.server_address[1]
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/api/runs")
+        runs_payload = json.loads(conn.getresponse().read().decode())
+        assert runs_payload["runs"]
+        assert runs_payload["runs"][0]["state"]["kind"] == "training"
+
+        conn.request("GET", "/api/posture")
+        posture = json.loads(conn.getresponse().read().decode())
+        assert posture["groups"]["github"]["aggregate"] == "fail"
+        assert posture["groups"]["github"]["tools"][0]["status"] == "fail"
+        # fail beats unknown: mix fail+unknown → fail
+        assert (
+            aggregate_github_write([{"status": "fail"}, {"status": "unknown"}]) == "fail"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_probe_github_write_forces_prompt_disable_env(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "autobench"
+    root.mkdir()
+    (root / ".git").mkdir()
+    seen: dict = {}
+
+    def fake_run(command, cwd=None, capture_output=None, timeout=None, env=None, **kwargs):
+        del command, cwd, capture_output, timeout, kwargs
+        seen["env"] = dict(env)
+
+        class Completed:
+            returncode = 0
+
+        return Completed()
+
+    monkeypatch.setenv("GIT_TERMINAL_PROMPT", "1")
+    monkeypatch.setenv("GCM_INTERACTIVE", "always")
+    monkeypatch.setattr("edge_console.subprocess.run", fake_run)
+    assert probe_github_write(root, runner=None)["status"] == "ok"
+    assert seen["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    assert seen["env"]["GCM_INTERACTIVE"] == "never"
+
+
+def test_module_doc_does_not_claim_zero_dependency() -> None:
+    doc = (edge_console_mod.__doc__ or "").lower()
+    assert "zero-dependency" not in doc
+    assert "zero-external-dependency" not in doc

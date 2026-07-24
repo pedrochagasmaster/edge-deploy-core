@@ -146,6 +146,9 @@ def load_private_onboarding_source(path: Path) -> ImportedPrivateConfig:
     return parse_private_onboarding_source(raw, source_bytes=source_bytes)
 
 
+_ICACLS_TIMEOUT_S = 20.0
+
+
 def _default_permission_setter(path: Path) -> None:
     """Restrictive owner-only permissions; best-effort on Windows via icacls."""
     try:
@@ -166,8 +169,9 @@ def _default_permission_setter(path: Path) -> None:
             check=False,
             capture_output=True,
             text=True,
+            timeout=_ICACLS_TIMEOUT_S,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         pass
 
 

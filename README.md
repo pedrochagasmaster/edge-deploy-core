@@ -82,10 +82,13 @@ isolated under `%APPDATA%\edge-deploy\training\<tool>\` with both
 same `onboard` command to resume; completed runs refresh the report without
 re-practicing.
 
-Edge Console launches against the training roots and shows a **simulated**
-posture rail — do not switch workstation posture for it. The console GitHub
-write indicator is green only when every watched tool's `git push --dry-run`
-write probe passes; **red in `both-vpns` is expected and is not an onboarding
+Edge Console launches against the training roots (`--root`) for ledger
+rendering and against the selected real tool checkouts
+(`--github-write-root`) for GitHub write probes. It shows a **simulated**
+posture rail — do not switch workstation posture for it. Training roots may
+lack git; divergence against them is intentionally soft. The console GitHub
+write indicator is green only when every write-root's `git push --dry-run`
+probe passes; **red in `both-vpns` is expected and is not an onboarding
 failure**. A first real release is a separate boundary after onboarding
 completes, for example:
 

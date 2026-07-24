@@ -391,12 +391,43 @@ def test_default_runner_uses_prompt_free_env_and_timeouts(tmp_path: Path, monkey
     env = recorded["kwargs"]["env"]
     assert env["GIT_TERMINAL_PROMPT"] == "0"
     assert env["GCM_INTERACTIVE"] == "never"
+    assert env["GIT_ASKPASS"] == ""
+    assert env["GH_PROMPT_DISABLED"] == "1"
     assert recorded["kwargs"]["text"] is True
     assert recorded["kwargs"]["timeout"] == repos.GIT_COMMAND_TIMEOUT_S
 
     run([sys.executable, "-m", "pip", "install", "-e", ".[dev,release]"])
     assert recorded["kwargs"]["timeout"] == repos.PIP_COMMAND_TIMEOUT_S
     assert recorded["kwargs"]["timeout"] > repos.GIT_COMMAND_TIMEOUT_S
+
+
+def test_default_runner_clone_uses_explicit_600s_timeout(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from edge_deploy.onboarding import repositories as repos
+
+    recorded: dict[str, object] = {}
+
+    def fake_run(args, **kwargs):
+        recorded["args"] = list(args)
+        recorded["kwargs"] = kwargs
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(repos.subprocess, "run", fake_run)
+    monkeypatch.setenv("GIT_TERMINAL_PROMPT", "1")
+    monkeypatch.setenv("GCM_INTERACTIVE", "always")
+    monkeypatch.setenv("GIT_ASKPASS", "askpass.exe")
+    monkeypatch.setenv("GH_PROMPT_DISABLED", "0")
+    run = repos.default_runner(tmp_path)
+    run(["git", "clone", "https://example.invalid/repo.git", str(tmp_path / "dest")])
+    assert recorded["kwargs"]["timeout"] == repos.CLONE_COMMAND_TIMEOUT_S
+    assert repos.CLONE_COMMAND_TIMEOUT_S == 600.0
+    assert recorded["kwargs"]["timeout"] == repos.PIP_COMMAND_TIMEOUT_S
+    env = recorded["kwargs"]["env"]
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert env["GCM_INTERACTIVE"] == "never"
+    assert env["GIT_ASKPASS"] == ""
+    assert env["GH_PROMPT_DISABLED"] == "1"
 
 
 def test_default_runner_errors_are_host_safe(tmp_path: Path, monkeypatch) -> None:

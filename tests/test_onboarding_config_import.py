@@ -1,5 +1,9 @@
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 
+from edge_deploy.onboarding import config_import as config_import_mod
 from edge_deploy.onboarding.config_import import (
     fingerprint_config_bytes,
     install_operator_config,
@@ -167,3 +171,24 @@ def test_node_allowlist_strips_private_metadata(tmp_path) -> None:
     assert "region" not in text
     assert "notes" not in text
     assert "do-not-install" not in text
+
+
+def test_default_permission_setter_icacls_uses_20s_timeout(
+    tmp_path: Path, monkeypatch
+) -> None:
+    dest = tmp_path / "config.yaml"
+    dest.write_text("operator_email: op@example.com\n", encoding="utf-8")
+    recorded: dict[str, object] = {}
+
+    def fake_run(args, **kwargs):
+        recorded["args"] = list(args)
+        recorded["kwargs"] = kwargs
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(config_import_mod.sys, "platform", "win32")
+    monkeypatch.setattr(config_import_mod.subprocess, "run", fake_run)
+    monkeypatch.setenv("USERNAME", "operator")
+    config_import_mod._default_permission_setter(dest)
+    assert recorded["args"][0] == "icacls"
+    assert recorded["kwargs"]["timeout"] == 20.0
+    assert recorded["kwargs"]["capture_output"] is True

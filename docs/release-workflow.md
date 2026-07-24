@@ -53,10 +53,12 @@ Paths under `%APPDATA%\edge-deploy\`:
 - `config.yaml` — installed operator config (never commit)
 
 Training is not a release: production commands reject training ledgers, and the
-console training rail is labeled simulated. GitHub write aggregate green requires
-every watched tool's `git push --dry-run` write probe to pass; **red in
-`both-vpns` is expected and does not fail onboarding**. After onboard completes,
-the first real guided release is a separate boundary (see below).
+console training rail is labeled simulated. Onboarding launches the console with
+training ledgers on `--root` and selected real tool checkouts on
+`--github-write-root` for write probes. GitHub write aggregate green requires
+every write-root's `git push --dry-run` probe to pass; **red in `both-vpns` is
+expected and does not fail onboarding**. After onboard completes, the first real
+guided release is a separate boundary (see below).
 
 ## Prerequisites
 

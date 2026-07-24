@@ -308,7 +308,7 @@ def test_bb_token_check_presence_without_leaking(monkeypatch, tmp_path: Path) ->
     specs = build_readiness_specs(_ctx(tmp_path))
     token_spec = next(s for s in specs if s.id == "bb_token_present")
     result = token_spec.run()
-    assert result.outcome == "failed"
+    assert result.outcome == "blocked"
     assert "BB_TOKEN" in result.remediation
     assert "env-only" not in result.summary
     assert "token=" not in result.summary.lower()
@@ -326,12 +326,12 @@ def test_bb_token_present_passes_without_echoing_value(
     assert "env-only-token" not in result.remediation
 
 
-def test_rsa_runner_failure_is_failed_not_persisting_secret(tmp_path: Path) -> None:
+def test_rsa_runner_failure_is_blocked_not_persisting_secret(tmp_path: Path) -> None:
     ctx = _ctx(
         tmp_path,
         rsa_auth_runner=lambda node: CheckResult(
             f"rsa_auth:{node}",
-            "failed",
+            "blocked",
             redact("passcode=123456 RSA rejected"),
             "Re-enter a fresh RSA passcode; it is never stored",
         ),
@@ -344,7 +344,7 @@ def test_rsa_runner_failure_is_failed_not_persisting_secret(tmp_path: Path) -> N
     )
     rsa = next(s for s in build_readiness_specs(ctx) if s.id == "rsa_auth:node03")
     result = rsa.run()
-    assert result.outcome == "failed"
+    assert result.outcome == "blocked"
     assert "123456" not in result.summary
     assert "***REDACTED***" in result.summary
 
@@ -354,7 +354,7 @@ def test_readiness_dependency_blocking_for_auth_chain(tmp_path: Path) -> None:
         tmp_path,
         known_hosts_runner=lambda: _pass("known_hosts"),
         edge_tcp_runner=lambda: CheckResult(
-            "edge_tcp", "failed", "Edge TCP failed for: node03", "Restore Edge VPN"
+            "edge_tcp", "blocked", "Edge TCP blocked for: node03", "Restore Edge VPN"
         ),
         rsa_auth_runner=lambda node: CheckResult(
             f"rsa_auth:{node}", "passed", "should not run", ""
@@ -362,7 +362,7 @@ def test_readiness_dependency_blocking_for_auth_chain(tmp_path: Path) -> None:
     )
     results = run_checks(build_readiness_specs(ctx), max_workers=1)
     by_id = {r.id: r for r in results}
-    assert by_id["edge_tcp"].outcome == "failed"
+    assert by_id["edge_tcp"].outcome == "blocked"
     assert by_id["rsa_auth:node03"].outcome == "blocked"
     assert by_id["transport_smoke:node03"].outcome == "blocked"
 
@@ -528,7 +528,7 @@ def test_failures_never_leak_private_hosts_urls_or_secrets(
         core_root=tmp_path / "core",
         git_runner=lambda command, root: 1,
     )()
-    assert bb_result.outcome == "failed"
+    assert bb_result.outcome == "blocked"
     assert "autobench" in bb_result.summary or "core" in bb_result.summary
     assert "scm.mastercard.int" not in bb_result.summary
     assert "https://" not in bb_result.summary
@@ -540,7 +540,7 @@ def test_failures_never_leak_private_hosts_urls_or_secrets(
         edge_tcp_runner=lambda: _pass("edge_tcp"),
         rsa_auth_runner=lambda node: CheckResult(
             f"rsa_auth:{node}",
-            "failed",
+            "blocked",
             f"passcode=999999 RSA rejected for {node}",
             "Re-enter RSA passcode",
         ),
@@ -705,11 +705,11 @@ def test_deep_smoke_blocks_transport_when_kerberos_fails(tmp_path: Path) -> None
         tmp_path,
         require_deep_smoke=True,
         kerberos_runner=lambda node: CheckResult(
-            f"kerberos:{node}", "failed", "Kerberos failed", "fix ticket"
+            f"kerberos:{node}", "blocked", "Kerberos blocked", "fix ticket"
         ),
     )
     results = {r.id: r for r in run_checks(build_readiness_specs(ctx))}
-    assert results["kerberos:node03"].outcome == "failed"
+    assert results["kerberos:node03"].outcome == "blocked"
     assert results["transport_smoke:node03"].outcome == "blocked"
 
 
@@ -764,7 +764,7 @@ def test_rsa_transport_kerberos_failures_never_interpolate_exc_text(
         smoke=smoke,
     )
     rsa = rsa_runner("node03")
-    assert rsa.outcome == "failed"
+    assert rsa.outcome == "blocked"
     assert "ConnectionError" in rsa.summary
     assert "999999" not in rsa.summary
     assert "scm.mastercard.int" not in rsa.summary
@@ -773,7 +773,7 @@ def test_rsa_transport_kerberos_failures_never_interpolate_exc_text(
     # Pre-register so transport/kerberos paths exercise exception handling.
     registry.put("node03", FakeDriver())
     smoke_result = smoke_runner("node03")
-    assert smoke_result.outcome == "failed"
+    assert smoke_result.outcome == "blocked"
     assert "TimeoutError" in smoke_result.summary
     assert "999999" not in smoke_result.summary
     assert "scm.mastercard.int" not in smoke_result.summary
@@ -785,7 +785,7 @@ def test_rsa_transport_kerberos_failures_never_interpolate_exc_text(
         ),
     )
     kresult = kerberos("node03")
-    assert kresult.outcome == "failed"
+    assert kresult.outcome == "blocked"
     assert "RuntimeError" in kresult.summary
     assert "999999" not in kresult.summary
     assert "scm.mastercard.int" not in kresult.summary
@@ -817,12 +817,12 @@ def test_bitbucket_runners_fail_when_selected_tool_root_missing(tmp_path: Path) 
     assert "https://" not in write.summary
 
 
-def test_whitespace_only_bb_token_fails(monkeypatch, tmp_path: Path) -> None:
+def test_whitespace_only_bb_token_is_blocked(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("BB_TOKEN", "   \t  ")
     result = next(
         s for s in build_readiness_specs(_ctx(tmp_path)) if s.id == "bb_token_present"
     ).run()
-    assert result.outcome == "failed"
+    assert result.outcome == "blocked"
     assert "BB_TOKEN" in result.remediation
 
 
@@ -834,7 +834,7 @@ def test_default_gh_auth_runner_uses_injected_runner() -> None:
         return 1
 
     result = build_default_gh_auth_runner(runner=runner)()
-    assert result.outcome == "failed"
+    assert result.outcome == "blocked"
     assert calls == [["gh", "auth", "status"]]
     assert "gh" in result.summary.lower()
 
@@ -932,7 +932,7 @@ def test_default_edge_tcp_runner_names_nodes_only(tmp_path: Path) -> None:
         raise TimeoutError(f"timed out connecting to {address[0]}")
 
     result = build_default_edge_tcp_runner(operator, connect=connect, timeout=1.0)()
-    assert result.outcome == "failed"
+    assert result.outcome == "blocked"
     assert "node03" in result.summary
     assert private not in result.summary
     assert private not in result.remediation
@@ -1073,9 +1073,116 @@ def test_auth_failure_cleans_up_driver_and_leaves_no_stale_registry(
         authenticate=authenticate,
     )
     result = rsa_runner("node03")
-    assert result.outcome == "failed"
+    assert result.outcome == "blocked"
     assert "RuntimeError" in result.summary
     assert "123456" not in result.summary
     assert "edge.example" not in result.summary
     assert registry.get("node03") is None
     assert driver.stopped is True
+
+
+# ---------------------------------------------------------------------------
+# Final-review: blocked vs failed classification
+# ---------------------------------------------------------------------------
+
+
+def test_git_timeout_and_access_are_blocked(tmp_path: Path) -> None:
+    timeout = build_default_github_read_runner(
+        tools=["autobench"],
+        tool_roots={"autobench": tmp_path / "autobench"},
+        git_runner=lambda command, root: -1,
+    )()
+    access = build_default_bitbucket_read_runner(
+        tools=["autobench"],
+        tool_roots={"autobench": tmp_path / "autobench"},
+        core_root=tmp_path / "core",
+        git_runner=lambda command, root: 128,
+    )()
+    assert timeout.outcome == "blocked"
+    assert access.outcome == "blocked"
+
+
+def test_structural_known_hosts_local_check_outbox_remain_failed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "app"))
+    kh = tmp_path / "kh-empty"
+    kh.write_text("", encoding="utf-8")
+    operator = OperatorConfig(
+        operator_email="op@example.com",
+        audit_repo=str(tmp_path / "core"),
+        nodes={
+            "node03": NodeConfig(
+                host="operator@edge.example",
+                ssh_options=f"-p 2222 -o UserKnownHostsFile={kh.as_posix()}",
+                name="node03",
+            )
+        },
+    )
+    assert build_default_known_hosts_runner(operator)().outcome == "failed"
+    assert (
+        _ctx(tmp_path, local_check_runner=lambda root: 2)
+        .local_check_runner(tmp_path)
+        == 2
+    )
+    local = next(
+        s
+        for s in build_readiness_specs(_ctx(tmp_path, local_check_runner=lambda root: 2))
+        if s.id == "local_check:autobench"
+    ).run()
+    assert local.outcome == "failed"
+
+    outbox = tmp_path / "app" / "edge-deploy" / "outbox"
+    outbox.mkdir(parents=True)
+    (outbox / "pending.json").write_text("{}", encoding="utf-8")
+    dirty = build_default_audit_runner(
+        core_root=tmp_path / "core",
+        git_runner=lambda command, root: 0,
+        outbox=outbox,
+    )()
+    assert dirty.outcome == "failed"
+
+
+def test_audit_lsremote_access_is_blocked_remote_missing_is_failed(
+    tmp_path: Path,
+) -> None:
+    def missing_remote(command: list[str], root: Path) -> int:
+        del root
+        if command[:3] == ["git", "remote", "get-url"]:
+            return 1
+        return 0
+
+    def lsremote_fail(command: list[str], root: Path) -> int:
+        del root
+        if command[:3] == ["git", "remote", "get-url"]:
+            return 0
+        if command[:2] == ["git", "ls-remote"]:
+            return 128
+        return 0
+
+    missing = build_default_audit_runner(
+        core_root=tmp_path / "core",
+        git_runner=missing_remote,
+        outbox=tmp_path / "empty",
+    )()
+    access = build_default_audit_runner(
+        core_root=tmp_path / "core",
+        git_runner=lsremote_fail,
+        outbox=tmp_path / "empty",
+    )()
+    assert missing.outcome == "failed"
+    assert access.outcome == "blocked"
+
+
+def test_prompt_free_env_forces_values_over_ambient(monkeypatch) -> None:
+    from edge_deploy.onboarding import checks as checks_mod
+
+    monkeypatch.setenv("GIT_TERMINAL_PROMPT", "1")
+    monkeypatch.setenv("GCM_INTERACTIVE", "always")
+    monkeypatch.setenv("GH_PROMPT_DISABLED", "0")
+    monkeypatch.setenv("GIT_ASKPASS", "askpass.exe")
+    env = checks_mod._prompt_free_env()
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert env["GCM_INTERACTIVE"] == "never"
+    assert env["GH_PROMPT_DISABLED"] == "1"
+    assert env["GIT_ASKPASS"] == ""

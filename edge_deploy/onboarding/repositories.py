@@ -19,6 +19,7 @@ CommandRunner = Callable[[Sequence[str]], str]
 _ENGINE_PIN_RE = re.compile(r"@(v\d+\.\d+\.\d+)")
 _REQUIRED_OPERATOR_EXTRAS = ("dev", "release")
 GIT_COMMAND_TIMEOUT_S = 20.0
+CLONE_COMMAND_TIMEOUT_S = 600.0
 PIP_COMMAND_TIMEOUT_S = 600.0
 
 
@@ -90,8 +91,8 @@ def _prompt_free_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
     env = dict(base if base is not None else os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GCM_INTERACTIVE"] = "never"
-    env.setdefault("GIT_ASKPASS", "")
-    env.setdefault("GH_PROMPT_DISABLED", "1")
+    env["GIT_ASKPASS"] = ""
+    env["GH_PROMPT_DISABLED"] = "1"
     return env
 
 
@@ -103,6 +104,8 @@ def _timeout_for(args: Sequence[str]) -> float:
         return PIP_COMMAND_TIMEOUT_S
     if len(args) >= 3 and args[1] == "-m" and args[2] == "pip":
         return PIP_COMMAND_TIMEOUT_S
+    if name == "git" and len(args) >= 2 and args[1] == "clone":
+        return CLONE_COMMAND_TIMEOUT_S
     return GIT_COMMAND_TIMEOUT_S
 
 

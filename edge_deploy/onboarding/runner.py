@@ -240,19 +240,42 @@ def _popen(command: Sequence[str], **kwargs: Any) -> Any:
     return subprocess.Popen(list(command), **kwargs)
 
 
-def _launch_console(roots: list[Path]) -> None:
-    """Start Edge Console against training roots without blocking onboarding."""
+def _launch_console(
+    roots: list[Path],
+    github_write_roots: list[Path] | None = None,
+) -> None:
+    """Start Edge Console against training roots without blocking onboarding.
+
+    Ledger/tool collection uses ``roots``; GitHub write probes use
+    ``github_write_roots`` when provided (real tool checkouts during practice).
+    """
     script = Path(__file__).resolve().parents[2] / "edge_console.py"
     command: list[str] = [sys.executable, str(script), "--no-browser"]
     for root in roots:
         command.extend(["--root", str(root)])
-    _popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
+    write_roots = (
+        list(github_write_roots) if github_write_roots is not None else list(roots)
     )
+    for root in write_roots:
+        command.extend(["--github-write-root", str(root)])
+    port = int(os.environ.get("PORT", 7643))
+    url = f"http://127.0.0.1:{port}/"
+    print(f"onboard: edge console at {url}")
+    try:
+        _popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise RuntimeError(
+            redact(
+                f"failed to launch edge console ({type(exc).__name__}); "
+                f"start manually: {sys.executable} {script} --no-browser"
+            )
+        ) from exc
 
 
 def _local_check_runner(repo_root: Path) -> int:
@@ -869,7 +892,9 @@ def _stage_practice(
             run_guided_training(ledger, acknowledge=_training_acknowledge)
             run_ids.append(str(ledger.state["run_id"]))
             training_roots.append(workspace)
-        _launch_console(training_roots)
+        real_root = Path(str(state.data.get("root") or "")).resolve()
+        write_roots = [_tool_dest(real_root, tool).resolve() for tool in tools]
+        _launch_console(training_roots, github_write_roots=write_roots)
         state.data["practice"] = {
             "completed": True,
             "run_id": run_ids[0] if len(run_ids) == 1 else ",".join(run_ids),
@@ -976,6 +1001,14 @@ def _run_stages(
         _stage_readiness(state, tools=tools, root=root, check_only=True)
         state.save()
         return 0 if state.data["stages"]["readiness"]["outcome"] == "passed" else 1
+
+    # Missing installed operator config on resume: invalidate from config and reinstall.
+    if (
+        state.data["stages"]["config"]["outcome"] == "passed"
+        and not default_operator_config_path().is_file()
+    ):
+        state.invalidate_from("config")
+        state.save()
 
     if state.data["stages"]["config"]["outcome"] != "passed":
         _stage_config(state, imported=imported, tools=tools, root=root)

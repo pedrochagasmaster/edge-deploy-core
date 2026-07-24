@@ -240,8 +240,8 @@ def _prompt_free_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
     env = dict(base if base is not None else os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GCM_INTERACTIVE"] = "never"
-    env.setdefault("GH_PROMPT_DISABLED", "1")
-    env.setdefault("GIT_ASKPASS", "")
+    env["GH_PROMPT_DISABLED"] = "1"
+    env["GIT_ASKPASS"] = ""
     return env
 
 
@@ -284,7 +284,7 @@ def build_default_gh_auth_runner(
             return CheckResult("gh_auth", "passed", "gh authenticated", "")
         return CheckResult(
             "gh_auth",
-            "failed",
+            "blocked",
             "gh is not authenticated",
             "Run: gh auth login",
         )
@@ -299,20 +299,28 @@ def build_default_github_read_runner(
     git_runner: GitRunner,
 ) -> SimpleCheckRunner:
     def check() -> CheckResult:
-        failed: list[str] = []
+        missing: list[str] = []
+        blocked: list[str] = []
         command = git_probe_command("origin", "read")
         for tool in tools:
             root = tool_roots.get(tool)
             if root is None:
-                failed.append(tool)
+                missing.append(tool)
                 continue
             if git_runner(list(command), Path(root)) != 0:
-                failed.append(tool)
-        if failed:
+                blocked.append(tool)
+        if missing:
             return CheckResult(
                 "github_read",
                 "failed",
-                f"GitHub read failed for: {', '.join(failed)}",
+                f"GitHub read missing checkout for: {', '.join(missing)}",
+                "Provision the tool checkout, then re-run.",
+            )
+        if blocked:
+            return CheckResult(
+                "github_read",
+                "blocked",
+                f"GitHub read blocked for: {', '.join(blocked)}",
                 "Restore GitHub read access in the current posture, then re-run.",
             )
         return CheckResult("github_read", "passed", "GitHub read ok for selected tools", "")
@@ -417,20 +425,26 @@ def build_default_bitbucket_read_runner(
     git_runner: GitRunner,
 ) -> SimpleCheckRunner:
     def check() -> CheckResult:
-        failed: list[str] = []
+        blocked: list[str] = []
         command = git_probe_command("bitbucket", "read")
         targets, missing = _bitbucket_targets(
             tools=tools, tool_roots=tool_roots, core_root=core_root
         )
-        failed.extend(missing)
-        for label, root in targets:
-            if git_runner(list(command), root) != 0:
-                failed.append(label)
-        if failed:
+        if missing:
             return CheckResult(
                 "bitbucket_read",
                 "failed",
-                f"Bitbucket read failed for: {', '.join(failed)}",
+                f"Bitbucket read missing checkout for: {', '.join(missing)}",
+                "Provision the selected tool checkouts, then re-run.",
+            )
+        for label, root in targets:
+            if git_runner(list(command), root) != 0:
+                blocked.append(label)
+        if blocked:
+            return CheckResult(
+                "bitbucket_read",
+                "blocked",
+                f"Bitbucket read blocked for: {', '.join(blocked)}",
                 "Confirm Bitbucket VPN and remotes, then re-run.",
             )
         return CheckResult(
@@ -453,20 +467,26 @@ def build_default_bitbucket_write_dry_run_runner(
     """Dry-run Bitbucket write via ``git_probe_command('bitbucket', 'write')`` only."""
 
     def check() -> CheckResult:
-        failed: list[str] = []
+        blocked: list[str] = []
         command = git_probe_command("bitbucket", "write")
         targets, missing = _bitbucket_targets(
             tools=tools, tool_roots=tool_roots, core_root=core_root
         )
-        failed.extend(missing)
-        for label, root in targets:
-            if git_runner(list(command), root) != 0:
-                failed.append(label)
-        if failed:
+        if missing:
             return CheckResult(
                 "bitbucket_write_dry_run",
                 "failed",
-                f"Bitbucket dry-run write failed for: {', '.join(failed)}",
+                f"Bitbucket dry-run write missing checkout for: {', '.join(missing)}",
+                "Provision the selected tool checkouts, then re-run.",
+            )
+        for label, root in targets:
+            if git_runner(list(command), root) != 0:
+                blocked.append(label)
+        if blocked:
+            return CheckResult(
+                "bitbucket_write_dry_run",
+                "blocked",
+                f"Bitbucket dry-run write blocked for: {', '.join(blocked)}",
                 "Confirm BB_TOKEN and Bitbucket write access; only dry-run push is used.",
             )
         return CheckResult(
@@ -519,8 +539,8 @@ def build_default_audit_runner(
         ):
             return CheckResult(
                 "audit_release_log",
-                "failed",
-                "release-log ls-remote access failed",
+                "blocked",
+                "release-log ls-remote access blocked",
                 "Confirm Bitbucket VPN and release-log branch access, then re-run.",
             )
         return CheckResult(
@@ -602,8 +622,8 @@ def build_default_edge_tcp_runner(
         if failed:
             return CheckResult(
                 "edge_tcp",
-                "failed",
-                f"Edge TCP failed for: {', '.join(failed)}",
+                "blocked",
+                f"Edge TCP blocked for: {', '.join(failed)}",
                 "Restore Edge VPN (both-vpns), then re-run.",
             )
         return CheckResult("edge_tcp", "passed", "Edge TCP ok for all nodes", "")
@@ -659,7 +679,7 @@ def make_rsa_and_transport_runners(
                 _stop_driver(driver)
             return CheckResult(
                 f"rsa_auth:{node_name}",
-                "failed",
+                "blocked",
                 _safe_failure_summary(f"RSA authentication for {node_name}", exc),
                 "Re-enter a fresh RSA passcode; it is never stored.",
             )
@@ -684,7 +704,7 @@ def make_rsa_and_transport_runners(
         except Exception as exc:
             return CheckResult(
                 f"transport_smoke:{node_name}",
-                "failed",
+                "blocked",
                 _safe_failure_summary(f"transport smoke for {node_name}", exc),
                 "Inspect transport smoke failures, then re-run readiness.",
             )
@@ -698,8 +718,8 @@ def make_rsa_and_transport_runners(
             )
         return CheckResult(
             f"transport_smoke:{node_name}",
-            "failed",
-            f"transport smoke failed for {node_name}",
+            "blocked",
+            f"transport smoke blocked for {node_name}",
             "Inspect transport smoke failures, then re-run readiness.",
         )
 
@@ -728,7 +748,7 @@ def build_default_kerberos_runner(
         except Exception as exc:
             return CheckResult(
                 f"kerberos:{node_name}",
-                "failed",
+                "blocked",
                 _safe_failure_summary(f"Kerberos for {node_name}", exc),
                 "Re-enter Kerberos credentials; they are never stored.",
             )
@@ -741,8 +761,8 @@ def build_default_kerberos_runner(
             )
         return CheckResult(
             f"kerberos:{node_name}",
-            "failed",
-            f"Kerberos failed for {node_name}",
+            "blocked",
+            f"Kerberos blocked for {node_name}",
             "Acquire a Kerberos ticket on the node, then re-run.",
         )
 
@@ -759,7 +779,7 @@ def _check_bb_token() -> CheckResult:
         return CheckResult("bb_token_present", "passed", "BB_TOKEN is set", "")
     return CheckResult(
         "bb_token_present",
-        "failed",
+        "blocked",
         "BB_TOKEN is not set",
         "Set BB_TOKEN in the environment (value is never displayed or stored).",
     )

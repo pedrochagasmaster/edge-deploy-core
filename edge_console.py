@@ -1,6 +1,6 @@
 """edge_console — read-only posture console for edge-deploy runs.
 
-A single-file, zero-dependency local web UI over one or more run ledgers
+A single-file local web UI over one or more run ledgers
 (``<checkout>/edge-deploy/runs/``). It renders each Run as a rail through the
 five workstation postures (ADR-0013): stations are tinted by the capability
 they need (bitbucket, edge, github write), VPN joins are soft boundaries, and
@@ -19,20 +19,25 @@ undeployed commits and stale checkouts, and — when no Run is open — walks th
 operator through starting one (posture to hold, optional ``preflight`` /
 ``transport-smoke``, then ``py -m edge_deploy release --guided``).
 
-Deliberately standalone: Engine Identity (ADR-0008) hashes every ``*.py``
-inside the ``edge_deploy`` package, so UI code must live outside the engine
-or every open Run would be orphaned. This file never writes to the ledger.
+Deliberately outside the ``edge_deploy`` package: Engine Identity (ADR-0008)
+hashes every package ``*.py``, so UI code must live here or every open Run
+would be orphaned. This file never writes to the ledger. It imports a few
+engine helpers for probe argv and Edge endpoints only.
 
 Usage:
 
     py edge_console.py                              # watch the cwd checkout
     py edge_console.py --root D:\\ab --root D:\\rc    # watch several checkouts
+    py edge_console.py --root D:\\training\\ab \\
+        --github-write-root D:\\ab                   # training ledgers + real write probes
     py edge_console.py --demo                       # fabricated checkouts, no probes
 
 Posture probes: Bitbucket and Edge remain TCP-only and labelled as such. The
 GitHub capability light is a per-watched-tool ``git push --dry-run`` write
-probe (same argv as posture gating); it never updates a remote ref. Divergence
-facts still use read-only git (``ls-remote`` for GitHub main).
+probe (same argv as posture gating); it never updates a remote ref. Write
+probes use ``--github-write-root`` when set, otherwise the same paths as
+``--root``. Divergence facts still use read-only git on ``--root`` checkouts
+(``ls-remote`` for GitHub main); training roots may lack git on purpose.
 """
 
 from __future__ import annotations
@@ -150,8 +155,8 @@ def github_write_command() -> list[str]:
 
 def _default_github_write_runner(command: list[str], repo_root: Path, *, timeout: float) -> int:
     env = dict(os.environ)
-    env.setdefault("GIT_TERMINAL_PROMPT", "0")
-    env.setdefault("GCM_INTERACTIVE", "never")
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "never"
     try:
         completed = subprocess.run(
             command,
@@ -682,8 +687,8 @@ _TOOL_NAME_RE = re.compile(r"^tool:\s*[\"']?([A-Za-z0-9_-]+)", re.MULTILINE)
 def _git(root: Path, *args: str, timeout: float = _GIT_TIMEOUT) -> str | None:
     """Run one read-only git command; None on any failure (never raises)."""
     env = dict(os.environ)
-    env.setdefault("GIT_TERMINAL_PROMPT", "0")  # never block on a credential prompt
-    env.setdefault("GCM_INTERACTIVE", "never")
+    env["GIT_TERMINAL_PROMPT"] = "0"  # never block on a credential prompt
+    env["GCM_INTERACTIVE"] = "never"
     try:
         completed = subprocess.run(
             ["git", "-C", str(root), *args],
@@ -886,26 +891,54 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self._send(404, "text/plain; charset=utf-8", b"not found\n")
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Read-only posture console for edge-deploy runs")
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Read-only posture console for edge-deploy runs"
+    )
     parser.add_argument(
         "--root",
         action="append",
         default=None,
         help="Tool checkout containing edge-deploy/runs; repeat to watch several (default: cwd)",
     )
+    parser.add_argument(
+        "--github-write-root",
+        action="append",
+        default=None,
+        help=(
+            "Checkout used for GitHub write probes; repeat for several. "
+            "Defaults to the same paths as --root when omitted"
+        ),
+    )
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 7643)))
-    parser.add_argument("--demo", action="store_true", help="Serve fabricated checkouts; no network probes")
+    parser.add_argument(
+        "--demo", action="store_true", help="Serve fabricated checkouts; no network probes"
+    )
     parser.add_argument("--no-browser", action="store_true")
-    args = parser.parse_args()
+    return parser
+
+
+def resolve_console_roots(args: argparse.Namespace) -> tuple[list[Path], list[Path]]:
+    """Return (ledger_roots, github_write_roots). Write roots default to ledger roots."""
+    ledger_roots = [Path(raw).resolve() for raw in (args.root or ["."])]
+    if args.github_write_root:
+        write_roots = [Path(raw).resolve() for raw in args.github_write_root]
+    else:
+        write_roots = list(ledger_roots)
+    return ledger_roots, write_roots
+
+
+def main() -> int:
+    args = build_arg_parser().parse_args()
 
     if args.demo:
         roots = build_demo_checkouts()
+        write_roots = roots
     else:
-        roots = [Path(raw).resolve() for raw in (args.root or ["."])]
+        roots, write_roots = resolve_console_roots(args)
 
     ConsoleHandler.roots = roots
-    ConsoleHandler.prober = PostureProber(demo=args.demo, roots=roots)
+    ConsoleHandler.prober = PostureProber(demo=args.demo, roots=write_roots)
     ConsoleHandler.tools_prober = ToolsProber(roots, demo=args.demo)
     ConsoleHandler.demo = args.demo
 
@@ -913,6 +946,9 @@ def main() -> int:
     url = f"http://127.0.0.1:{args.port}/"
     for root in roots:
         print(f"edge-console: watching {root / 'edge-deploy' / 'runs'}")
+    if write_roots != roots:
+        for root in write_roots:
+            print(f"edge-console: github write probe root {root}")
     print(f"edge-console: {url}  (read-only; Ctrl+C to stop)")
     if not args.no_browser:
         webbrowser.open(url)

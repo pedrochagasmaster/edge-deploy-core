@@ -251,7 +251,7 @@ class OnboardHarness:
         )
         monkeypatch.setattr(
             "edge_deploy.onboarding.runner._launch_console",
-            lambda roots: self.console_launches.append(list(roots)),
+            lambda roots, github_write_roots=None: self.console_launches.append(list(roots)),
         )
         monkeypatch.setattr(
             "edge_deploy.onboarding.runner._training_acknowledge",
