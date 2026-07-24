@@ -1056,7 +1056,10 @@ details.guide summary:focus-visible{outline:2px solid var(--gh);outline-offset:-
 .runmeta{font-family:var(--mono);font-size:11px;color:var(--dim);margin-left:auto}
 
 /* ---------- the posture rail (signature) ---------- */
+.rail-wrap.simulated{border-top:1px solid var(--line)}
+.rail-sim-tag{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--warn);padding:7px 16px;border-bottom:1px dashed var(--warn);background:var(--panel)}
 .rail{display:flex;align-items:stretch;min-height:96px}
+.rail.simulated{opacity:.9}
 .station{flex:1 1 0;padding:12px 12px 14px;position:relative}
 .station[data-req="any"]{background:var(--panel)}
 .station[data-req="bb"]{background:var(--bb-band)}
@@ -1269,7 +1272,8 @@ function stateChip(s){
 
 function stationHtml(run, phase, next){
   const req = PHASE_REQ[phase];
-  const cls = phase === next ? "station next" : "station";
+  // Training rails stay educational: never apply the live "◀ next" cue.
+  const cls = (!isTrainingRun(run.state) && phase === next) ? "station next" : "station";
   let body;
   if(phase === "deploy"){
     // Deploy node keys are operator-config names ("node03"), and evidence is
@@ -1302,20 +1306,34 @@ function stationHtml(run, phase, next){
 
 function railHtml(run){
   const next = nextPhase(run);
+  const training = isTrainingRun(run.state);
   const parts = RAIL.map(item => {
     if(item.phase) return stationHtml(run, item.phase, next);
     if(item.gate){
       // The one hard wall: firewall-off drops both VPNs (ADR-0013). TCP
-      // cannot see github write, so this stays hot as a position marker.
-      const hot = next === item.before;
-      return `<div class="gate${hot ? " hot" : ""}" role="separator" aria-label="drop VPNs, firewall off"><span>${esc(item.gate)}</span></div>`;
+      // cannot see github write, so this stays hot as a position marker —
+      // except on training rails, which must never cue a live switch.
+      const hot = !training && next === item.before;
+      const aria = training
+        ? "simulated firewall-off boundary (do not switch posture)"
+        : "drop VPNs, firewall off";
+      return `<div class="gate${hot ? " hot" : ""}" role="separator" aria-label="${esc(aria)}"><span>${esc(item.gate)}</span></div>`;
     }
     // A VPN join only glows when the run is waiting here AND that VPN is
-    // actually down as far as TCP can see.
+    // actually down as far as TCP can see. Training never lights this.
     const missing = !tcpCaps || !tcpCaps[item.cap];
-    const hot = next === item.before && missing;
-    return `<div class="sep${hot ? " hot" : ""}" role="separator" aria-label="join ${esc(item.sep)}"><span>${esc(item.sep)}</span></div>`;
+    const hot = !training && next === item.before && missing;
+    const aria = training
+      ? `simulated ${item.sep} boundary (do not switch posture)`
+      : `join ${item.sep}`;
+    return `<div class="sep${hot ? " hot" : ""}" role="separator" aria-label="${esc(aria)}"><span>${esc(item.sep)}</span></div>`;
   });
+  if(training){
+    return `<div class="rail-wrap simulated">
+      <div class="rail-sim-tag" role="status">TRAINING ONLY · simulated posture rail — do not switch workstation posture</div>
+      <div class="rail simulated" aria-label="TRAINING ONLY simulated posture rail">${parts.join("")}</div>
+    </div>`;
+  }
   return `<div class="rail">${parts.join("")}</div>`;
 }
 
@@ -1418,6 +1436,15 @@ function runHtml(run){
       ${readinessHtml(req)}
     </div>`;
     }
+  } else if(st.status === "open" && training){
+    // Open skew: phases advanced but ledger not yet complete() — do not say finished.
+    const guidance = "TRAINING ONLY — training ledger awaits completion (not a production command)";
+    tail = `<div class="nextcmd">
+      <span class="label">TRAINING ONLY</span>
+      <span class="need any">ledger open</span>
+      <code>${esc(guidance)}</code>
+      <button class="copy" data-cmd="${esc(guidance)}">copy</button>
+    </div>`;
   } else if(st.status === "abandoned"){
     tail = `<div class="done-line abandoned">abandoned — ${esc(st.abandon_reason || "no reason recorded")}</div>`;
   } else if(training){

@@ -97,11 +97,13 @@ def _page_script_through_run_html() -> str:
     return script.split(marker, 1)[0]
 
 
-def _render_run_html(run: dict) -> str:
+def _render_run_html(run: dict, *, tcp_caps: dict | None = None) -> str:
     """Evaluate PAGE's runHtml() in Node so tests assert real card output."""
     script = _page_script_through_run_html()
     with tempfile.NamedTemporaryFile("w", suffix=".mjs", encoding="utf-8", delete=False) as fh:
         fh.write(script)
+        if tcp_caps is not None:
+            fh.write(f"\ntcpCaps = {json.dumps(tcp_caps)};\n")
         fh.write("\nprocess.stdout.write(runHtml(")
         fh.write(json.dumps(run))
         fh.write("));\n")
@@ -117,6 +119,32 @@ def _render_run_html(run: dict) -> str:
         path.unlink(missing_ok=True)
     assert completed.returncode == 0, completed.stderr
     return completed.stdout
+
+
+def _phases_through(last_pending: str | None) -> dict:
+    """Build phase map with all phases before last_pending passed; rest pending.
+
+    last_pending=None means every phase passed (open skew / complete).
+    """
+    order = ["verify", "publish", "deploy", "tag_bitbucket", "tag_github"]
+    pending = {"state": "pending", "updated_at": None, "evidence": {}}
+    passed = {"state": "passed", "updated_at": None, "evidence": {}}
+    phases: dict = {}
+    reached = False
+    for name in order:
+        if last_pending is not None and name == last_pending:
+            reached = True
+        if last_pending is None:
+            entry = dict(passed)
+        elif reached:
+            entry = dict(pending)
+        else:
+            entry = dict(passed)
+        if name == "deploy":
+            phases[name] = {"node03": dict(entry)}
+        else:
+            phases[name] = entry
+    return phases
 
 
 def _sample_run(
@@ -811,3 +839,79 @@ def test_console_http_surface_stays_read_only() -> None:
     assert "def do_PUT" not in source
     assert "def do_PATCH" not in source
     assert "def do_DELETE" not in source
+
+
+def test_training_rail_is_simulated_without_live_hot_or_firewall_now_cues() -> None:
+    """Educational rail stays, but never cues a live posture switch."""
+    # Waiting on tag_github would normally hot the firewall-off gate.
+    at_github = _render_run_html(
+        _sample_run(
+            kind="training",
+            training=True,
+            status="open",
+            phases=_phases_through("tag_github"),
+        ),
+        tcp_caps={"bb": False, "edge": False},
+    )
+    assert 'class="rail simulated"' in at_github
+    assert "TRAINING ONLY" in at_github
+    assert "simulated" in at_github.lower()
+    assert "firewall off" in at_github  # educational rail label remains
+    assert " hot" not in at_github
+    assert 'class="gate hot"' not in at_github
+    assert 'class="sep hot"' not in at_github
+    assert 'class="station next"' not in at_github
+    assert "switch needed" not in at_github
+    # Live do-it-now firewall aria copy must not appear on training rails.
+    assert "drop VPNs, firewall off" not in at_github
+    assert "needs firewall-off" not in at_github
+
+    # Waiting on deploy would normally hot the + edge vpn sep when edge is down.
+    at_deploy = _render_run_html(
+        _sample_run(
+            kind="training",
+            training=True,
+            status="open",
+            phases=_phases_through("deploy"),
+        ),
+        tcp_caps={"bb": True, "edge": False},
+    )
+    assert 'class="rail simulated"' in at_deploy
+    assert " hot" not in at_deploy
+    assert 'class="station next"' not in at_deploy
+    assert "join + edge vpn" not in at_deploy  # live join aria suppressed
+
+    # Real release at the same point still gets the live firewall-off hot cue.
+    real = _render_run_html(
+        _sample_run(
+            kind="release",
+            training=None,
+            status="open",
+            phases=_phases_through("tag_github"),
+        ),
+        tcp_caps={"bb": False, "edge": False},
+    )
+    assert 'class="gate hot"' in real
+    assert 'class="station next"' in real
+    assert 'class="rail simulated"' not in real
+    assert "drop VPNs, firewall off" in real
+
+
+def test_open_training_all_phases_passed_awaits_completion_not_finished() -> None:
+    html = _render_run_html(
+        _sample_run(
+            kind="training",
+            training=True,
+            status="open",
+            phases=_phases_through(None),
+        )
+    )
+    assert 'class="chip training"' in html
+    assert "awaits completion" in html.lower()
+    assert "practice finished" not in html.lower()
+    assert "release-tagged on GitHub and Bitbucket" not in html
+    # Must not claim the run is complete while status is still open.
+    assert "complete —" not in html
+    assert "TRAINING ONLY" in html
+    for forbidden in _FORBIDDEN_PRODUCTION_COMMANDS:
+        assert forbidden not in html, forbidden
