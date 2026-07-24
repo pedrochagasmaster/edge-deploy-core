@@ -24,6 +24,7 @@ from edge_deploy.auth import AuthBroker
 from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, OperatorConfig, load_tool_profile
 from edge_deploy.ledger import LedgerError, RunLedger
 from edge_deploy.mirror import MirrorError, mirror_release
+from edge_deploy.onboarding.runner import run_onboarding
 from edge_deploy.phases import PHASE_REGISTRY, EngineMismatchError, enter_phase
 from edge_deploy.phases.deploy import run_deploy
 from edge_deploy.phases.publish import run_publish_phase
@@ -167,6 +168,38 @@ def build_parser() -> argparse.ArgumentParser:
     abandon_parser = subparsers.add_parser("abandon", help="Abandon an open run")
     abandon_parser.add_argument("--run", required=True)
     abandon_parser.add_argument("--reason", required=True)
+
+    onboard_parser = subparsers.add_parser(
+        "onboard",
+        help="Provision tools, validate both-vpns readiness, and run guided training",
+    )
+    onboard_parser.add_argument(
+        "--config",
+        required=True,
+        help="Private onboarding/operator source YAML (never commit this file)",
+    )
+    onboard_parser.add_argument("--root", default=None, help="Checkout root (overrides private file)")
+    onboard_parser.add_argument(
+        "--tool",
+        action="append",
+        choices=("autobench", "robocop", "dispatch"),
+        help="Tool to provision; repeatable. 'dispatch' is a CLI alias for robocop",
+    )
+    onboard_parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Rerun diagnostics without provisioning",
+    )
+    onboard_parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="Discard onboarding evidence only (keeps checkouts and private config)",
+    )
+    onboard_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm --restart non-interactively (valid only with --restart)",
+    )
 
     for _spec, register_fn in sorted(PHASE_REGISTRY, key=lambda item: item[0].order):
         register_fn(subparsers)
@@ -936,6 +969,17 @@ def main(argv: list[str] | None = None) -> int:
             return args.func(args, None)
         except (LedgerError, KeyError, ValueError) as exc:
             print(f"status failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 2
+    if args.command == "onboard":
+        # Onboarding loads a private source file via its own import path; do not
+        # require OperatorConfig.load (same early-exit class as status / mirror).
+        if args.yes and not args.restart:
+            print("error: --yes requires --restart", file=sys.stderr)
+            return 2
+        try:
+            return run_onboarding(args)
+        except (RuntimeError, ValueError, FileNotFoundError, OSError) as exc:
+            print(f"onboard failed: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 2
     try:
         operator = OperatorConfig.load(args.config)
