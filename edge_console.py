@@ -17,8 +17,7 @@ Nodes are believed to hold) against the checkout's HEAD and against GitHub
 ``main`` (``git ls-remote`` — GitHub read works in every posture), flags
 undeployed commits and stale checkouts, and — when no Run is open — walks the
 operator through starting one (posture to hold, optional ``preflight`` /
-``transport-smoke``, then ``py -m edge_deploy release --guided``). Git use is
-strictly read-only, matching the console's no-writes contract.
+``transport-smoke``, then ``py -m edge_deploy release --guided``).
 
 Deliberately standalone: Engine Identity (ADR-0008) hashes every ``*.py``
 inside the ``edge_deploy`` package, so UI code must live outside the engine
@@ -30,10 +29,10 @@ Usage:
     py edge_console.py --root D:\\ab --root D:\\rc    # watch several checkouts
     py edge_console.py --demo                       # fabricated checkouts, no probes
 
-Posture probes are TCP-only and labelled as such in the UI: the corporate
-proxy accepts TCP connects in every posture, and TCP cannot see GitHub write
-(baseline and firewall-off look identical), so only the phases' own
-git-protocol probes are authoritative (ADR-0012/0013).
+Posture probes: Bitbucket and Edge remain TCP-only and labelled as such. The
+GitHub capability light is a per-watched-tool ``git push --dry-run`` write
+probe (same argv as posture gating); it never updates a remote ref. Divergence
+facts still use read-only git (``ls-remote`` for GitHub main).
 """
 
 from __future__ import annotations
@@ -225,7 +224,7 @@ def aggregate_github_write(tool_results: list[dict]) -> str:
 
 
 def _edge_endpoints() -> list[tuple[str, int]]:
-    """Edge node endpoints from the operator config, if the engine is importable."""
+    """Edge node endpoints from the operator config; empty if config cannot be loaded."""
     try:
         operator = load_operator_config(DEFAULT_OPERATOR_CONFIG_PATH)
         endpoints = []
@@ -246,21 +245,36 @@ def _probe_one(host: str, port: int) -> bool:
 
 
 class PostureProber:
-    def __init__(self, demo: bool) -> None:
+    def __init__(self, demo: bool, roots: list[Path] | None = None) -> None:
         self._demo = demo
+        self._roots = list(roots or [])
         self._lock = threading.Lock()
         self._cached: dict | None = None
         self._cached_at = 0.0
 
     def snapshot(self) -> dict:
         if self._demo:
+            tools = [
+                {
+                    "tool": "autobench",
+                    "root": "(demo)/autobench",
+                    "status": "fail",
+                    "detail": "demo: GitHub write unavailable outside firewall-off",
+                },
+                {
+                    "tool": "robocop",
+                    "root": "(demo)/robocop",
+                    "status": "fail",
+                    "detail": "demo: GitHub write unavailable outside firewall-off",
+                },
+            ]
             return {
                 "probed_at": time.strftime("%H:%M:%SZ", time.gmtime()),
                 "groups": {
-                    "github": [
-                        {"endpoint": "github.com:443", "reachable": True},
-                        {"endpoint": "api.github.com:443", "reachable": True},
-                    ],
+                    "github": {
+                        "aggregate": aggregate_github_write(tools),
+                        "tools": tools,
+                    },
                     "bitbucket": [
                         {"endpoint": "scm.mastercard.int:443", "reachable": True},
                     ],
@@ -273,13 +287,15 @@ class PostureProber:
         with self._lock:
             if self._cached and time.monotonic() - self._cached_at < _PROBE_CACHE_SECONDS:
                 return self._cached
-        groups: dict[str, list[tuple[str, int]]] = dict(_STATIC_GROUPS)
+        groups: dict[str, list[tuple[str, int]]] = {
+            key: value for key, value in _STATIC_GROUPS.items() if key != "github"
+        }
         edge = _edge_endpoints()
         if edge:
             groups["edge"] = edge
         flat = [(name, host, port) for name, eps in groups.items() for host, port in eps]
-        with ThreadPoolExecutor(max_workers=max(1, len(flat))) as pool:
-            reachable = list(pool.map(lambda item: _probe_one(item[1], item[2]), flat))
+        with ThreadPoolExecutor(max_workers=max(1, len(flat) or 1)) as pool:
+            reachable = list(pool.map(lambda item: _probe_one(item[1], item[2]), flat)) if flat else []
         result: dict = {
             "probed_at": time.strftime("%H:%M:%SZ", time.gmtime()),
             "groups": {},
@@ -288,6 +304,22 @@ class PostureProber:
             result["groups"].setdefault(name, []).append(
                 {"endpoint": f"{host}:{port}", "reachable": ok}
             )
+        with ThreadPoolExecutor(max_workers=max(1, len(self._roots) or 1)) as pool:
+            write_tools = list(pool.map(probe_github_write, self._roots)) if self._roots else []
+        # Strip command from API payload (argv is an implementation detail).
+        api_tools = [
+            {
+                "tool": row["tool"],
+                "root": row["root"],
+                "status": row["status"],
+                "detail": row["detail"],
+            }
+            for row in write_tools
+        ]
+        result["groups"]["github"] = {
+            "aggregate": aggregate_github_write(api_tools),
+            "tools": api_tools,
+        }
         with self._lock:
             self._cached = result
             self._cached_at = time.monotonic()
@@ -876,7 +908,7 @@ def main() -> int:
         roots = [Path(raw).resolve() for raw in (args.root or ["."])]
 
     ConsoleHandler.roots = roots
-    ConsoleHandler.prober = PostureProber(demo=args.demo)
+    ConsoleHandler.prober = PostureProber(demo=args.demo, roots=roots)
     ConsoleHandler.tools_prober = ToolsProber(roots, demo=args.demo)
     ConsoleHandler.demo = args.demo
 

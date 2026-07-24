@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from edge_console import (  # noqa: E402
     _SCHEMA,
     PAGE,
+    PostureProber,
     ToolsProber,
     _tool_name,
     aggregate_github_write,
@@ -466,3 +467,76 @@ def test_aggregate_github_write_rules() -> None:
     assert aggregate_github_write([{"status": "ok"}, {"status": "fail"}]) == "fail"
     assert aggregate_github_write([{"status": "ok"}, {"status": "unknown"}]) == "unknown"
     assert aggregate_github_write([{"status": "fail"}, {"status": "unknown"}]) == "fail"
+
+
+def test_posture_prober_github_uses_write_probes_not_tcp(tmp_path, monkeypatch) -> None:
+    auto = tmp_path / "autobench"
+    robo = tmp_path / "robocop"
+    for root in (auto, robo):
+        root.mkdir()
+        (root / ".git").mkdir()
+
+    def runner(command: list[str], cwd):
+        assert command == github_write_command()
+        return 0 if Path(cwd).name == "autobench" else 128
+
+    monkeypatch.setattr(
+        "edge_console.probe_github_write",
+        lambda root, runner=None, timeout=20.0: {
+            "tool": Path(root).name,
+            "root": str(root),
+            "status": "ok" if Path(root).name == "autobench" else "fail",
+            "detail": "test",
+            "command": github_write_command(),
+        },
+    )
+    prober = PostureProber(demo=False, roots=[auto, robo])
+    # Force TCP groups empty/fast: stub _probe_one True for bitbucket only path by
+    # replacing snapshot internals via monkeypatch on ThreadPoolExecutor path.
+    monkeypatch.setattr("edge_console._edge_endpoints", lambda: [])
+    monkeypatch.setattr("edge_console._probe_one", lambda host, port: True)
+    snap = prober.snapshot()
+    assert snap["groups"]["github"]["aggregate"] == "fail"
+    by_tool = {row["tool"]: row["status"] for row in snap["groups"]["github"]["tools"]}
+    assert by_tool == {"autobench": "ok", "robocop": "fail"}
+    assert isinstance(snap["groups"]["bitbucket"], list)
+
+
+def test_posture_prober_github_unknown_without_roots(monkeypatch) -> None:
+    monkeypatch.setattr("edge_console._edge_endpoints", lambda: [])
+    monkeypatch.setattr("edge_console._probe_one", lambda host, port: False)
+    snap = PostureProber(demo=False, roots=[]).snapshot()
+    assert snap["groups"]["github"]["aggregate"] == "unknown"
+    assert snap["groups"]["github"]["tools"] == []
+
+
+def test_divergence_still_uses_ls_remote_only(tmp_path) -> None:
+    """Regression: write probes must not replace divergence read probes."""
+    deployed = "d" * 40
+    runs_root = tmp_path / "edge-deploy" / "runs"
+    _write_state(
+        runs_root / "run-20260709T000000Z-deploy1",
+        "run-20260709T000000Z-deploy1",
+        status="complete",
+        source_sha=deployed,
+        created_at="2026-07-09T00:00:00+00:00",
+    )
+    runs = collect_runs(runs_root)
+    calls: list[tuple] = []
+
+    def git(root, *args, timeout=None):
+        calls.append(args)
+        return _fake_git(head=deployed, origin=deployed)(root, *args, timeout=timeout)
+
+    result = probe_divergence(tmp_path, runs, git=git)
+    assert result["verdict"] == "up_to_date"
+    assert any(args[:2] == ("ls-remote", "origin") for args in calls)
+    assert not any(args and args[0] == "push" for args in calls)
+
+
+def test_demo_posture_github_is_write_shaped() -> None:
+    snap = PostureProber(demo=True, roots=[]).snapshot()
+    github = snap["groups"]["github"]
+    assert github["aggregate"] in {"ok", "fail", "unknown"}
+    assert {row["tool"] for row in github["tools"]} == {"autobench", "robocop"}
+    assert all(row["status"] in {"ok", "fail", "unknown"} for row in github["tools"])
