@@ -447,4 +447,3 @@ def test_default_runner_errors_are_host_safe(tmp_path: Path, monkeypatch) -> Non
     assert "token=" not in message
     assert "abc123" not in message
     assert "exit 128" in message
-
