@@ -1,5 +1,9 @@
 # Copy to %APPDATA%/edge-deploy/config.yaml and keep the real file private.
 # BB_TOKEN remains an environment variable.
+# Private onboarding source files may also include checkout_root and
+# bitbucket_remotes.{core,autobench,robocop}. Those keys are consumed by
+# `py -m edge_deploy onboard` and are not stored in onboarding-state.json.
+# Credentials (BB_TOKEN, RSA, Kerberos) must never appear in YAML.
 
 operator_email: operator@example.com
 audit_repo: C:/path/to/edge-deploy-core
