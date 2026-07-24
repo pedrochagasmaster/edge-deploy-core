@@ -10,11 +10,33 @@ import pytest
 
 from edge_deploy import cli
 from edge_deploy.config import OperatorConfig
-from edge_deploy.ledger import LedgerError, RunLedger, is_training_ledger
+from edge_deploy.ledger import LedgerError, RunLedger, is_training_ledger, reject_training_ledger
 from edge_deploy.onboarding.training import create_training_workspace, start_training_ledger
 from edge_deploy.phases import PHASE_REGISTRY, enter_phase, load_run
 from edge_deploy.phases.publish import _cmd_publish_phase
 from edge_deploy.phases.status import format_run_status
+
+_TRAINING_PROFILE = (
+    "tool: autobench\n"
+    "repo_path: /ads_storage/autobench\n"
+    "github_url: https://github.com/example/autobench.git\n"
+    "bitbucket_url: https://scm.example/autobench.git\n"
+    "release_branch: main\n"
+    "runtime_paths: []\n"
+    "compile_targets: src\n"
+    "version_files: []\n"
+    "install_trigger_paths: []\n"
+    "dependency_paths: []\n"
+    "smoke:\n"
+    "  standard: []\n"
+    "  deep: []\n"
+)
+
+
+def _training_workspace_with_profile(tmp_path: Path, tool: str = "autobench") -> Path:
+    ws = create_training_workspace(tmp_path / "appdata" / "edge-deploy", tool)
+    (ws / "edge_deploy.yaml").write_text(_TRAINING_PROFILE.replace("autobench", tool), encoding="utf-8")
+    return ws
 
 
 def _events(ledger: RunLedger) -> list[dict]:
@@ -151,16 +173,33 @@ def test_training_workspace_never_under_real_tool_runs_root(tmp_path: Path) -> N
     assert not str(ws.resolve()).startswith(str((real_tool / "edge-deploy" / "runs").resolve()))
 
 
+def test_reject_training_ledger_central_message() -> None:
+    with pytest.raises(LedgerError, match="^training ledger rejected by production commands$"):
+        reject_training_ledger({"kind": "training", "training": True})
+
+
 def test_enter_phase_rejects_training_ledger_before_lock(tmp_path: Path) -> None:
     ws = create_training_workspace(tmp_path / "appdata" / "edge-deploy", "robocop")
     ledger = start_training_ledger(ws, tool="robocop", operator="trainee", nodes=["node03"])
     created_events = len(_events(ledger))
     spec = PHASE_REGISTRY[0][0]
-    with pytest.raises(LedgerError, match="training ledger rejected"):
+    with pytest.raises(LedgerError, match="^training ledger rejected by production commands$"):
         enter_phase(spec, None, ledger, next_command="x")
     assert not (ledger.run_dir / "run.lock").is_file()
     assert len(_events(ledger)) == created_events
     assert not any(event["event"] == "phase_entered" for event in _events(ledger))
+
+
+def test_enter_phase_rejects_training_before_generic_status(tmp_path: Path) -> None:
+    ws = create_training_workspace(tmp_path / "appdata" / "edge-deploy", "robocop")
+    ledger = start_training_ledger(ws, tool="robocop", operator="trainee", nodes=["node03"])
+    ledger.state["status"] = "abandoned"
+    ledger.state["abandon_reason"] = "practice done"
+    ledger._persist_state()
+    with pytest.raises(LedgerError, match="^training ledger rejected by production commands$") as exc:
+        enter_phase(PHASE_REGISTRY[0][0], None, ledger, next_command="x")
+    assert "abandoned" not in str(exc.value)
+    assert not (ledger.run_dir / "run.lock").is_file()
 
 
 @pytest.mark.parametrize(
@@ -180,7 +219,7 @@ def test_enter_phase_rejects_either_marker(tmp_path: Path, state_patch: dict) ->
     )
     ledger.state.update(state_patch)
     ledger._persist_state()
-    with pytest.raises(LedgerError, match="training ledger rejected"):
+    with pytest.raises(LedgerError, match="^training ledger rejected by production commands$"):
         enter_phase(PHASE_REGISTRY[0][0], None, ledger, next_command="x")
     assert not (ledger.run_dir / "run.lock").is_file()
 
@@ -191,7 +230,7 @@ def test_load_run_rejects_training_ledger(tmp_path: Path, monkeypatch: pytest.Mo
     monkeypatch.chdir(ws)
     operator = SimpleNamespace(tools={"autobench": str(ws)})
     args = SimpleNamespace(run=ledger.state["run_id"])
-    with pytest.raises(LedgerError, match="training ledger rejected"):
+    with pytest.raises(LedgerError, match="^training ledger rejected by production commands$"):
         load_run(args, operator)  # type: ignore[arg-type]
 
 
@@ -212,7 +251,7 @@ def test_publish_phase_rejects_training_before_mutation(
     )
     args = SimpleNamespace(run=ledger.state["run_id"], no_local_check=False, force_lock=False)
     operator = SimpleNamespace(tools={"autobench": str(ws)}, tool_path=lambda t: ws)
-    with pytest.raises(LedgerError, match="training ledger rejected"):
+    with pytest.raises(LedgerError, match="^training ledger rejected by production commands$"):
         _cmd_publish_phase(args, operator)  # type: ignore[arg-type]
     assert not (ledger.run_dir / "run.lock").is_file()
     assert len(_events(ledger)) == created_events
@@ -224,23 +263,7 @@ def test_publish_phase_rejects_training_before_mutation(
 def test_release_continue_rejects_training_before_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    ws = create_training_workspace(tmp_path / "appdata" / "edge-deploy", "autobench")
-    (ws / "edge_deploy.yaml").write_text(
-        "tool: autobench\n"
-        "repo_path: /ads_storage/autobench\n"
-        "github_url: https://github.com/example/autobench.git\n"
-        "bitbucket_url: https://scm.example/autobench.git\n"
-        "release_branch: main\n"
-        "runtime_paths: []\n"
-        "compile_targets: src\n"
-        "version_files: []\n"
-        "install_trigger_paths: []\n"
-        "dependency_paths: []\n"
-        "smoke:\n"
-        "  standard: []\n"
-        "  deep: []\n",
-        encoding="utf-8",
-    )
+    ws = _training_workspace_with_profile(tmp_path)
     ledger = start_training_ledger(ws, tool="autobench", operator="trainee", nodes=["node03"])
     created_events = len(_events(ledger))
     monkeypatch.chdir(ws)
@@ -270,10 +293,56 @@ def test_release_continue_rejects_training_before_lock(
             "tools": {"autobench": str(ws)},
         }
     )
-    with pytest.raises(LedgerError, match="training ledger rejected"):
+    with pytest.raises(LedgerError, match="^training ledger rejected by production commands$"):
         cli._cmd_release(args, operator)
     assert not (ledger.run_dir / "run.lock").is_file()
     assert len(_events(ledger)) == created_events
+    assert RunLedger.load(ledger.run_dir).state["status"] == "open"
+
+
+def test_bare_release_refuses_open_training_without_production_commands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = _training_workspace_with_profile(tmp_path)
+    ledger = start_training_ledger(ws, tool="autobench", operator="trainee", nodes=["node03"])
+    run_id = ledger.state["run_id"]
+    monkeypatch.chdir(ws)
+
+    def fail_chain(*_args, **_kwargs):
+        raise AssertionError("release chain must not run for training ledgers")
+
+    monkeypatch.setattr(cli, "_chain_release_phases", fail_chain)
+    args = SimpleNamespace(
+        tool=None,
+        run=None,
+        nodes=None,
+        force_lock=False,
+        guided=False,
+        no_local_check=False,
+        smoke="standard",
+        max_auth_attempts=3,
+        auth_mode="prompt",
+        auth_wait_seconds=300.0,
+        heartbeat_interval=30.0,
+        stall_threshold=300.0,
+    )
+    operator = OperatorConfig.from_mapping(
+        {
+            "operator_email": "op@example.com",
+            "nodes": {"node03": {"host": "user@edge.example"}},
+            "tools": {"autobench": str(ws)},
+        }
+    )
+    rc = cli._cmd_release(args, operator)
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "training" in out.lower()
+    assert run_id in out
+    assert f"release --run {run_id}" not in out
+    assert f"abandon --run {run_id}" not in out
+    assert "py -m edge_deploy release --run" not in out
+    assert "py -m edge_deploy abandon --run" not in out
+    assert not (ledger.run_dir / "run.lock").is_file()
     assert RunLedger.load(ledger.run_dir).state["status"] == "open"
 
 
@@ -286,7 +355,7 @@ def test_abandon_rejects_training_before_mutation(
     monkeypatch.chdir(ws)
     args = SimpleNamespace(run=ledger.state["run_id"], reason="practice done")
     operator = SimpleNamespace(tools={})
-    with pytest.raises(LedgerError, match="training ledger rejected"):
+    with pytest.raises(LedgerError, match="^training ledger rejected by production commands$"):
         cli._cmd_abandon(args, operator)  # type: ignore[arg-type]
     assert not (ledger.run_dir / "run.lock").is_file()
     assert len(_events(ledger)) == created_events
@@ -299,7 +368,17 @@ def test_status_does_not_present_training_next_as_production_safe(tmp_path: Path
     ws = create_training_workspace(tmp_path / "appdata" / "edge-deploy", "autobench")
     ledger = start_training_ledger(ws, tool="autobench", operator="trainee", nodes=["node03"])
     output = format_run_status(ledger)
-    assert "TRAINING" in output.upper()
-    assert "py -m edge_deploy verify" not in output
-    assert "py -m edge_deploy publish-phase" not in output
-    assert "py -m edge_deploy deploy" not in output
+    assert "next: TRAINING ONLY (not a production command)" in output
+    assert output.endswith("next: TRAINING ONLY (not a production command)")
+    for forbidden in (
+        "py -m edge_deploy verify",
+        "py -m edge_deploy publish-phase",
+        "py -m edge_deploy deploy",
+        "py -m edge_deploy tag-github",
+        "py -m edge_deploy tag-bitbucket",
+        "py -m edge_deploy release",
+        "py -m edge_deploy abandon",
+        "release --run",
+        "abandon --run",
+    ):
+        assert forbidden not in output, forbidden

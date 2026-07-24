@@ -22,7 +22,7 @@ from edge_deploy import __version__, drift, preflight, rollout
 from edge_deploy.audit import AuditAttempt, AuditSyncError, append_audit_attempt
 from edge_deploy.auth import AuthBroker
 from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, OperatorConfig, load_tool_profile
-from edge_deploy.ledger import LedgerError, RunLedger, is_training_ledger
+from edge_deploy.ledger import LedgerError, RunLedger, is_training_ledger, reject_training_ledger
 from edge_deploy.mirror import MirrorError, mirror_release
 from edge_deploy.onboarding.runner import run_onboarding
 from edge_deploy.phases import PHASE_REGISTRY, EngineMismatchError, enter_phase
@@ -285,6 +285,16 @@ def _print_open_run_refusal(run: dict) -> None:
     tool = run["tool"]
     sha7 = run["source_sha"][:7]
     created_at = run["created_at"]
+    if is_training_ledger(run):
+        print(
+            f"release refused: open training run {run_id} for {tool} "
+            f"(source {sha7}, created {created_at}) exists."
+        )
+        print(
+            "Training ledgers are practice-only under the training workspace; "
+            "do not continue or abandon them with production commands."
+        )
+        return
     print(
         f"release refused: unresolved run {run_id} for {tool} "
         f"(source {sha7}, created {created_at}) exists."
@@ -602,8 +612,7 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
             print(f"no such run: {args.run} under {runs_root}", file=sys.stderr)
             return 2
         ledger = RunLedger.load(run_dir)
-        if is_training_ledger(ledger):
-            raise LedgerError("training ledger rejected by production commands")
+        reject_training_ledger(ledger)
         if ledger.state["status"] != "open":
             return _refuse_non_open_run("release", args.run, ledger.state["status"])
     else:
@@ -824,8 +833,7 @@ def _cmd_abandon(args: argparse.Namespace, operator: OperatorConfig) -> int:
         print(f"no such run: {args.run} under {runs_root}", file=sys.stderr)
         return 2
     ledger = RunLedger.load(run_dir)
-    if is_training_ledger(ledger):
-        raise LedgerError("training ledger rejected by production commands")
+    reject_training_ledger(ledger)
     with ledger.locked():
         ledger.abandon(args.reason)
     print(f"abandoned {args.run}")

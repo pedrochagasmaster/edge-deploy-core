@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from edge_deploy.config import OperatorConfig
-from edge_deploy.ledger import LedgerError, RunLedger, engine_identity, is_training_ledger
+from edge_deploy.ledger import LedgerError, RunLedger, engine_identity, reject_training_ledger
 from edge_deploy.posture import require_posture
 
 SocketConnector = Callable[[tuple[str, int], float], object]
@@ -37,11 +37,6 @@ def _runs_root(repo_root: Path) -> Path:
     return repo_root / "edge-deploy" / "runs"
 
 
-def _reject_training_ledger(ledger: RunLedger) -> None:
-    if is_training_ledger(ledger):
-        raise LedgerError("training ledger rejected by production commands")
-
-
 def load_run(args: argparse.Namespace, operator: OperatorConfig) -> tuple[RunLedger, Path]:
     """Locate a run directory under configured tool roots, then cwd."""
     for tool_path in operator.tools.values():
@@ -50,7 +45,7 @@ def load_run(args: argparse.Namespace, operator: OperatorConfig) -> tuple[RunLed
         run_dir = runs_root / args.run
         if run_dir.is_dir() and (run_dir / "state.json").is_file():
             ledger = RunLedger.load(run_dir)
-            _reject_training_ledger(ledger)
+            reject_training_ledger(ledger)
             return ledger, repo_root
 
     repo_root = Path.cwd().resolve()
@@ -60,7 +55,7 @@ def load_run(args: argparse.Namespace, operator: OperatorConfig) -> tuple[RunLed
         print(f"no such run: {args.run} under {runs_root}", file=sys.stderr)
         raise SystemExit(2)
     ledger = RunLedger.load(run_dir)
-    _reject_training_ledger(ledger)
+    reject_training_ledger(ledger)
     return ledger, repo_root
 
 
@@ -89,13 +84,13 @@ def enter_phase(
     repo_root: Path | None = None,
     git_probe_runner: Callable | None = None,
 ) -> ExitStack:
+    reject_training_ledger(ledger)
     run_status = ledger.state["status"]
     if run_status != "open":
         run_id = ledger.state["run_id"]
         raise LedgerError(
             f"phase '{spec.name}' refused: run {run_id} is {run_status}"
         )
-    _reject_training_ledger(ledger)
 
     stack = ExitStack()
     ledger.acquire_lock(force=force_lock)

@@ -37,6 +37,12 @@ def is_training_ledger(ledger_or_state: RunLedger | dict) -> bool:
     return state.get("kind") == "training" or state.get("training") is True
 
 
+def reject_training_ledger(ledger_or_state: RunLedger | dict) -> None:
+    """Raise when a production command touches a training ledger."""
+    if is_training_ledger(ledger_or_state):
+        raise LedgerError("training ledger rejected by production commands")
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
