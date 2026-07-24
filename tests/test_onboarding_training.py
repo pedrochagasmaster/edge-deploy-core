@@ -1,7 +1,8 @@
-"""Training ledger markers and production rejection."""
+"""Training ledger markers, production rejection, and guided simulator."""
 
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,8 +11,21 @@ import pytest
 
 from edge_deploy import cli
 from edge_deploy.config import OperatorConfig
-from edge_deploy.ledger import LedgerError, RunLedger, is_training_ledger, reject_training_ledger
-from edge_deploy.onboarding.training import create_training_workspace, start_training_ledger
+from edge_deploy.ledger import (
+    _VALID_PHASE_STATES,
+    _VALID_STATUSES,
+    LedgerError,
+    RunLedger,
+    is_training_ledger,
+    reject_training_ledger,
+)
+from edge_deploy.onboarding.training import (
+    TRAINING_PHASES,
+    advance_training,
+    create_training_workspace,
+    run_guided_training,
+    start_training_ledger,
+)
 from edge_deploy.phases import PHASE_REGISTRY, enter_phase, load_run
 from edge_deploy.phases.publish import _cmd_publish_phase
 from edge_deploy.phases.status import format_run_status
@@ -382,3 +396,246 @@ def test_status_does_not_present_training_next_as_production_safe(tmp_path: Path
         "abandon --run",
     ):
         assert forbidden not in output, forbidden
+
+
+_TRAINING_MODULE = Path("edge_deploy/onboarding/training.py")
+_FIREWALL_OFF_PROMPT = (
+    "TRAINING ONLY: a real guided release would switch both-vpns → firewall-off "
+    "before tag_github. Do not change the workstation posture now; press Enter to "
+    "simulate the acknowledgement."
+)
+_ENGINE_EVENTS = frozenset(
+    {
+        "run_created",
+        "phase_entered",
+        "phase_skipped",
+        "lock_stolen",
+        "run_abandoned",
+        "run_completed",
+    }
+)
+_ROLLOUT_EVIDENCE_KEYS = frozenset(
+    {
+        "tool",
+        "node",
+        "status",
+        "state_left",
+        "deployment_commit",
+        "previous_remote_commit",
+        "sensitive_changed",
+        "drift",
+        "smoke",
+        "report_path",
+        "dependency",
+    }
+)
+
+
+def test_training_module_does_not_import_production_executors() -> None:
+    source = _TRAINING_MODULE.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        if isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module)
+    forbidden = {
+        "edge_deploy.phases.publish",
+        "edge_deploy.phases.deploy",
+        "edge_deploy.phases.tag",
+        "edge_deploy.phases.verify",
+        "edge_deploy.publish",
+        "edge_deploy.rollout",
+        "edge_deploy.mirror",
+    }
+    assert not (imported & forbidden)
+
+
+def test_training_module_has_no_subprocess_or_network_calls() -> None:
+    tree = ast.parse(_TRAINING_MODULE.read_text(encoding="utf-8"))
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        if isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    forbidden_roots = {"subprocess", "socket", "urllib", "http", "requests", "paramiko"}
+    assert not (imported & forbidden_roots)
+
+
+def test_guided_training_advances_all_phases(tmp_path: Path) -> None:
+    ws = create_training_workspace(tmp_path / "appdata", "autobench")
+    ledger = start_training_ledger(ws, tool="autobench", operator="op", nodes=["node03", "node04"])
+    prompts: list[str] = []
+
+    def acknowledge(message: str) -> None:
+        prompts.append(message)
+
+    run_guided_training(ledger, acknowledge=acknowledge)
+    ledger = RunLedger.load(ledger.run_dir)
+    assert ledger.state["status"] == "complete"
+    for phase in TRAINING_PHASES:
+        if phase == "deploy":
+            assert all(
+                ledger.state["phases"]["deploy"][n]["state"] == "passed" for n in ("node03", "node04")
+            )
+        else:
+            assert ledger.state["phases"][phase]["state"] == "passed"
+    assert any("firewall-off" in p for p in prompts)
+    assert any("simulated" in p.lower() or "training" in p.lower() for p in prompts)
+
+
+def test_guided_training_prompt_text_and_order(tmp_path: Path) -> None:
+    ws = create_training_workspace(tmp_path / "appdata", "autobench")
+    ledger = start_training_ledger(ws, tool="autobench", operator="op", nodes=["node03"])
+    prompts: list[str] = []
+    phase_when_prompted: list[str] = []
+
+    def acknowledge(message: str) -> None:
+        prompts.append(message)
+        phase_when_prompted.append(ledger.phase_state("tag_bitbucket"))
+        assert ledger.phase_state("tag_github") == "pending"
+
+    run_guided_training(ledger, acknowledge=acknowledge)
+    assert prompts == [_FIREWALL_OFF_PROMPT]
+    assert phase_when_prompted == ["passed"]
+    assert "Do not change the workstation posture" in prompts[0]
+
+
+def test_guided_training_console_compatible_shape_and_events(tmp_path: Path) -> None:
+    ws = create_training_workspace(tmp_path / "appdata", "autobench")
+    ledger = start_training_ledger(
+        ws, tool="autobench", operator="op", nodes=["node03", "node04"]
+    )
+    run_guided_training(ledger, acknowledge=lambda _msg: None)
+    ledger = RunLedger.load(ledger.run_dir)
+    state = ledger.state
+    assert state["schema"] == "edge-deploy/run/1"
+    assert state["status"] in _VALID_STATUSES
+    assert state["status"] == "complete"
+    assert state["kind"] == "training"
+    assert state["training"] is True
+    assert sorted(state["phases"]["deploy"]) == sorted(state["nodes"])
+
+    sha = state["source_sha"]
+    verify = state["phases"]["verify"]
+    assert verify["state"] == "passed"
+    assert verify["evidence"]["commit"] == sha
+    assert verify["evidence"]["ci"] == "success"
+    assert verify["evidence"]["tests"] == "passed"
+    assert "verified_at" in verify["evidence"]
+
+    publish = state["phases"]["publish"]
+    assert publish["state"] == "passed"
+    assert publish["evidence"]["snapshot_sha"] == sha
+    assert publish["evidence"]["source_commit"] == sha
+    assert publish["evidence"]["previous_remote_commit"]
+
+    for node in ("node03", "node04"):
+        node_phase = state["phases"]["deploy"][node]
+        assert node_phase["state"] in _VALID_PHASE_STATES
+        assert node_phase["state"] == "passed"
+        evidence = node_phase["evidence"]
+        assert _ROLLOUT_EVIDENCE_KEYS <= set(evidence)
+        assert evidence["tool"] == "autobench"
+        assert evidence["node"] == node
+        assert evidence["status"] == "rolled_out"
+        assert evidence["deployment_commit"] == sha
+        assert evidence["drift"] == "passed"
+        assert evidence["smoke"] == "passed"
+
+    tag = state["phases"]["tag_bitbucket"]["evidence"]["tag"]
+    assert tag.startswith("release-")
+    assert state["phases"]["tag_bitbucket"]["evidence"]["pushed_sha"] == sha
+    assert state["phases"]["tag_github"]["evidence"]["tag"] == tag
+    assert state["phases"]["tag_github"]["evidence"]["pushed_sha"] == sha
+
+    events = _events(ledger)
+    event_names = [event["event"] for event in events]
+    assert event_names[0] == "run_created"
+    assert event_names[-1] == "run_completed"
+    for phase in TRAINING_PHASES:
+        assert any(e["event"] == "phase_entered" and e["phase"] == phase for e in events)
+    assert all(event["event"] in _ENGINE_EVENTS for event in events)
+
+
+def test_advance_training_rejects_unknown_phase(tmp_path: Path) -> None:
+    ws = create_training_workspace(tmp_path / "appdata", "autobench")
+    ledger = start_training_ledger(ws, tool="autobench", operator="op", nodes=["node03"])
+    with pytest.raises(LedgerError, match="unknown training phase"):
+        advance_training(ledger, "mirror")
+
+
+def test_advance_training_rejects_out_of_order(tmp_path: Path) -> None:
+    ws = create_training_workspace(tmp_path / "appdata", "autobench")
+    ledger = start_training_ledger(ws, tool="autobench", operator="op", nodes=["node03"])
+    with pytest.raises(LedgerError, match="out of order|prerequisite"):
+        advance_training(ledger, "publish")
+    assert ledger.phase_state("publish") == "pending"
+    assert ledger.phase_state("verify") == "pending"
+
+
+def test_advance_training_rerun_is_idempotent(tmp_path: Path) -> None:
+    ws = create_training_workspace(tmp_path / "appdata", "autobench")
+    ledger = start_training_ledger(ws, tool="autobench", operator="op", nodes=["node03"])
+    advance_training(ledger, "verify")
+    first = dict(ledger.state["phases"]["verify"])
+    events_before = len(_events(ledger))
+    advance_training(ledger, "verify")
+    assert ledger.state["phases"]["verify"] == first
+    assert len(_events(ledger)) == events_before
+    assert ledger.phase_state("verify") == "passed"
+
+
+def test_advance_training_rejects_non_training_ledger(tmp_path: Path) -> None:
+    runs_root = tmp_path / "edge-deploy" / "runs"
+    runs_root.mkdir(parents=True)
+    ledger = RunLedger.create(
+        runs_root,
+        tool="autobench",
+        source_sha="a" * 40,
+        nodes=["node03"],
+        operator="op",
+        kind="release",
+    )
+    with pytest.raises(LedgerError, match="training"):
+        advance_training(ledger, "verify")
+    assert ledger.phase_state("verify") == "pending"
+
+
+def test_advance_training_rejects_when_run_not_open(tmp_path: Path) -> None:
+    ws = create_training_workspace(tmp_path / "appdata", "autobench")
+    ledger = start_training_ledger(ws, tool="autobench", operator="op", nodes=["node03"])
+    ledger.complete()
+    with pytest.raises(LedgerError, match="not open|complete"):
+        advance_training(ledger, "verify")
+
+
+def test_guided_training_preserves_markers_and_stays_in_training_root(tmp_path: Path) -> None:
+    appdata = tmp_path / "appdata"
+    real_tool = tmp_path / "checkouts" / "autobench"
+    (real_tool / "edge-deploy" / "runs").mkdir(parents=True)
+    before_real = {p for p in real_tool.rglob("*") if p.is_file()}
+
+    ws = create_training_workspace(appdata, "autobench")
+    ledger = start_training_ledger(ws, tool="autobench", operator="op", nodes=["node03", "node04"])
+    run_guided_training(ledger, acknowledge=lambda _msg: None)
+    ledger = RunLedger.load(ledger.run_dir)
+
+    assert ledger.state["kind"] == "training"
+    assert ledger.state["training"] is True
+    assert is_training_ledger(ledger) is True
+    assert ledger.run_dir.resolve().is_relative_to(ws.resolve())
+    assert not any(
+        path.resolve().is_relative_to(real_tool.resolve())
+        for path in ledger.run_dir.rglob("*")
+        if path.is_file()
+    )
+    after_real = {p for p in real_tool.rglob("*") if p.is_file()}
+    assert after_real == before_real
+    assert not (ledger.run_dir / "run.lock").is_file()
+
+
+def test_training_phases_order_matches_production() -> None:
+    assert TRAINING_PHASES == ("verify", "publish", "deploy", "tag_bitbucket", "tag_github")
