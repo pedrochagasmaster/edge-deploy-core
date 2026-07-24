@@ -18,7 +18,8 @@ from typing import Any
 
 import paramiko
 
-from edge_deploy.audit import AuditSyncError, check_audit_remote
+from edge_deploy.audit import default_outbox
+from edge_deploy.auth import ensure_kerberos
 from edge_deploy.config import (
     TOOL_PROFILE_FILENAME,
     NodeConfig,
@@ -80,18 +81,31 @@ class NodeSessionRegistry:
     def put(self, node: str, driver: Any) -> None:
         self._drivers[node] = driver
 
+    def discard(self, node: str) -> Any | None:
+        """Remove and return a driver without stopping it."""
+        return self._drivers.pop(node, None)
+
     def clear(self) -> None:
         self._drivers.clear()
 
     def stop_all(self) -> None:
         for driver in list(self._drivers.values()):
-            stop = getattr(driver, "stop_session", None)
-            if callable(stop):
-                try:
-                    stop()
-                except Exception:
-                    pass
+            _stop_driver(driver)
         self.clear()
+
+
+def _stop_driver(driver: Any) -> None:
+    stop = getattr(driver, "stop_session", None)
+    if callable(stop):
+        try:
+            stop()
+        except Exception:
+            pass
+
+
+def _safe_failure_summary(label: str, exc: BaseException) -> str:
+    """Stable failure text: check label + exception type only (never ``str(exc)``)."""
+    return f"{label} failed ({type(exc).__name__})"
 
 
 @dataclass(frozen=True)
@@ -379,6 +393,19 @@ def build_default_tool_clean_main_runner(
     return check
 
 
+def _bitbucket_targets(
+    *,
+    tools: Sequence[str],
+    tool_roots: Mapping[str, Path],
+    core_root: Path,
+) -> tuple[list[tuple[str, Path]], list[str]]:
+    """Return (runnable targets, missing selected-tool labels)."""
+    missing = [tool for tool in tools if tool not in tool_roots]
+    targets: list[tuple[str, Path]] = [("core", Path(core_root))]
+    targets.extend((tool, Path(tool_roots[tool])) for tool in tools if tool in tool_roots)
+    return targets, missing
+
+
 def build_default_bitbucket_read_runner(
     *,
     tools: Sequence[str],
@@ -389,8 +416,10 @@ def build_default_bitbucket_read_runner(
     def check() -> CheckResult:
         failed: list[str] = []
         command = git_probe_command("bitbucket", "read")
-        targets: list[tuple[str, Path]] = [("core", Path(core_root))]
-        targets.extend((tool, Path(tool_roots[tool])) for tool in tools if tool in tool_roots)
+        targets, missing = _bitbucket_targets(
+            tools=tools, tool_roots=tool_roots, core_root=core_root
+        )
+        failed.extend(missing)
         for label, root in targets:
             if git_runner(list(command), root) != 0:
                 failed.append(label)
@@ -423,8 +452,10 @@ def build_default_bitbucket_write_dry_run_runner(
     def check() -> CheckResult:
         failed: list[str] = []
         command = git_probe_command("bitbucket", "write")
-        targets: list[tuple[str, Path]] = [("core", Path(core_root))]
-        targets.extend((tool, Path(tool_roots[tool])) for tool in tools if tool in tool_roots)
+        targets, missing = _bitbucket_targets(
+            tools=tools, tool_roots=tool_roots, core_root=core_root
+        )
+        failed.extend(missing)
         for label, root in targets:
             if git_runner(list(command), root) != 0:
                 failed.append(label)
@@ -448,30 +479,46 @@ def build_default_bitbucket_write_dry_run_runner(
 def build_default_audit_runner(
     *,
     core_root: Path,
-    tools: Sequence[str],
-    audit_check: Callable[..., None] | None = None,
+    git_runner: GitRunner | None = None,
+    outbox: Path | None = None,
 ) -> SimpleCheckRunner:
-    check_fn = audit_check or check_audit_remote
+    """Prompt-disabled, deadline-bounded readiness audit probe.
+
+    Checks outbox emptiness, bitbucket remote presence, and release-log
+    ``ls-remote`` access. Exit codes only — never interpolates remote URLs.
+    Does not call :func:`edge_deploy.audit.check_audit_remote` / ``audit._run``.
+    """
+    run = git_runner or default_git_runner
 
     def check() -> CheckResult:
-        try:
-            # Reachability / sync first (no tool filter).
-            check_fn(Path(core_root))
-            for tool in tools:
-                check_fn(Path(core_root), tool=tool, allow_unresolved=True)
-        except AuditSyncError as exc:
+        pending = outbox if outbox is not None else default_outbox()
+        if pending.exists() and any(pending.iterdir()):
             return CheckResult(
                 "audit_release_log",
                 "failed",
-                f"release-log audit not synchronized ({type(exc).__name__})",
+                "unsynchronized audit outbox is not empty",
                 "Clear the audit outbox and synchronize the Bitbucket release-log branch.",
             )
-        except Exception as exc:
+        root = Path(core_root)
+        if run(["git", "remote", "get-url", "bitbucket"], root) != 0:
             return CheckResult(
                 "audit_release_log",
                 "failed",
-                f"release-log audit check failed ({type(exc).__name__})",
-                "Confirm Bitbucket release-log access, then re-run.",
+                "bitbucket remote missing on core checkout",
+                "Configure the core bitbucket remote, then re-run.",
+            )
+        if (
+            run(
+                ["git", "ls-remote", "bitbucket", "refs/heads/release-log"],
+                root,
+            )
+            != 0
+        ):
+            return CheckResult(
+                "audit_release_log",
+                "failed",
+                "release-log ls-remote access failed",
+                "Confirm Bitbucket VPN and release-log branch access, then re-run.",
             )
         return CheckResult(
             "audit_release_log",
@@ -566,15 +613,19 @@ def make_rsa_and_transport_runners(
     *,
     registry: NodeSessionRegistry | None = None,
     transport_factory: Callable[[NodeConfig], Any] | None = None,
-    authenticate: Callable[[Any, str], None] | None = None,
+    authenticate: Callable[[Any, str], Any] | None = None,
     smoke: Callable[..., Any] | None = None,
 ) -> tuple[AuthRunner, TransportSmokeRunner]:
     """Build RSA + transport runners that share one per-node authenticated session.
 
-    ``authenticate(driver, node_name)`` should leave ``driver`` authenticated and
-    registered. ``smoke`` defaults to :func:`run_transport_smoke` and receives that
-    same driver — avoiding a second RSA prompt. Kerberos (when required) should be
-    scheduled before transport smoke so it can use the live session first.
+    ``authenticate(driver, node_name)`` must return the authenticated driver. Only
+    this builder registers it in ``registry``. On failure the builder stops any
+    constructed driver and discards stale registry entries for that node.
+
+    ``smoke`` defaults to :func:`run_transport_smoke` and receives the registered
+    driver — avoiding a second RSA prompt. Pair with
+    :func:`build_default_kerberos_runner` and schedule Kerberos before transport
+    smoke when deep smoke is required.
     """
     active = registry if registry is not None else NodeSessionRegistry()
     smoke_fn = smoke or run_transport_smoke
@@ -588,20 +639,25 @@ def make_rsa_and_transport_runners(
                 f"unknown node {node_name}",
                 "Configure the node in OperatorConfig, then re-run.",
             )
+        driver: Any | None = None
         try:
             if transport_factory is None:
                 raise RuntimeError("transport_factory is required for RSA auth")
-            driver = transport_factory(node)
             if authenticate is None:
                 raise RuntimeError("authenticate is required for RSA auth")
-            authenticate(driver, node_name)
-            active.put(node_name, driver)
+            driver = transport_factory(node)
+            authenticated = authenticate(driver, node_name)
+            active.put(node_name, authenticated)
         except Exception as exc:
-            summary = redact(f"{type(exc).__name__}: {exc}")
+            stale = active.discard(node_name)
+            if stale is not None:
+                _stop_driver(stale)
+            if driver is not None and driver is not stale:
+                _stop_driver(driver)
             return CheckResult(
                 f"rsa_auth:{node_name}",
                 "failed",
-                f"RSA authentication failed for {node_name}: {summary}",
+                _safe_failure_summary(f"RSA authentication for {node_name}", exc),
                 "Re-enter a fresh RSA passcode; it is never stored.",
             )
         return CheckResult(
@@ -623,11 +679,10 @@ def make_rsa_and_transport_runners(
         try:
             result = smoke_fn(driver, node_label=node_name)
         except Exception as exc:
-            summary = redact(f"{type(exc).__name__}: {exc}")
             return CheckResult(
                 f"transport_smoke:{node_name}",
                 "failed",
-                f"transport smoke failed for {node_name}: {summary}",
+                _safe_failure_summary(f"transport smoke for {node_name}", exc),
                 "Inspect transport smoke failures, then re-run readiness.",
             )
         passed = bool(getattr(result, "passed", False))
@@ -648,13 +703,56 @@ def make_rsa_and_transport_runners(
     return rsa_runner, transport_runner
 
 
+def build_default_kerberos_runner(
+    registry: NodeSessionRegistry,
+    *,
+    ensure_fn: Callable[..., Any] | None = None,
+) -> KerberosRunner:
+    """Consume the RSA-authenticated registry driver; map ensure_kerberos safely."""
+    ensure = ensure_fn or ensure_kerberos
+
+    def run(node_name: str) -> CheckResult:
+        driver = registry.get(node_name)
+        if driver is None:
+            return CheckResult(
+                f"kerberos:{node_name}",
+                "failed",
+                f"no authenticated session for {node_name}",
+                "RSA auth must succeed before Kerberos.",
+            )
+        try:
+            report = ensure(driver, node_name)
+        except Exception as exc:
+            return CheckResult(
+                f"kerberos:{node_name}",
+                "failed",
+                _safe_failure_summary(f"Kerberos for {node_name}", exc),
+                "Re-enter Kerberos credentials; they are never stored.",
+            )
+        if getattr(report, "passed", False):
+            return CheckResult(
+                f"kerberos:{node_name}",
+                "passed",
+                "Kerberos ticket ok",
+                "",
+            )
+        return CheckResult(
+            f"kerberos:{node_name}",
+            "failed",
+            f"Kerberos failed for {node_name}",
+            "Acquire a Kerberos ticket on the node, then re-run.",
+        )
+
+    return run
+
+
 # ---------------------------------------------------------------------------
 # Built-in helpers (local / env only)
 # ---------------------------------------------------------------------------
 
 
 def _check_bb_token() -> CheckResult:
-    if os.environ.get("BB_TOKEN"):
+    if (os.environ.get("BB_TOKEN") or "").strip():
         return CheckResult("bb_token_present", "passed", "BB_TOKEN is set", "")
     return CheckResult(
         "bb_token_present",
@@ -764,7 +862,7 @@ def _execute(spec: CheckSpec) -> CheckResult:
         return CheckResult(
             spec.id,
             "failed",
-            f"check raised {type(exc).__name__}: {exc}",
+            _safe_failure_summary(f"check {spec.id}", exc),
             "Inspect the check error, correct the environment, then re-run.",
         )
 

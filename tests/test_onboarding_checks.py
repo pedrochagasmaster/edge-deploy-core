@@ -11,14 +11,21 @@ from edge_deploy.onboarding.checks import (
     CheckSpec,
     NodeSessionRegistry,
     ReadinessContext,
+    build_default_audit_runner,
+    build_default_bitbucket_read_runner,
     build_default_bitbucket_write_dry_run_runner,
+    build_default_edge_tcp_runner,
+    build_default_gh_auth_runner,
+    build_default_github_read_runner,
+    build_default_kerberos_runner,
     build_default_known_hosts_runner,
+    build_default_tool_clean_main_runner,
     build_readiness_specs,
     make_rsa_and_transport_runners,
     run_checks,
 )
 from edge_deploy.posture import git_probe_command
-from edge_deploy.reporting import redact
+from edge_deploy.reporting import ReportCheck, redact
 
 
 def _host_key_line(hostname: str, port: int, key: paramiko.PKey) -> str:
@@ -117,7 +124,8 @@ def test_check_exception_becomes_failed_and_continues() -> None:
     assert results[0].outcome == "failed"
     assert "leaked-secret" not in results[0].summary
     assert "leaked-secret" not in results[0].remediation
-    assert "***REDACTED***" in results[0].summary
+    assert "token=" not in results[0].summary
+    assert "RuntimeError" in results[0].summary
     assert results[1].outcome == "passed"
     assert calls == ["a", "b"]
 
@@ -624,6 +632,7 @@ def test_rsa_transport_registry_reuses_same_driver(tmp_path: Path) -> None:
         def __init__(self) -> None:
             self.auth_calls = 0
             self.smoke_calls = 0
+            self.stopped = False
 
         def ensure(self) -> None:
             self.auth_calls += 1
@@ -631,15 +640,19 @@ def test_rsa_transport_registry_reuses_same_driver(tmp_path: Path) -> None:
         def smoke(self) -> None:
             self.smoke_calls += 1
 
+        def stop_session(self) -> None:
+            self.stopped = True
+
     drivers = {"node03": FakeDriver()}
     registry = NodeSessionRegistry()
 
     def transport_factory(node: NodeConfig):
         return drivers[node.name]
 
-    def authenticate(driver, node_name: str) -> None:
+    def authenticate(driver, node_name: str):
+        del node_name
         driver.ensure()
-        registry.put(node_name, driver)
+        return driver  # builder alone registers
 
     def run_smoke(driver, *, node_label: str):
         driver.smoke()
@@ -675,3 +688,371 @@ def test_conditional_kerberos_only_when_require_deep_smoke(tmp_path: Path) -> No
 
     shallow = build_readiness_specs(_ctx(tmp_path, require_deep_smoke=False))
     assert not any(s.id.startswith("kerberos:") for s in shallow)
+
+
+# ---------------------------------------------------------------------------
+# Review-fix coverage (host-safe errors, defaults, registry ownership)
+# ---------------------------------------------------------------------------
+
+
+_LEAK = "passcode=999999 https://scm.mastercard.int/x.git host=hde2stl020003.mastercard.int"
+
+
+def test_execute_failure_summary_uses_exception_type_only() -> None:
+    def boom() -> CheckResult:
+        raise RuntimeError(_LEAK)
+
+    results = run_checks([CheckSpec("leaky", (), boom)], max_workers=1)
+    assert results[0].outcome == "failed"
+    assert "RuntimeError" in results[0].summary
+    assert "999999" not in results[0].summary
+    assert "scm.mastercard.int" not in results[0].summary
+    assert "hde2stl020003" not in results[0].summary
+    assert _LEAK not in results[0].summary
+    assert _LEAK not in results[0].remediation
+
+
+def test_rsa_transport_kerberos_failures_never_interpolate_exc_text(
+    tmp_path: Path,
+) -> None:
+    class FakeDriver:
+        def stop_session(self) -> None:
+            return None
+
+    registry = NodeSessionRegistry()
+
+    def transport_factory(node: NodeConfig):
+        del node
+        return FakeDriver()
+
+    def authenticate(driver, node_name: str):
+        del driver, node_name
+        raise ConnectionError(_LEAK)
+
+    def smoke(driver, *, node_label: str):
+        del driver, node_label
+        raise TimeoutError(_LEAK)
+
+    rsa_runner, smoke_runner = make_rsa_and_transport_runners(
+        _operator(tmp_path),
+        registry=registry,
+        transport_factory=transport_factory,
+        authenticate=authenticate,
+        smoke=smoke,
+    )
+    rsa = rsa_runner("node03")
+    assert rsa.outcome == "failed"
+    assert "ConnectionError" in rsa.summary
+    assert "999999" not in rsa.summary
+    assert "scm.mastercard.int" not in rsa.summary
+    assert registry.get("node03") is None
+
+    # Pre-register so transport/kerberos paths exercise exception handling.
+    registry.put("node03", FakeDriver())
+    smoke_result = smoke_runner("node03")
+    assert smoke_result.outcome == "failed"
+    assert "TimeoutError" in smoke_result.summary
+    assert "999999" not in smoke_result.summary
+    assert "scm.mastercard.int" not in smoke_result.summary
+
+    kerberos = build_default_kerberos_runner(
+        registry,
+        ensure_fn=lambda driver, label, **kwargs: (_ for _ in ()).throw(
+            RuntimeError(_LEAK)
+        ),
+    )
+    kresult = kerberos("node03")
+    assert kresult.outcome == "failed"
+    assert "RuntimeError" in kresult.summary
+    assert "999999" not in kresult.summary
+    assert "scm.mastercard.int" not in kresult.summary
+    assert "hde2stl020003" not in kresult.summary
+
+
+def test_bitbucket_runners_fail_when_selected_tool_root_missing(tmp_path: Path) -> None:
+    def git_runner(command: list[str], root: Path) -> int:
+        del command, root
+        return 0
+
+    read = build_default_bitbucket_read_runner(
+        tools=["autobench", "robocop"],
+        tool_roots={"autobench": tmp_path / "autobench"},
+        core_root=tmp_path / "core",
+        git_runner=git_runner,
+    )()
+    write = build_default_bitbucket_write_dry_run_runner(
+        tools=["autobench", "robocop"],
+        tool_roots={"autobench": tmp_path / "autobench"},
+        core_root=tmp_path / "core",
+        git_runner=git_runner,
+    )()
+    assert read.outcome == "failed"
+    assert write.outcome == "failed"
+    assert "robocop" in read.summary
+    assert "robocop" in write.summary
+    assert "https://" not in read.summary
+    assert "https://" not in write.summary
+
+
+def test_whitespace_only_bb_token_fails(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("BB_TOKEN", "   \t  ")
+    result = next(
+        s for s in build_readiness_specs(_ctx(tmp_path)) if s.id == "bb_token_present"
+    ).run()
+    assert result.outcome == "failed"
+    assert "BB_TOKEN" in result.remediation
+
+
+def test_default_gh_auth_runner_uses_injected_runner() -> None:
+    calls: list[list[str]] = []
+
+    def runner(command: list[str]) -> int:
+        calls.append(command)
+        return 1
+
+    result = build_default_gh_auth_runner(runner=runner)()
+    assert result.outcome == "failed"
+    assert calls == [["gh", "auth", "status"]]
+    assert "gh" in result.summary.lower()
+
+
+def test_default_github_read_runner_uses_git_probe_read(tmp_path: Path) -> None:
+    seen: list[tuple[tuple[str, ...], str]] = []
+
+    def git_runner(command: list[str], root: Path) -> int:
+        seen.append((tuple(command), root.name))
+        return 0
+
+    result = build_default_github_read_runner(
+        tools=["autobench"],
+        tool_roots={"autobench": tmp_path / "autobench"},
+        git_runner=git_runner,
+    )()
+    assert result.outcome == "passed"
+    assert seen == [(tuple(git_probe_command("origin", "read")), "autobench")]
+
+
+def test_default_tool_clean_main_runner_requires_exact_match(tmp_path: Path) -> None:
+    outputs = {
+        ("git", "branch", "--show-current"): "main\n",
+        ("git", "status", "--porcelain", "--untracked-files=all"): "",
+        ("git", "rev-parse", "HEAD"): "a" * 40 + "\n",
+        ("git", "rev-parse", "refs/remotes/origin/main"): "b" * 40 + "\n",
+    }
+
+    def git_runner(command: list[str], root: Path) -> int:
+        del root
+        return 0
+
+    def output_runner(command: list[str], root: Path) -> str:
+        del root
+        return outputs[tuple(command)]
+
+    result = build_default_tool_clean_main_runner(
+        tools=["autobench"],
+        tool_roots={"autobench": tmp_path / "autobench"},
+        git_runner=git_runner,
+        output_runner=output_runner,
+    )()
+    assert result.outcome == "failed"
+    assert "autobench" in result.summary
+    assert "https://" not in result.summary
+
+
+def test_default_bitbucket_read_and_write_use_probe_commands(tmp_path: Path) -> None:
+    seen: list[tuple[str, ...]] = []
+
+    def git_runner(command: list[str], root: Path) -> int:
+        del root
+        seen.append(tuple(command))
+        return 0
+
+    assert (
+        build_default_bitbucket_read_runner(
+            tools=["autobench"],
+            tool_roots={"autobench": tmp_path / "ab"},
+            core_root=tmp_path / "core",
+            git_runner=git_runner,
+        )().outcome
+        == "passed"
+    )
+    assert (
+        build_default_bitbucket_write_dry_run_runner(
+            tools=["autobench"],
+            tool_roots={"autobench": tmp_path / "ab"},
+            core_root=tmp_path / "core",
+            git_runner=git_runner,
+        )().outcome
+        == "passed"
+    )
+    assert tuple(git_probe_command("bitbucket", "read")) in seen
+    assert tuple(git_probe_command("bitbucket", "write")) in seen
+    assert not any(cmd == tuple(git_probe_command("origin", "write")) for cmd in seen)
+
+
+def test_default_edge_tcp_runner_names_nodes_only(tmp_path: Path) -> None:
+    private = "hde2stl020003.mastercard.int"
+    operator = OperatorConfig(
+        operator_email="op@example.com",
+        audit_repo=str(tmp_path / "core"),
+        nodes={
+            "node03": NodeConfig(
+                host=f"operator@{private}",
+                ssh_options="-p 2222",
+                name="node03",
+            )
+        },
+    )
+
+    def connect(address: tuple[str, int], timeout: float) -> object:
+        del timeout
+        raise TimeoutError(f"timed out connecting to {address[0]}")
+
+    result = build_default_edge_tcp_runner(operator, connect=connect, timeout=1.0)()
+    assert result.outcome == "failed"
+    assert "node03" in result.summary
+    assert private not in result.summary
+    assert private not in result.remediation
+
+
+def test_default_audit_runner_probe_without_url_leak(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "app"))
+    outbox = tmp_path / "app" / "edge-deploy" / "outbox"
+    outbox.mkdir(parents=True)
+    # empty outbox ok
+    calls: list[tuple[tuple[str, ...], str]] = []
+
+    def git_runner(command: list[str], root: Path) -> int:
+        calls.append((tuple(command), root.name))
+        if command[:3] == ["git", "remote", "get-url"]:
+            return 0
+        if command[:2] == ["git", "ls-remote"]:
+            return 0
+        return 1
+
+    result = build_default_audit_runner(
+        core_root=tmp_path / "core",
+        git_runner=git_runner,
+        outbox=outbox,
+    )()
+    assert result.outcome == "passed"
+    assert any(cmd[:3] == ("git", "remote", "get-url") for cmd, _ in calls)
+    assert any(
+        cmd[:2] == ("git", "ls-remote") and "release-log" in " ".join(cmd)
+        for cmd, _ in calls
+    )
+    assert "https://" not in result.summary
+    assert "scm." not in result.summary
+
+    (outbox / "pending.json").write_text("{}", encoding="utf-8")
+    dirty = build_default_audit_runner(
+        core_root=tmp_path / "core",
+        git_runner=git_runner,
+        outbox=outbox,
+    )()
+    assert dirty.outcome == "failed"
+    assert "outbox" in dirty.summary.lower() or "unsynchronized" in dirty.summary.lower()
+    assert str(outbox) not in dirty.summary
+
+
+def test_default_audit_runner_remote_or_lsremote_failure_is_label_safe(
+    tmp_path: Path,
+) -> None:
+    def git_runner(command: list[str], root: Path) -> int:
+        del root
+        if command[:3] == ["git", "remote", "get-url"]:
+            return 1
+        return 0
+
+    result = build_default_audit_runner(
+        core_root=tmp_path / "core",
+        git_runner=git_runner,
+        outbox=tmp_path / "empty-outbox",
+    )()
+    assert result.outcome == "failed"
+    assert "bitbucket" in result.summary.lower() or "remote" in result.summary.lower()
+    assert "https://" not in result.summary
+    assert "mastercard" not in result.summary
+
+
+def test_default_kerberos_uses_registry_session_before_smoke(tmp_path: Path) -> None:
+    class FakeDriver:
+        def __init__(self) -> None:
+            self.order: list[str] = []
+
+        def ensure(self) -> None:
+            self.order.append("rsa")
+
+        def kerberos(self) -> None:
+            self.order.append("kerberos")
+
+        def smoke(self) -> None:
+            self.order.append("smoke")
+
+    driver = FakeDriver()
+    registry = NodeSessionRegistry()
+
+    def authenticate(d, node_name: str):
+        del node_name
+        d.ensure()
+        return d
+
+    def smoke(d, *, node_label: str):
+        del node_label
+        d.smoke()
+        return type("R", (), {"passed": True, "checks": []})()
+
+    def ensure_fn(d, label, **kwargs):
+        del label, kwargs
+        d.kerberos()
+        return ReportCheck("kerberos", True, "Existing Kerberos ticket")
+
+    rsa_runner, smoke_runner = make_rsa_and_transport_runners(
+        _operator(tmp_path),
+        registry=registry,
+        transport_factory=lambda node: driver,
+        authenticate=authenticate,
+        smoke=smoke,
+    )
+    kerberos_runner = build_default_kerberos_runner(registry, ensure_fn=ensure_fn)
+    assert rsa_runner("node03").outcome == "passed"
+    assert kerberos_runner("node03").outcome == "passed"
+    assert smoke_runner("node03").outcome == "passed"
+    assert driver.order == ["rsa", "kerberos", "smoke"]
+    assert registry.get("node03") is driver
+
+
+def test_auth_failure_cleans_up_driver_and_leaves_no_stale_registry(
+    tmp_path: Path,
+) -> None:
+    class FakeDriver:
+        def __init__(self) -> None:
+            self.stopped = False
+
+        def stop_session(self) -> None:
+            self.stopped = True
+
+    driver = FakeDriver()
+    registry = NodeSessionRegistry()
+    # Stale entry that must be cleared on failure.
+    registry.put("node03", FakeDriver())
+
+    def authenticate(d, node_name: str):
+        del d, node_name
+        raise RuntimeError("passcode=123456 rejected at host=edge.example")
+
+    rsa_runner, _smoke = make_rsa_and_transport_runners(
+        _operator(tmp_path),
+        registry=registry,
+        transport_factory=lambda node: driver,
+        authenticate=authenticate,
+    )
+    result = rsa_runner("node03")
+    assert result.outcome == "failed"
+    assert "RuntimeError" in result.summary
+    assert "123456" not in result.summary
+    assert "edge.example" not in result.summary
+    assert registry.get("node03") is None
+    assert driver.stopped is True
