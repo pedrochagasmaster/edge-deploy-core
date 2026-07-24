@@ -1,0 +1,188 @@
+import sys
+from pathlib import Path
+
+import pytest
+
+from edge_deploy.ledger import engine_identity
+from edge_deploy.onboarding.manifest import CORE_GITHUB_URL, TOOL_MANIFESTS, approved_engine_tag
+from edge_deploy.onboarding.repositories import (
+    assert_engine_pins_compatible,
+    bootstrap_core_root,
+    install_tool_dependencies,
+    provision_tool_checkout,
+    validate_bootstrap_core,
+)
+
+
+class FakeGit:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+        self.origin = TOOL_MANIFESTS["autobench"].github_url
+        self.bitbucket = ""
+        self.head_tag = approved_engine_tag()
+
+    def __call__(self, args: list[str]) -> str:
+        self.calls.append(list(args))
+        if args[:2] == ["git", "clone"]:
+            dest = Path(args[-1])
+            dest.mkdir(parents=True)
+            (dest / ".git").mkdir()
+            (dest / "edge_deploy.yaml").write_text("tool: autobench\n", encoding="utf-8")
+            (dest / "tools" / "dev").mkdir(parents=True)
+            (dest / "tools" / "dev" / "local_check.ps1").write_text("# ok\n", encoding="utf-8")
+            (dest / "pyproject.toml").write_text(
+                f"edge-deploy-core @ git+https://example/@{approved_engine_tag()}\n",
+                encoding="utf-8",
+            )
+            return ""
+        if args[:3] == ["git", "remote", "get-url"]:
+            if args[3] == "origin":
+                return self.origin + "\n"
+            if args[3] == "bitbucket":
+                if not self.bitbucket:
+                    raise RuntimeError("bitbucket missing")
+                return self.bitbucket + "\n"
+        if args[:3] == ["git", "remote", "add"]:
+            self.bitbucket = args[4]
+            return ""
+        if args[:2] == ["git", "status"]:
+            return ""
+        if args[:3] == ["git", "describe", "--tags"]:
+            return self.head_tag + "\n"
+        if args[:2] == ["git", "rev-parse"]:
+            return "a" * 40 + "\n"
+        return ""
+
+
+def _tool_pyproject(*, tag: str, extras: bool = True) -> str:
+    lines = [
+        "[project]",
+        "name = \"demo-tool\"",
+        f'dependencies = ["edge-deploy-core @ git+https://example/@{tag}"]',
+        "",
+    ]
+    if extras:
+        lines.extend(
+            [
+                "[project.optional-dependencies]",
+                'dev = ["pytest"]',
+                'release = ["build"]',
+                "",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def test_bootstrap_core_root_is_editable_package_parent() -> None:
+    expected = Path(engine_identity()["package_dir"]).resolve().parent
+    assert bootstrap_core_root() == expected
+
+
+def test_validate_bootstrap_core_never_clones(tmp_path: Path) -> None:
+    core = tmp_path / "edge-deploy-core"
+    core.mkdir()
+    (core / ".git").mkdir()
+    fake = FakeGit()
+    fake.origin = CORE_GITHUB_URL
+    result = validate_bootstrap_core(
+        core,
+        bitbucket_url="https://bitbucket.example/core.git",
+        expected_tag=approved_engine_tag(),
+        runner=fake,
+    )
+    assert result.action == "validated"
+    assert not any(c[:2] == ["git", "clone"] for c in fake.calls)
+
+
+def test_clone_tool_when_missing(tmp_path: Path) -> None:
+    dest = tmp_path / "autobench"
+    fake = FakeGit()
+    result = provision_tool_checkout(
+        dest,
+        TOOL_MANIFESTS["autobench"],
+        bitbucket_url="https://bitbucket.example/ab.git",
+        runner=fake,
+    )
+    assert result.action == "cloned"
+    assert dest.is_dir()
+    assert any(c[:2] == ["git", "clone"] for c in fake.calls)
+
+
+def test_refuse_unexpected_existing_directory(tmp_path: Path) -> None:
+    dest = tmp_path / "autobench"
+    dest.mkdir()
+    (dest / "README.md").write_text("nope\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="unexpected"):
+        provision_tool_checkout(
+            dest,
+            TOOL_MANIFESTS["autobench"],
+            bitbucket_url="https://bitbucket.example/ab.git",
+            runner=lambda args: "",
+        )
+
+
+def test_engine_pin_mismatch_fails_before_install(tmp_path: Path) -> None:
+    a = tmp_path / "autobench"
+    b = tmp_path / "robocop"
+    for root, tag in ((a, "v1.5.3"), (b, "v1.4.0")):
+        root.mkdir()
+        (root / "pyproject.toml").write_text(
+            f'dependencies = ["edge-deploy-core @ git+https://example/@{tag}"]\n',
+            encoding="utf-8",
+        )
+    with pytest.raises(RuntimeError, match="engine pin"):
+        assert_engine_pins_compatible([a, b], expected_tag="v1.5.3")
+
+
+def test_pin_mismatch_causes_zero_install_calls(tmp_path: Path) -> None:
+    a = tmp_path / "autobench"
+    b = tmp_path / "robocop"
+    for root, tag in ((a, approved_engine_tag()), (b, "v1.4.0")):
+        root.mkdir()
+        (root / "pyproject.toml").write_text(_tool_pyproject(tag=tag), encoding="utf-8")
+    install_calls: list[list[str]] = []
+
+    def runner(args: list[str]) -> str:
+        install_calls.append(list(args))
+        return ""
+
+    with pytest.raises(RuntimeError, match="engine pin"):
+        assert_engine_pins_compatible([a, b], expected_tag=approved_engine_tag())
+        for root in (a, b):
+            install_tool_dependencies(root, runner=runner)
+
+    assert install_calls == []
+
+
+def test_install_tool_dependencies_runs_declared_operator_extras(tmp_path: Path) -> None:
+    tool = tmp_path / "autobench"
+    tool.mkdir()
+    (tool / "pyproject.toml").write_text(
+        _tool_pyproject(tag=approved_engine_tag()),
+        encoding="utf-8",
+    )
+    calls: list[list[str]] = []
+
+    def runner(args: list[str]) -> str:
+        calls.append(list(args))
+        return ""
+
+    assert_engine_pins_compatible([tool], expected_tag=approved_engine_tag())
+    install_tool_dependencies(tool, runner=runner)
+
+    assert calls == [[sys.executable, "-m", "pip", "install", "-e", ".[dev,release]"]]
+
+
+def test_install_tool_dependencies_requires_declared_extras(tmp_path: Path) -> None:
+    tool = tmp_path / "autobench"
+    tool.mkdir()
+    (tool / "pyproject.toml").write_text(
+        _tool_pyproject(tag=approved_engine_tag(), extras=False),
+        encoding="utf-8",
+    )
+    calls: list[list[str]] = []
+
+    with pytest.raises(RuntimeError, match="optional-dependencies"):
+        install_tool_dependencies(tool, runner=lambda args: calls.append(list(args)) or "")
+
+    assert calls == []
