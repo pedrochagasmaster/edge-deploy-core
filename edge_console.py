@@ -62,7 +62,6 @@ _PROBE_CACHE_SECONDS = 10.0
 GITHUB_WRITE_STATUSES = frozenset({"ok", "fail", "unknown"})
 
 _STATIC_GROUPS: dict[str, list[tuple[str, int]]] = {
-    "github": [("github.com", 443), ("api.github.com", 443)],
     "bitbucket": [("scm.mastercard.int", 443)],
 }
 
@@ -287,9 +286,7 @@ class PostureProber:
         with self._lock:
             if self._cached and time.monotonic() - self._cached_at < _PROBE_CACHE_SECONDS:
                 return self._cached
-        groups: dict[str, list[tuple[str, int]]] = {
-            key: value for key, value in _STATIC_GROUPS.items() if key != "github"
-        }
+        groups: dict[str, list[tuple[str, int]]] = dict(_STATIC_GROUPS)
         edge = _edge_endpoints()
         if edge:
             groups["edge"] = edge
@@ -984,7 +981,10 @@ header{border-bottom:1px solid var(--line);background:var(--panel)}
 .endpoint .dot{width:7px;height:7px;border-radius:50%;flex:none;background:var(--faint)}
 .endpoint.up .dot{background:var(--pass);box-shadow:0 0 5px rgba(121,201,143,.7)}
 .endpoint.down .dot{background:transparent;border:1.5px solid var(--fail)}
-.endpoint.up{color:var(--ink)}
+.endpoint.unknown .dot{background:transparent;border:1.5px solid var(--warn)}
+.endpoint.ok .dot{background:var(--pass);box-shadow:0 0 5px rgba(121,201,143,.7)}
+.endpoint.fail .dot{background:transparent;border:1.5px solid var(--fail)}
+.endpoint.up,.endpoint.ok{color:var(--ink)}
 /* five-posture strip: the inferred current posture(s) lit, the rest dim */
 .pstrip{max-width:1060px;margin:0 auto;padding:0 20px 10px;display:flex;gap:6px;flex-wrap:wrap;align-items:center}
 .pchip{font-family:var(--mono);font-size:10.5px;letter-spacing:.06em;border:1px solid var(--line);border-radius:4px;padding:2.5px 9px;color:var(--faint)}
@@ -1159,11 +1159,11 @@ footer code{font-family:var(--mono)}
   <div id="tools"></div>
   <div class="filterbar" id="filterbar" aria-label="filter runs by tool and status"></div>
   <div id="runs"></div>
-  <footer>TCP reachability is informational: the corporate proxy accepts connects in every
-  posture, and TCP cannot see GitHub write (baseline vs firewall-off) — only each phase's
-  git-protocol probe is authoritative (ADR-0012/0013). Divergence facts come from read-only
-  git (rev-parse / rev-list locally; ls-remote for GitHub main, a github-read action that
-  works in every posture). This console never writes to the ledger or the checkout.</footer>
+  <footer>Bitbucket/Edge lights are TCP-only. The GitHub light is a per-tool
+  <code>git push --dry-run</code> write probe (no ref update); green only when every
+  watched tool passes. Divergence still uses read-only <code>ls-remote</code>
+  (GitHub read works in every posture). Phase git-protocol probes remain
+  authoritative for release commands (ADR-0012/0013).</footer>
 </main>
 
 <script>
@@ -1203,6 +1203,7 @@ const RAIL = [
 // Latest TCP inference from the posture panel ("bitbucket"/"edge" up flags);
 // null until the first /api/posture answer arrives.
 let tcpCaps = null;
+let githubWriteAgg = null; // set when /api/posture arrives
 
 function esc(s){
   return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -1411,10 +1412,20 @@ function runHtml(run){
 /* ---------- posture panel ---------- */
 const POSTURE_NAMES = ["baseline","edge-vpn","bitbucket-vpn","both-vpns","firewall-off"];
 
+function githubWriteHtml(g){
+  const agg = g.aggregate || "unknown";
+  const rows = (g.tools || []).map(t => {
+    const st = t.status || "unknown";
+    return `<div class="endpoint ${st}"><span class="dot"></span>${esc(t.tool)} · ${esc(st)}${t.detail ? ` · ${esc(t.detail)}` : ""}</div>`;
+  }).join("") || `<div class="endpoint unknown"><span class="dot"></span>no watched tools</div>`;
+  return `<div class="pgroup gh"><h3>github write · ${esc(agg)}</h3>${rows}</div>`;
+}
+
 function postureHtml(p){
   const order = ["github","bitbucket","edge"];
   const cls = {github:"gh", bitbucket:"bb", edge:"edge"};
   return order.filter(g => p.groups[g]).map(g => {
+    if(g === "github") return githubWriteHtml(p.groups.github);
     const rows = p.groups[g].map(e =>
       `<div class="endpoint ${e.reachable ? "up" : "down"}"><span class="dot"></span>${esc(e.endpoint)}</div>`
     ).join("");
@@ -1422,8 +1433,8 @@ function postureHtml(p){
   }).join("");
 }
 
-// TCP sees the VPNs (bitbucket, edge) but not GitHub write, so baseline and
-// firewall-off are indistinguishable here (ADR-0013).
+// VPN chips come from Bitbucket/Edge TCP only. GitHub write is a separate
+// aggregate (ADR-0013); baseline and firewall-off stay indistinguishable via TCP.
 function inferPostures(p){
   const up = g => (p.groups[g] || []).some(e => e.reachable);
   const bb = up("bitbucket"), edge = up("edge");
@@ -1444,22 +1455,27 @@ function pstripHtml(inf){
 function postureNote(p, inf){
   let read;
   if(inf.bb && inf.edge)
-    read = "<b>Both VPNs up</b> — publish, deploy, and tag-bitbucket can run; tag-github still needs the firewall off.";
+    read = "<b>Both VPNs up</b> — publish, deploy, and tag-bitbucket can run; tag-github still needs the firewall off. GitHub write aggregate is shown separately.";
   else if(inf.bb)
     read = "<b>Bitbucket VPN up</b> — publish and tag-bitbucket can run; deploy also needs the Edge VPN.";
   else if(inf.edge)
     read = "<b>Edge VPN up</b> — join the Bitbucket VPN before publish or deploy.";
   else
-    read = "<b>No VPNs reachable</b> — baseline or firewall-off; TCP cannot see GitHub write. GitHub read works in every posture.";
-  return `${read} <span style="color:var(--faint)">probed ${esc(p.probed_at)} · TCP only</span>`;
+    read = "<b>No VPNs reachable</b> — baseline or firewall-off; GitHub write aggregate is shown separately. GitHub read works in every posture.";
+  return `${read} <span style="color:var(--faint)">probed ${esc(p.probed_at)}</span>`;
 }
 
-// Small honesty marker next to the next command: can the current posture
-// (as far as TCP can see) run it?
+// Honesty marker next to the next command: TCP for VPN phases; write aggregate for gh.
 function readinessHtml(req){
   if(!tcpCaps) return "";
   if(req === "any") return `<span class="readiness ok">runs in any posture</span>`;
-  if(req === "gh")  return `<span class="readiness">tcp can't see github write</span>`;
+  if(req === "gh"){
+    if(githubWriteAgg === "ok")
+      return `<span class="readiness ok">github write ok</span>`;
+    if(githubWriteAgg === "fail")
+      return `<span class="readiness blocked">github write unavailable</span>`;
+    return `<span class="readiness">github write unknown</span>`;
+  }
   const ok = req === "bb" ? tcpCaps.bb : (tcpCaps.bb && tcpCaps.edge);
   return ok ? `<span class="readiness ok">posture ok (tcp)</span>`
             : `<span class="readiness blocked">switch needed</span>`;
@@ -1722,8 +1738,11 @@ async function pollPosture(){
     const res = await fetch("/api/posture");
     const p = await res.json();
     const inf = inferPostures(p);
-    const capsChanged = !tcpCaps || tcpCaps.bb !== inf.bb || tcpCaps.edge !== inf.edge;
+    const nextAgg = p.groups.github && p.groups.github.aggregate;
+    const capsChanged = !tcpCaps || tcpCaps.bb !== inf.bb || tcpCaps.edge !== inf.edge
+      || githubWriteAgg !== nextAgg;
     tcpCaps = {bb: inf.bb, edge: inf.edge};
+    githubWriteAgg = nextAgg;
     document.getElementById("posture").innerHTML = postureHtml(p);
     document.getElementById("pstrip").innerHTML = pstripHtml(inf);
     document.getElementById("pnote").innerHTML = postureNote(p, inf);

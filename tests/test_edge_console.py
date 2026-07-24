@@ -396,6 +396,22 @@ def test_next_command_cds_into_the_runs_root() -> None:
     assert 'cd "${run.root}"' in body or "cd \\\"${run.root}\\\"" in body
 
 
+def test_page_mentions_github_write_probe_not_tcp_authority() -> None:
+    assert "git push --dry-run" in PAGE
+    assert "github write" in PAGE.lower()
+    # Must match the JS in Step 3: githubWriteHtml(p.groups.github)
+    assert "p.groups.github" in PAGE
+    assert "githubWriteHtml" in PAGE
+    assert "aggregate" in PAGE
+    assert "github write unavailable" in PAGE.lower()
+
+
+def test_page_render_helpers_include_github_write_statuses() -> None:
+    assert 'status || "unknown"' in PAGE or "status || 'unknown'" in PAGE
+    assert "githubWriteAgg === \"ok\"" in PAGE or 'githubWriteAgg === "ok"' in PAGE
+    assert "githubWriteAgg === \"fail\"" in PAGE or 'githubWriteAgg === "fail"' in PAGE
+
+
 def test_github_write_command_matches_posture_write_argv() -> None:
     assert github_write_command() == git_probe_command("origin", "write")
     assert github_write_command() == [
@@ -475,10 +491,6 @@ def test_posture_prober_github_uses_write_probes_not_tcp(tmp_path, monkeypatch) 
     for root in (auto, robo):
         root.mkdir()
         (root / ".git").mkdir()
-
-    def runner(command: list[str], cwd):
-        assert command == github_write_command()
-        return 0 if Path(cwd).name == "autobench" else 128
 
     monkeypatch.setattr(
         "edge_console.probe_github_write",
