@@ -13,11 +13,15 @@ from edge_console import (  # noqa: E402
     PAGE,
     ToolsProber,
     _tool_name,
+    aggregate_github_write,
     build_demo_checkouts,
     collect_runs,
     collect_runs_multi,
+    github_write_command,
     probe_divergence,
+    probe_github_write,
 )
+from edge_deploy.posture import git_probe_command  # noqa: E402
 
 
 def _write_state(
@@ -389,3 +393,76 @@ def test_next_command_cds_into_the_runs_root() -> None:
     body = PAGE.split("function nextCommand(run, phase){", 1)[1].split("\n}", 1)[0]
     assert "run.root" in body
     assert 'cd "${run.root}"' in body or "cd \\\"${run.root}\\\"" in body
+
+
+def test_github_write_command_matches_posture_write_argv() -> None:
+    assert github_write_command() == git_probe_command("origin", "write")
+    assert github_write_command() == [
+        "git",
+        "push",
+        "--dry-run",
+        "--force",
+        "origin",
+        "HEAD:refs/edge-deploy/posture-probe",
+    ]
+
+
+def test_probe_github_write_ok_fail_unknown(tmp_path) -> None:
+    root = tmp_path / "autobench"
+    root.mkdir()
+    (root / ".git").mkdir()
+
+    assert probe_github_write(root, runner=lambda cmd, cwd: 0)["status"] == "ok"
+    assert probe_github_write(root, runner=lambda cmd, cwd: 128)["status"] == "fail"
+
+    missing = tmp_path / "missing"
+    assert probe_github_write(missing, runner=lambda cmd, cwd: 0)["status"] == "unknown"
+
+
+def test_probe_github_write_timeout_is_unknown(tmp_path) -> None:
+    root = tmp_path / "robocop"
+    root.mkdir()
+    (root / ".git").mkdir()
+
+    def timed_out(command: list[str], cwd) -> int:
+        del command, cwd
+        return -1
+
+    result = probe_github_write(root, runner=timed_out)
+    assert result["status"] == "unknown"
+    assert result["tool"] == "robocop"
+
+
+def test_probe_github_write_disables_prompts_and_uses_write_argv(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "autobench"
+    root.mkdir()
+    (root / ".git").mkdir()
+    seen: dict = {}
+
+    def fake_run(command, cwd=None, capture_output=None, timeout=None, env=None, **kwargs):
+        seen["command"] = list(command)
+        seen["cwd"] = Path(cwd)
+        seen["env"] = dict(env)
+        seen["timeout"] = timeout
+
+        class Completed:
+            returncode = 0
+
+        return Completed()
+
+    monkeypatch.setattr("edge_console.subprocess.run", fake_run)
+    result = probe_github_write(root, runner=None)
+    assert result["status"] == "ok"
+    assert seen["command"] == github_write_command()
+    assert seen["cwd"] == root
+    assert seen["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    assert seen["env"]["GCM_INTERACTIVE"] == "never"
+    assert seen["timeout"] == 20.0
+
+
+def test_aggregate_github_write_rules() -> None:
+    assert aggregate_github_write([]) == "unknown"
+    assert aggregate_github_write([{"status": "ok"}, {"status": "ok"}]) == "ok"
+    assert aggregate_github_write([{"status": "ok"}, {"status": "fail"}]) == "fail"
+    assert aggregate_github_write([{"status": "ok"}, {"status": "unknown"}]) == "unknown"
+    assert aggregate_github_write([{"status": "fail"}, {"status": "unknown"}]) == "fail"

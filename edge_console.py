@@ -52,10 +52,15 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, load_operator_config
+from edge_deploy.posture import git_probe_command
+from edge_deploy.preflight import endpoint_from_node
+
 _SCHEMA = "edge-deploy/run/1"
 _EVENT_TAIL = 60
 _PROBE_TIMEOUT = 1.5
 _PROBE_CACHE_SECONDS = 10.0
+GITHUB_WRITE_STATUSES = frozenset({"ok", "fail", "unknown"})
 
 _STATIC_GROUPS: dict[str, list[tuple[str, int]]] = {
     "github": [("github.com", 443), ("api.github.com", 443)],
@@ -137,12 +142,91 @@ def collect_runs_multi(roots: list[Path]) -> list[dict]:
 # TCP posture probes (informational only — see ADR-0012)
 # ---------------------------------------------------------------------------
 
+_GITHUB_WRITE_TIMEOUT = 20.0
+
+
+def github_write_command() -> list[str]:
+    """Exact write-path argv used by posture gating (ADR-0012)."""
+    return list(git_probe_command("origin", "write"))
+
+
+def _default_github_write_runner(command: list[str], repo_root: Path, *, timeout: float) -> int:
+    env = dict(os.environ)
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    env.setdefault("GCM_INTERACTIVE", "never")
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=repo_root,
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return -1
+    except OSError:
+        return -1
+    return completed.returncode
+
+
+def probe_github_write(
+    root: Path,
+    *,
+    runner=None,
+    timeout: float = _GITHUB_WRITE_TIMEOUT,
+) -> dict:
+    """Non-mutating GitHub write probe for one watched checkout.
+
+    Status is ``ok`` (exit 0), ``fail`` (definitive non-zero), or ``unknown``
+    (missing checkout, timeout, or runner cannot execute). Never guesses the
+    failure cause (posture vs credentials vs authz).
+    """
+    root = Path(root)
+    tool = root.name
+    if not (root.is_dir() and (root / ".git").exists()):
+        return {
+            "tool": tool,
+            "root": str(root),
+            "status": "unknown",
+            "detail": "checkout missing or not a git repository",
+        }
+    command = github_write_command()
+    if runner is None:
+        code = _default_github_write_runner(command, root, timeout=timeout)
+    else:
+        code = runner(command, root)
+    if code == 0:
+        status = "ok"
+        detail = "git push --dry-run write probe passed"
+    elif code < 0:
+        status = "unknown"
+        detail = f"write probe timed out or could not run (code {code})"
+    else:
+        status = "fail"
+        detail = f"write probe exited {code}"
+    return {
+        "tool": tool,
+        "root": str(root),
+        "status": status,
+        "detail": detail,
+        "command": command,
+    }
+
+
+def aggregate_github_write(tool_results: list[dict]) -> str:
+    if not tool_results:
+        return "unknown"
+    statuses = [str(item.get("status") or "unknown") for item in tool_results]
+    if any(status == "fail" for status in statuses):
+        return "fail"
+    if any(status != "ok" for status in statuses):
+        return "unknown"
+    return "ok"
+
+
 def _edge_endpoints() -> list[tuple[str, int]]:
     """Edge node endpoints from the operator config, if the engine is importable."""
     try:
-        from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, load_operator_config
-        from edge_deploy.preflight import endpoint_from_node
-
         operator = load_operator_config(DEFAULT_OPERATOR_CONFIG_PATH)
         endpoints = []
         for name in sorted(operator.nodes):
