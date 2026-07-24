@@ -1,9 +1,17 @@
 # Copy to %APPDATA%/edge-deploy/config.yaml and keep the real file private.
 # BB_TOKEN remains an environment variable.
-# Private onboarding source files may also include checkout_root and
-# bitbucket_remotes.{core,autobench,robocop}. Those keys are consumed by
-# `py -m edge_deploy onboard` and are not stored in onboarding-state.json.
+#
+# Private onboarding source (passed to `py -m edge_deploy onboard --config …`)
+# may include the OperatorConfig fields below plus staging-only keys:
+#   checkout_root: C:/edge-deploy
+#   bitbucket_remotes:
+#     core: https://bitbucket.example/scm/project/edge-deploy-core.git
+#     autobench: https://bitbucket.example/scm/project/autobench.git
+#     robocop: https://bitbucket.example/scm/project/robocop.git
+# Those staging keys are consumed by onboard and are not stored in
+# onboarding-state.json (only a fingerprint of the private file is).
 # Credentials (BB_TOKEN, RSA, Kerberos) must never appear in YAML.
+# Replace example hosts/remotes with your private values outside Git.
 
 operator_email: operator@example.com
 audit_repo: C:/path/to/edge-deploy-core

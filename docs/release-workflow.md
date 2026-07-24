@@ -6,21 +6,75 @@ The release engine persists every attempt as a **run** under
 that declare which firewall posture they need. Use `status` to see state and the
 exact next command.
 
+## First-time onboarding (zero state)
+
+New controllers start from [ADR-0017](adr/0017-release-operator-onboarding.md).
+Connect Bitbucket + Edge VPNs (`both-vpns`) first and keep that posture for the
+entire onboard flow — do not switch to `firewall-off` for routine onboarding.
+
+```powershell
+git clone https://github.com/pedrochagasmaster/edge-deploy-core.git
+cd edge-deploy-core
+git checkout v1.5.3
+py -m pip install -e ".[dev]"
+```
+
+Core installs with `.[dev]` only (no core `release` extra). Keep a private
+onboarding source outside Git (see [config.example.yaml](../config.example.yaml)),
+set `BB_TOKEN` in the environment, then:
+
+```powershell
+py -m edge_deploy onboard --config C:\secure\operator.yaml
+```
+
+Or select tools non-interactively (`dispatch` aliases to `robocop`):
+
+```powershell
+py -m edge_deploy onboard `
+  --config C:\secure\operator.yaml `
+  --tool autobench `
+  --tool dispatch
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--root` | Override private `checkout_root` |
+| `--check` | Diagnostics only; no clone/install/practice |
+| `--restart` | Drop onboarding evidence; keep checkouts and private YAML |
+| `--restart --yes` | Non-interactive restart confirmation |
+
+Paths under `%APPDATA%\edge-deploy\`:
+
+- `onboarding-state.json` — resumable stage outcomes (fingerprints only)
+- `onboarding-report.json` — redacted completion report + first real release commands
+- `training\<tool>\` — isolated practice ledgers (`kind=training` and `training=true`)
+- `config.yaml` — installed operator config (never commit)
+
+Training is not a release: production commands reject training ledgers, and the
+console training rail is labeled simulated. GitHub write aggregate green requires
+every watched tool's `git push --dry-run` write probe to pass; **red in
+`both-vpns` is expected and does not fail onboarding**. After onboard completes,
+the first real guided release is a separate boundary (see below).
+
 ## Prerequisites
 
-1. Update a clean local `main` from GitHub with `git pull --ff-only origin main`.
-2. Confirm `HEAD` equals `origin/main` and its post-merge GitHub CI succeeded.
-3. Install and test from the tool checkout:
+1. Complete first-time onboarding above, or otherwise have operator config and
+   tool checkouts ready.
+2. Update a clean local `main` from GitHub with `git pull --ff-only origin main`.
+3. Confirm `HEAD` equals `origin/main` and its post-merge GitHub CI succeeded.
+4. Install and test from the **tool** checkout (tool repos declare `dev` and
+   `release` extras that pin `edge-deploy-core`; this is not a core package
+   extra — [ADR-0001](adr/0001-standalone-operator-package.md)):
 
    ```powershell
-   python -m pip install -e ".[dev,release]"
-   python -m pytest -n 4 --dist loadfile
+   py -m pip install -e ".[dev,release]"
+   py -m pytest -n 4 --dist loadfile
    ```
 
-4. Copy [config.example.yaml](../config.example.yaml) to
-   `%APPDATA%\edge-deploy\config.yaml` and set `BB_TOKEN` in the environment.
+5. Ensure `%APPDATA%\edge-deploy\config.yaml` is installed (onboarding does this)
+   and `BB_TOKEN` is set in the environment.
 
-5. Before releasing to a node for the first time, or after any change to its
+6. Before releasing to a node for the first time, or after any change to its
    `ssh_options`, known-hosts entry, or credentials, verify its transport:
 
    ```powershell
@@ -31,6 +85,8 @@ exact next command.
    `transport-smoke` authenticates once and exercises command execution,
    verified file transfer, PTY dialogue, and keepalive over that single
    connection, then always tears it down and reports pass/fail per check.
+   Onboarding never auto-enrolls SSH host keys; add exact entries to each
+   node's `UserKnownHostsFile` before readiness can pass.
 
 ## Transport (ADR-0014)
 
@@ -294,6 +350,8 @@ for architecture decisions,
 for the durable publish verification contract,
 [docs/adr/0016-tool-owned-verification.md](adr/0016-tool-owned-verification.md)
 for tool-owned source verification,
+[docs/adr/0017-release-operator-onboarding.md](adr/0017-release-operator-onboarding.md)
+for zero-state onboarding,
 [docs/adr/0010-guided-posture-loop.md](adr/0010-guided-posture-loop.md) for
 guided mode and cross-posture resume, and
 [docs/adr/0014-paramiko-release-transport.md](adr/0014-paramiko-release-transport.md)

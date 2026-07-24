@@ -15,7 +15,81 @@ python -m pip install -e ".[dev]"
 python -m pytest
 ```
 
-Python 3.10 and 3.12 are tested in CI.
+Python 3.10 and 3.12 are tested in CI. Core declares only the `dev` extra;
+there is no core `release` extra.
+
+## Release Operator onboarding (zero state)
+
+First-time operators use Windows PowerShell 5.1 on the controller. Connect
+**both** the Bitbucket and Edge VPNs (`both-vpns`) before any clone or install,
+and do not switch VPN or firewall posture during onboarding
+([ADR-0013](docs/adr/0013-five-posture-capability-model.md),
+[ADR-0017](docs/adr/0017-release-operator-onboarding.md)).
+
+1. Bootstrap the approved immutable engine tag and install editable core:
+
+```powershell
+git clone https://github.com/pedrochagasmaster/edge-deploy-core.git
+cd edge-deploy-core
+git checkout v1.5.3
+py -m pip install -e ".[dev]"
+```
+
+Use the tag equal to the package version (`v` + `__version__` /
+`approved_engine_tag()`). Onboarding reuses this same checkout as `audit_repo`
+via `bootstrap_core_root()`; it does not clone core again.
+
+2. Prepare a **private** onboarding source YAML outside every Git repository
+   (never commit it). Use neutral placeholders for hosts and remotes; put
+   `BB_TOKEN` in the environment only. See [config.example.yaml](config.example.yaml)
+   for the allowlisted shape (`operator_email`, `nodes`, optional
+   `checkout_root`, `bitbucket_remotes`).
+
+3. Run onboarding:
+
+```powershell
+py -m edge_deploy onboard --config C:\secure\operator.yaml
+```
+
+Omit `--tool` to choose Autobench and/or Dispatch interactively, or select
+explicitly (`dispatch` is a CLI alias for canonical tool id `robocop`):
+
+```powershell
+py -m edge_deploy onboard `
+  --config C:\secure\operator.yaml `
+  --tool autobench `
+  --tool dispatch
+```
+
+Useful flags (see `py -m edge_deploy onboard --help`):
+
+| Flag | Behavior |
+|------|----------|
+| `--root` | Checkout root (overrides private `checkout_root`) |
+| `--check` | Rerun diagnostics without provisioning |
+| `--restart` | Discard onboarding evidence only (keeps checkouts and private config) |
+| `--restart --yes` | Confirm restart non-interactively (`--yes` is valid only with `--restart`) |
+
+State and the redacted report live under `%APPDATA%\edge-deploy\`
+(`onboarding-state.json`, `onboarding-report.json`). Training ledgers are
+isolated under `%APPDATA%\edge-deploy\training\<tool>\` with both
+`kind=training` and `training=true`; they are not real releases. Re-run the
+same `onboard` command to resume; completed runs refresh the report without
+re-practicing.
+
+Edge Console launches against the training roots and shows a **simulated**
+posture rail — do not switch workstation posture for it. The console GitHub
+write indicator is green only when every watched tool's `git push --dry-run`
+write probe passes; **red in `both-vpns` is expected and is not an onboarding
+failure**. A first real release is a separate boundary after onboarding
+completes, for example:
+
+```powershell
+py -m edge_deploy release --guided --tool autobench
+```
+
+(That real guided release later needs one `both-vpns → firewall-off` switch for
+`tag_github`; onboarding itself never requires it.)
 
 ## Operator configuration
 
@@ -25,19 +99,23 @@ Copy [config.example.yaml](config.example.yaml) to:
 %APPDATA%\edge-deploy\config.yaml
 ```
 
-Keep the real file private. `BB_TOKEN` remains an environment variable and
-interactive RSA or Kerberos responses are never persisted.
+Onboarding installs this path from the private source. Keep the real file
+private. `BB_TOKEN` remains an environment variable and interactive RSA or
+Kerberos responses are never persisted.
 
 Each tool repository contains `edge_deploy.yaml`, which describes only its
 node-independent deployment contract.
 
 ## Release
 
-From the clean GitHub `main` checkout of the tool being released:
+From the clean GitHub `main` checkout of the **tool** being released (Autobench
+or Dispatch/robocop). Tool repos declare a `release` extra that pins
+`edge-deploy-core` ([ADR-0001](docs/adr/0001-standalone-operator-package.md));
+install that tool checkout with:
 
 ```powershell
-python -m pip install -e ".[dev,release]"
-python -m pytest
+py -m pip install -e ".[dev,release]"
+py -m pytest
 py -m edge_deploy status
 py -m edge_deploy release --tool autobench
 ```
@@ -66,4 +144,6 @@ decisions: [ADR-0008](docs/adr/0008-run-ledger-and-posture-phases.md) (run
 ledger and phases), [ADR-0009](docs/adr/0009-on-node-runner-file-evidence.md)
 (runner and file evidence), [ADR-0013](docs/adr/0013-five-posture-capability-model.md)
 (five-posture capability model), [ADR-0014](docs/adr/0014-paramiko-release-transport.md)
-(Paramiko as the default release transport).
+(Paramiko as the default release transport),
+[ADR-0017](docs/adr/0017-release-operator-onboarding.md) (Release Operator
+onboarding).
