@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -24,6 +28,33 @@ from edge_console import (  # noqa: E402
 )
 from edge_deploy.posture import git_probe_command  # noqa: E402
 
+_FORBIDDEN_PRODUCTION_COMMANDS = (
+    "py -m edge_deploy verify",
+    "py -m edge_deploy publish-phase",
+    "py -m edge_deploy deploy",
+    "py -m edge_deploy tag-github",
+    "py -m edge_deploy tag-bitbucket",
+    "py -m edge_deploy release",
+    "py -m edge_deploy abandon",
+    "py -m edge_deploy publish",
+    "release --run",
+    "abandon --run",
+    "tag-github --run",
+    "tag-bitbucket --run",
+)
+
+
+def _pending_phases(nodes: list[str] | None = None) -> dict:
+    nodes = nodes or ["node03"]
+    pending = {"state": "pending", "updated_at": None, "evidence": {}}
+    return {
+        "verify": dict(pending),
+        "publish": dict(pending),
+        "deploy": {name: dict(pending) for name in nodes},
+        "tag_bitbucket": dict(pending),
+        "tag_github": dict(pending),
+    }
+
 
 def _write_state(
     run_dir: Path,
@@ -34,6 +65,9 @@ def _write_state(
     source_sha: str = "a" * 40,
     created_at: str = "2026-07-10T00:00:00+00:00",
     kind: str = "release",
+    training: bool | None = None,
+    phases: dict | None = None,
+    operator: str = "pedro.chagas",
 ) -> None:
     run_dir.mkdir(parents=True)
     state = {
@@ -41,7 +75,7 @@ def _write_state(
         "run_id": run_id,
         "tool": tool,
         "source_sha": source_sha,
-        "operator": "pedro.chagas",
+        "operator": operator,
         "created_at": created_at,
         "kind": kind,
         "rollback_tag": None,
@@ -49,9 +83,75 @@ def _write_state(
         "nodes": ["node03"],
         "status": status,
         "abandon_reason": None,
-        "phases": {},
+        "phases": phases if phases is not None else {},
     }
+    if training is not None:
+        state["training"] = training
     (run_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
+
+
+def _page_script_through_run_html() -> str:
+    script = PAGE.split("<script>", 1)[1].split("</script>", 1)[0]
+    marker = "/* ---------- run filter:"
+    assert marker in script, "PAGE script lost the run-filter marker used to extract runHtml"
+    return script.split(marker, 1)[0]
+
+
+def _render_run_html(run: dict) -> str:
+    """Evaluate PAGE's runHtml() in Node so tests assert real card output."""
+    script = _page_script_through_run_html()
+    with tempfile.NamedTemporaryFile("w", suffix=".mjs", encoding="utf-8", delete=False) as fh:
+        fh.write(script)
+        fh.write("\nprocess.stdout.write(runHtml(")
+        fh.write(json.dumps(run))
+        fh.write("));\n")
+        path = Path(fh.name)
+    try:
+        completed = subprocess.run(
+            ["node", str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        path.unlink(missing_ok=True)
+    assert completed.returncode == 0, completed.stderr
+    return completed.stdout
+
+
+def _sample_run(
+    *,
+    kind: str = "release",
+    training: bool | None = None,
+    status: str = "open",
+    run_id: str = "run-20260724T000000Z-train01",
+    operator: str = "trainee",
+    phases: dict | None = None,
+) -> dict:
+    state: dict = {
+        "schema": _SCHEMA,
+        "run_id": run_id,
+        "tool": "autobench",
+        "source_sha": "a" * 40,
+        "operator": operator,
+        "created_at": "2026-07-24T00:00:00+00:00",
+        "kind": kind,
+        "rollback_tag": None,
+        "engine": {"version": "1.4.0", "package_dir": "(test)", "content_sha256": "b" * 64},
+        "nodes": ["node03"],
+        "status": status,
+        "abandon_reason": None,
+        "phases": phases if phases is not None else _pending_phases(),
+    }
+    if training is not None:
+        state["training"] = training
+    return {
+        "state": state,
+        "events": [],
+        "lock": None,
+        "progress": None,
+        "root": "/tmp/training/autobench",
+    }
 
 
 def _fake_git(
@@ -552,3 +652,162 @@ def test_demo_posture_github_is_write_shaped() -> None:
     assert github["aggregate"] in {"ok", "fail", "unknown"}
     assert {row["tool"] for row in github["tools"]} == {"autobench", "robocop"}
     assert all(row["status"] in {"ok", "fail", "unknown"} for row in github["tools"])
+
+
+# ---------------------------------------------------------------------------
+# Training ledger visibility (read-only; either marker)
+# ---------------------------------------------------------------------------
+
+
+def test_collect_runs_includes_training_ledger(tmp_path) -> None:
+    runs_root = tmp_path / "edge-deploy" / "runs"
+    run_dir = runs_root / "run-20260724T000000Z-train01"
+    _write_state(
+        run_dir,
+        run_dir.name,
+        kind="training",
+        status="open",
+    )
+    state_path = run_dir / "state.json"
+    data = json.loads(state_path.read_text(encoding="utf-8"))
+    data["training"] = True
+    state_path.write_text(json.dumps(data), encoding="utf-8")
+    runs = collect_runs(runs_root)
+    assert len(runs) == 1
+    assert runs[0]["state"]["kind"] == "training"
+    assert runs[0]["state"]["training"] is True
+
+
+def test_page_has_training_chip_styling() -> None:
+    assert "training" in PAGE
+    assert ".chip.training" in PAGE
+    assert "isTrainingRun" in PAGE
+    assert 'aria-label="TRAINING"' in PAGE or "aria-label='TRAINING'" in PAGE
+
+
+@pytest.mark.parametrize(
+    "kind,training",
+    [
+        ("training", True),
+        ("training", None),  # kind-only legacy
+        ("release", True),  # flag-only legacy
+    ],
+)
+def test_training_card_open_labels_and_blocks_production_commands(kind, training) -> None:
+    html = _render_run_html(_sample_run(kind=kind, training=training, status="open"))
+    assert 'class="chip training"' in html
+    assert 'aria-label="TRAINING"' in html
+    assert "TRAINING ONLY" in html
+    assert "TRAINING ONLY (not a production command)" in html
+    for forbidden in _FORBIDDEN_PRODUCTION_COMMANDS:
+        assert forbidden not in html, forbidden
+    # Copy target must also be training-only when present.
+    if "data-cmd=" in html:
+        assert 'data-cmd="TRAINING ONLY (not a production command)"' in html
+        for forbidden in _FORBIDDEN_PRODUCTION_COMMANDS:
+            assert forbidden not in html
+
+
+@pytest.mark.parametrize(
+    "kind,training",
+    [
+        ("training", True),
+        ("training", None),
+        ("release", True),
+    ],
+)
+def test_training_card_complete_labels_without_production_commands(kind, training) -> None:
+    html = _render_run_html(
+        _sample_run(
+            kind=kind,
+            training=training,
+            status="complete",
+            phases={
+                "verify": {"state": "passed", "updated_at": None, "evidence": {}},
+                "publish": {"state": "passed", "updated_at": None, "evidence": {}},
+                "deploy": {
+                    "node03": {"state": "passed", "updated_at": None, "evidence": {}}
+                },
+                "tag_bitbucket": {"state": "passed", "updated_at": None, "evidence": {}},
+                "tag_github": {"state": "passed", "updated_at": None, "evidence": {}},
+            },
+        )
+    )
+    assert 'class="chip training"' in html
+    assert 'aria-label="TRAINING"' in html
+    assert "TRAINING ONLY" in html
+    assert "release-tagged on GitHub and Bitbucket" not in html
+    for forbidden in _FORBIDDEN_PRODUCTION_COMMANDS:
+        assert forbidden not in html, forbidden
+
+
+def test_training_marker_malformed_and_negative_combinations() -> None:
+    # Strict true / exact kind — malformed truthy strings are not training.
+    not_training = _render_run_html(_sample_run(kind="release", training=False, status="open"))
+    assert 'class="chip training"' not in not_training
+    assert "TRAINING ONLY" not in not_training
+    assert "py -m edge_deploy verify" in not_training
+
+    malformed = _sample_run(kind="release", training=None, status="open")
+    malformed["state"]["training"] = "yes"
+    html = _render_run_html(malformed)
+    assert 'class="chip training"' not in html
+    assert "TRAINING ONLY" not in html
+
+    kind_only_wrong_case = _sample_run(kind="Training", training=None, status="open")
+    html = _render_run_html(kind_only_wrong_case)
+    assert 'class="chip training"' not in html
+
+
+def test_training_card_escapes_operator_and_run_id_html() -> None:
+    nasty = '<img src=x onerror=alert(1)>'
+    html = _render_run_html(
+        _sample_run(
+            kind="training",
+            training=True,
+            status="open",
+            run_id=f"run-{nasty}",
+            operator=f"op{nasty}",
+        )
+    )
+    assert "<img src" not in html
+    assert "&lt;img src=x onerror=alert(1)&gt;" in html
+    assert 'class="chip training"' in html
+
+
+def test_real_release_card_unchanged_without_training_markers() -> None:
+    html = _render_run_html(_sample_run(kind="release", training=None, status="open"))
+    assert 'class="chip training"' not in html
+    assert "TRAINING ONLY" not in html
+    assert "py -m edge_deploy verify" in html
+    assert "cd &quot;/tmp/training/autobench&quot;" in html
+    assert "release-tagged on GitHub and Bitbucket" not in html  # still open
+
+    complete = _render_run_html(
+        _sample_run(
+            kind="release",
+            training=None,
+            status="complete",
+            phases={
+                "verify": {"state": "passed", "updated_at": None, "evidence": {}},
+                "publish": {"state": "passed", "updated_at": None, "evidence": {}},
+                "deploy": {
+                    "node03": {"state": "passed", "updated_at": None, "evidence": {}}
+                },
+                "tag_bitbucket": {"state": "passed", "updated_at": None, "evidence": {}},
+                "tag_github": {"state": "passed", "updated_at": None, "evidence": {}},
+            },
+        )
+    )
+    assert "TRAINING ONLY" not in complete
+    assert "release-tagged on GitHub and Bitbucket" in complete
+
+
+def test_console_http_surface_stays_read_only() -> None:
+    """Training visibility is display-only — HTTP handlers remain GET-only."""
+    source = Path("edge_console.py").read_text(encoding="utf-8")
+    assert "def do_GET" in source
+    assert "def do_POST" not in source
+    assert "def do_PUT" not in source
+    assert "def do_PATCH" not in source
+    assert "def do_DELETE" not in source

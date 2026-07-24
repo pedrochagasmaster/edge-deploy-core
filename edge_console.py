@@ -1052,6 +1052,7 @@ details.guide summary:focus-visible{outline:2px solid var(--gh);outline-offset:-
 .chip.complete{color:var(--gh);border-color:var(--gh)}
 .chip.abandoned{color:var(--fail);border-color:var(--fail)}
 .chip.lock{color:var(--warn);border-color:var(--warn)}
+.chip.training{color:var(--warn);border-color:var(--warn);letter-spacing:.18em}
 .runmeta{font-family:var(--mono);font-size:11px;color:var(--dim);margin-left:auto}
 
 /* ---------- the posture rail (signature) ---------- */
@@ -1218,6 +1219,11 @@ function shortDate(iso){
   return String(iso).replace(/T(\d\d:\d\d).*$/, " $1Z");
 }
 
+// Matches edge_deploy.ledger.is_training_ledger: either marker, strict true.
+function isTrainingRun(st){
+  return st.kind === "training" || st.training === true;
+}
+
 function phasePassed(run, phase){
   if(phase === "deploy"){
     const nodes = run.state.phases.deploy;
@@ -1234,6 +1240,9 @@ function nextPhase(run){
 }
 
 function nextCommand(run, phase){
+  // Training cards never emit a copyable production CLI (status.py parity).
+  if(isTrainingRun(run.state))
+    return "TRAINING ONLY (not a production command)";
   const id = run.state.run_id;
   let cmd;
   if(phase === "verify")  cmd = `py -m edge_deploy verify --run ${id}`;
@@ -1371,27 +1380,48 @@ function progressHtml(run){
 function runHtml(run){
   const st = run.state;
   const next = nextPhase(run);
+  const training = isTrainingRun(st);
   const statusChip = `<span class="chip ${esc(st.status)}">${esc(st.status)}</span>`;
   const lockChip = run.lock
     ? `<span class="chip lock" title="acquired ${esc(run.lock.acquired_at || "")}">locked · pid ${esc(run.lock.pid)} @ ${esc(run.lock.hostname)}</span>`
     : "";
-  const kindChip = st.kind !== "release" ? `<span class="chip">${esc(st.kind)}</span>` : "";
+  // Either marker gets an explicit accessible TRAINING chip; other non-release
+  // kinds (rollback, …) keep the generic kind chip.
+  const trainingChip = training
+    ? `<span class="chip training" role="status" aria-label="TRAINING">training</span>`
+    : "";
+  const kindChip = (!training && st.kind !== "release")
+    ? `<span class="chip">${esc(st.kind)}</span>` : "";
   const rollback = st.rollback_tag
     ? `<span class="chip" title="restores this recorded release tag">→ ${esc(st.rollback_tag)}</span>` : "";
 
   let tail;
   if(st.status === "open" && next){
-    const req = PHASE_REQ[next];
-    const needText = req === "any" ? "any posture" : `needs ${REQ_POSTURE[req]}`;
-    tail = `<div class="nextcmd">
+    const cmd = nextCommand(run, next);
+    if(training){
+      // Label + guidance + copy target are all TRAINING ONLY — never a
+      // production verify/publish/deploy/tag/abandon/release command.
+      tail = `<div class="nextcmd">
+      <span class="label">TRAINING ONLY</span>
+      <span class="need any">simulated practice</span>
+      <code>${esc(cmd)}</code>
+      <button class="copy" data-cmd="${esc(cmd)}">copy</button>
+    </div>`;
+    } else {
+      const req = PHASE_REQ[next];
+      const needText = req === "any" ? "any posture" : `needs ${REQ_POSTURE[req]}`;
+      tail = `<div class="nextcmd">
       <span class="label">next</span>
       <span class="need ${req}">${esc(needText)}</span>
-      <code>${esc(nextCommand(run, next))}</code>
-      <button class="copy" data-cmd="${esc(nextCommand(run, next))}">copy</button>
+      <code>${esc(cmd)}</code>
+      <button class="copy" data-cmd="${esc(cmd)}">copy</button>
       ${readinessHtml(req)}
     </div>`;
+    }
   } else if(st.status === "abandoned"){
     tail = `<div class="done-line abandoned">abandoned — ${esc(st.abandon_reason || "no reason recorded")}</div>`;
+  } else if(training){
+    tail = `<div class="done-line">complete — TRAINING ONLY practice finished (not a production release)</div>`;
   } else {
     tail = `<div class="done-line">complete — release-tagged on GitHub and Bitbucket</div>`;
   }
@@ -1399,7 +1429,7 @@ function runHtml(run){
   return `<article class="run ${st.status === "open" ? "" : "closed"}">
     <div class="runhead">
       <span class="runid">${esc(st.run_id)}</span>
-      <span class="chip tool">${esc(st.tool)}</span>${kindChip}${statusChip}${lockChip}${rollback}
+      <span class="chip tool">${esc(st.tool)}</span>${trainingChip}${kindChip}${statusChip}${lockChip}${rollback}
       <span class="runmeta">source ${esc(st.source_sha.slice(0,7))} · ${esc(st.operator)} · engine ${esc(st.engine && st.engine.version || "?")} · ${esc(shortDate(st.created_at))}</span>
     </div>
     ${railHtml(run)}
