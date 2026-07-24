@@ -110,3 +110,41 @@ class OnboardingState:
             "stages": _empty_stages(),
             "practice": {"completed": False, "run_id": None},
         }
+
+    def invalidate_from(self, stage: str) -> None:
+        """Reset ``stage`` and every later stage to pending; clear practice evidence."""
+        if stage not in ONBOARDING_STAGES:
+            raise ValueError(f"unknown stage {stage!r}")
+        start = ONBOARDING_STAGES.index(stage)
+        for name in ONBOARDING_STAGES[start:]:
+            self.data["stages"][name] = {
+                "outcome": "pending",
+                "inputs": {},
+                "checks": [],
+                "updated_at": None,
+            }
+        self.data["practice"] = {"completed": False, "run_id": None}
+
+    def apply_selection(
+        self,
+        *,
+        tools: list[str],
+        root: str,
+        config_fingerprint: str,
+    ) -> bool:
+        """Update selection fields; invalidate config-onward when any change.
+
+        Returns True when config-dependent stages were invalidated.
+        Never stores private config values — only the byte fingerprint.
+        """
+        changed = (
+            list(self.data.get("tools") or []) != list(tools)
+            or str(self.data.get("root") or "") != str(root)
+            or str(self.data.get("config_fingerprint") or "") != str(config_fingerprint)
+        )
+        self.data["tools"] = list(tools)
+        self.data["root"] = str(root)
+        self.data["config_fingerprint"] = str(config_fingerprint)
+        if changed:
+            self.invalidate_from("config")
+        return changed
