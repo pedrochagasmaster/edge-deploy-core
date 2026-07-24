@@ -125,9 +125,21 @@ class RunLedger:
         if is_training:
             kind = "training"
         now = _utc_now()
-        run_id = f"run-{now.strftime('%Y%m%dT%H%M%SZ')}-{source_sha[:7]}"
+        base_id = f"run-{now.strftime('%Y%m%dT%H%M%SZ')}-{source_sha[:7]}"
+        run_id = base_id
         run_dir = runs_root / run_id
-        run_dir.mkdir(parents=True, exist_ok=False)
+        # Same-second creates with the same source_sha prefix (common for
+        # training's fabricated zeros) must not raise FileExistsError.
+        for suffix in range(0, 128):
+            if suffix:
+                run_id = f"{base_id}-{suffix}"
+                run_dir = runs_root / run_id
+            try:
+                run_dir.mkdir(parents=True, exist_ok=False)
+                break
+            except FileExistsError:
+                if suffix == 127:
+                    raise
 
         engine = engine_identity()
         state = {
