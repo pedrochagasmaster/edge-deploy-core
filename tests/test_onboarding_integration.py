@@ -15,8 +15,11 @@ from types import SimpleNamespace
 import paramiko
 import pytest
 
+import edge_deploy.onboarding.runner as runner_mod
+import edge_deploy.posture as posture_mod
 from edge_console import collect_runs
 from edge_deploy.cli import main
+from edge_deploy.config import default_operator_config_path
 from edge_deploy.ledger import RunLedger, engine_identity, is_training_ledger
 from edge_deploy.onboarding.checks import CheckResult, NodeSessionRegistry
 from edge_deploy.onboarding.config_import import load_private_onboarding_source
@@ -31,6 +34,12 @@ from edge_deploy.onboarding.repositories import (
     fingerprint_remote_url,
 )
 from edge_deploy.onboarding.state import OnboardingState, default_state_path
+from edge_deploy.phases import deploy as phases_deploy
+from edge_deploy.phases import publish as phases_publish
+from edge_deploy.phases import tag as phases_tag
+from edge_deploy.phases import verify as phases_verify
+
+_BASELINE_OPERATOR_CONFIG = Path.home() / ".config" / "edge-deploy" / "config.yaml"
 
 _PRIVATE_HOST = "edge-node-03.example"
 _BB_CORE = "https://bitbucket.example/core.git"
@@ -205,6 +214,10 @@ class OnboardHarness:
         self.git_probes: list[list[str]] = []
         self.ack_messages: list[str] = []
         self._readiness_failures_remaining = 0
+        self._baseline_existed = _BASELINE_OPERATOR_CONFIG.is_file()
+        self._baseline_bytes = (
+            _BASELINE_OPERATOR_CONFIG.read_bytes() if self._baseline_existed else None
+        )
 
         monkeypatch.setenv("APPDATA", str(self.app))
         monkeypatch.setenv("BB_TOKEN", _SECRET)
@@ -356,8 +369,6 @@ class OnboardHarness:
         return check
 
     def _wrap_pin_install_ordering(self) -> None:
-        import edge_deploy.onboarding.runner as runner_mod
-
         real_assert = runner_mod.assert_engine_pins_compatible
         real_install = runner_mod.install_tool_dependencies
         real_provision = runner_mod.provision_tool_checkout
@@ -385,20 +396,21 @@ class OnboardHarness:
 
             return _inner
 
-        for mod_name, attr in (
-            ("edge_deploy.phases.publish", "run_publish_phase"),
-            ("edge_deploy.phases.deploy", "run_deploy"),
-            ("edge_deploy.phases.tag", "_cmd_tag_github"),
-            ("edge_deploy.phases.tag", "_cmd_tag_bitbucket"),
-            ("edge_deploy.phases.verify", "ensure_verified"),
-        ):
-            mod = __import__(mod_name, fromlist=[attr])
-            if hasattr(mod, attr):
-                self.monkeypatch.setattr(mod, attr, boom(f"{mod_name}.{attr}"))
+        self.monkeypatch.setattr(
+            phases_publish, "run_publish_phase", boom("phases.publish.run_publish_phase")
+        )
+        self.monkeypatch.setattr(phases_deploy, "run_deploy", boom("phases.deploy.run_deploy"))
+        self.monkeypatch.setattr(
+            phases_tag, "_cmd_tag_github", boom("phases.tag._cmd_tag_github")
+        )
+        self.monkeypatch.setattr(
+            phases_tag, "_cmd_tag_bitbucket", boom("phases.tag._cmd_tag_bitbucket")
+        )
+        self.monkeypatch.setattr(
+            phases_verify, "ensure_verified", boom("phases.verify.ensure_verified")
+        )
 
     def _guard_posture_switch(self) -> None:
-        import edge_deploy.posture as posture_mod
-
         for name in dir(posture_mod):
             if "switch" in name.lower() or name.startswith("set_"):
                 self.monkeypatch.setattr(
@@ -440,6 +452,7 @@ class OnboardHarness:
     def _wire_live_session_runners(self) -> None:
         """Keep ``_session_runners_for_readiness``; inject lower transport/auth seams."""
         drivers: dict[str, object] = {}
+        harness = self
 
         class FakeDriver:
             def __init__(self, node):
@@ -448,24 +461,27 @@ class OnboardHarness:
 
             def stop_session(self):
                 self.stopped = True
-                self.session_order.append(f"stop:{getattr(self.node, 'name', '?')}")
+                # Record on the harness list (nested-class ``self`` is the driver).
+                harness.session_order.append(
+                    f"stop:{getattr(self.node, 'name', '?')}"
+                )
 
         def transport_factory(node):
-            self.session_order.append(f"transport_factory:{node.name}")
+            harness.session_order.append(f"transport_factory:{node.name}")
             return FakeDriver(node)
 
         def authenticate(driver, node_name):
-            self.session_order.append(f"auth:{node_name}")
+            harness.session_order.append(f"auth:{node_name}")
             drivers[node_name] = driver
             return driver
 
         def smoke(driver, *, node_label):
-            self.session_order.append(f"smoke:{node_label}")
+            harness.session_order.append(f"smoke:{node_label}")
             assert drivers[node_label] is driver
             return SimpleNamespace(passed=True)
 
         def ensure_kerb(driver, node_name):
-            self.session_order.append(f"kerberos:{node_name}")
+            harness.session_order.append(f"kerberos:{node_name}")
             assert drivers[node_name] is driver
             return SimpleNamespace(passed=True)
 
@@ -485,7 +501,6 @@ class OnboardHarness:
             "edge_deploy.onboarding.runner._ensure_kerberos",
             ensure_kerb,
         )
-        # Bitbucket builders still use recording git probe; keep them real.
 
     def onboard(self, *tool_flags: str, extra: list[str] | None = None) -> int:
         argv = ["onboard", "--config", str(self.private), "--root", str(self.root)]
@@ -508,6 +523,15 @@ class OnboardHarness:
         for snippet in _FORBIDDEN_SNIPPETS:
             assert snippet not in text, f"leaked {snippet!r}"
 
+    def assert_config_under_test_appdata(self) -> None:
+        installed = default_operator_config_path()
+        assert installed == self.app / "edge-deploy" / "config.yaml"
+        assert installed.is_file()
+        if self._baseline_existed:
+            assert _BASELINE_OPERATOR_CONFIG.read_bytes() == self._baseline_bytes
+        else:
+            assert not _BASELINE_OPERATOR_CONFIG.is_file()
+
     def assert_complete(self, tools: list[str]) -> None:
         state = self.state()
         assert state.data["tools"] == tools
@@ -528,6 +552,7 @@ class OnboardHarness:
         assert report["config_fingerprint"] == imported.fingerprint
         self.assert_no_secrets(self.report_path().read_text(encoding="utf-8"))
         self.assert_no_secrets(default_state_path().read_text(encoding="utf-8"))
+        self.assert_config_under_test_appdata()
 
 
 def test_empty_zero_state_autobench_via_cli(tmp_path: Path, monkeypatch) -> None:
@@ -616,6 +641,8 @@ def test_one_session_auth_conditional_kerberos_smoke(
     kerb_i = h.session_order.index("kerberos:node03")
     smoke_i = h.session_order.index("smoke:node03")
     assert auth_i < kerb_i < smoke_i
+    assert "stop:node03" in h.session_order
+    assert h.session_order.index("stop:node03") > smoke_i
     readiness = h.state().data["stages"]["readiness"]
     assert any(c["id"] == "kerberos:node03" for c in readiness["checks"])
     assert any(c["id"] == "rsa_auth:node03" for c in readiness["checks"])
@@ -624,8 +651,6 @@ def test_one_session_auth_conditional_kerberos_smoke(
 
 def test_interrupt_and_same_command_resume(tmp_path: Path, monkeypatch) -> None:
     h = OnboardHarness(tmp_path, monkeypatch)
-    import edge_deploy.onboarding.runner as runner_mod
-
     real_provision = runner_mod.provision_tool_checkout
     calls = {"n": 0}
 
@@ -652,16 +677,35 @@ def test_interrupt_and_same_command_resume(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_temporary_readiness_failure_then_success(tmp_path: Path, monkeypatch) -> None:
-    h = OnboardHarness(tmp_path, monkeypatch)
+    h = OnboardHarness(
+        tmp_path, monkeypatch, deep_tools={"autobench"}, tools_for_session=True
+    )
     h._readiness_failures_remaining = 1
     assert h.onboard("autobench") == 1
     state = h.state()
     assert state.data["stages"]["repositories"]["outcome"] == "passed"
     assert state.data["stages"]["readiness"]["outcome"] == "failed"
     assert state.data["stages"]["practice"]["outcome"] == "pending"
+    checks = {c["id"]: c for c in state.data["stages"]["readiness"]["checks"]}
+    assert checks["edge_tcp"]["outcome"] == "failed"
+    assert checks["rsa_auth:node03"]["outcome"] == "blocked"
+    assert checks["kerberos:node03"]["outcome"] == "blocked"
+    assert checks["transport_smoke:node03"]["outcome"] == "blocked"
+    # Dependents must not have executed while edge_tcp was failed.
+    assert "auth:node03" not in h.session_order
+    assert "kerberos:node03" not in h.session_order
+    assert "smoke:node03" not in h.session_order
+    assert "stop:node03" not in h.session_order
 
     assert h.onboard("autobench") == 0
     h.assert_complete(["autobench"])
+    assert "auth:node03" in h.session_order
+    assert "kerberos:node03" in h.session_order
+    assert "smoke:node03" in h.session_order
+    assert "stop:node03" in h.session_order
+    assert h.session_order.index("auth:node03") < h.session_order.index(
+        "kerberos:node03"
+    ) < h.session_order.index("smoke:node03")
 
 
 def test_second_identical_invocation_zero_duplicates(
@@ -760,32 +804,65 @@ def test_changed_config_tool_root_repo_drift_invalidation(
 
 
 def test_check_mode_no_mutation(tmp_path: Path, monkeypatch) -> None:
-    from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH
-
     h = OnboardHarness(tmp_path, monkeypatch)
     assert h.onboard("autobench") == 0
     clones = len(h.recorder.clone_calls)
     remotes = len(h.recorder.remote_add_calls)
     installs = len(h.recorder.install_calls)
     consoles = len(h.console_launches)
-    # Operator config path is resolved at import time from the process APPDATA
-    # baseline; assert against that installed path (same as runner unit tests).
-    config_bytes = DEFAULT_OPERATOR_CONFIG_PATH.read_bytes()
-    report_mtime = h.report_path().stat().st_mtime_ns
+    ack_count = len(h.ack_messages)
+    config_path = default_operator_config_path()
+    config_bytes = config_path.read_bytes()
+    report_bytes = h.report_path().read_bytes()
+    training_bytes = {
+        p: p.read_bytes()
+        for p in (h.training_root("autobench") / "edge-deploy" / "runs").glob("*/state.json")
+    }
+    repo_head = _git(h.root / "autobench", "rev-parse", "HEAD").strip()
+    tool_tree = sorted(
+        (p.relative_to(h.root / "autobench").as_posix(), p.read_bytes())
+        for p in (h.root / "autobench").rglob("*")
+        if p.is_file() and ".git" not in p.parts
+    )
+    state_before = h.state().data
+    practice_before = json.dumps(state_before["stages"]["practice"], sort_keys=True)
+    complete_before = json.dumps(state_before["stages"]["complete"], sort_keys=True)
+    readiness_before = json.dumps(state_before["stages"]["readiness"], sort_keys=True)
 
     code = h.onboard("autobench", extra=["--check"])
     assert code == 0
+
+    # Provisioning / install / console / training ack must not re-run.
     assert len(h.recorder.clone_calls) == clones
     assert len(h.recorder.remote_add_calls) == remotes
     assert len(h.recorder.install_calls) == installs
     assert len(h.console_launches) == consoles
-    assert DEFAULT_OPERATOR_CONFIG_PATH.read_bytes() == config_bytes
-    # --check must not rewrite the completion report or re-launch console.
+    assert len(h.ack_messages) == ack_count
+    # Installed operator config, report, training ledgers, and repo bytes unchanged.
+    assert config_path.read_bytes() == config_bytes
+    assert h.report_path().read_bytes() == report_bytes
+    assert {
+        p: p.read_bytes()
+        for p in (h.training_root("autobench") / "edge-deploy" / "runs").glob("*/state.json")
+    } == training_bytes
+    assert _git(h.root / "autobench", "rev-parse", "HEAD").strip() == repo_head
+    assert (
+        sorted(
+            (p.relative_to(h.root / "autobench").as_posix(), p.read_bytes())
+            for p in (h.root / "autobench").rglob("*")
+            if p.is_file() and ".git" not in p.parts
+        )
+        == tool_tree
+    )
     state = h.state()
     assert state.data["stages"]["practice"]["outcome"] == "passed"
     assert state.data["stages"]["complete"]["outcome"] == "passed"
-    assert h.report_path().stat().st_mtime_ns == report_mtime
+    assert json.dumps(state.data["stages"]["practice"], sort_keys=True) == practice_before
+    assert json.dumps(state.data["stages"]["complete"], sort_keys=True) == complete_before
+    # Readiness evidence in onboarding state may refresh under --check.
     assert state.data["stages"]["readiness"]["outcome"] == "passed"
+    assert "readiness" in state.data["stages"]
+    del readiness_before  # may differ; refresh is allowed
 
 
 def test_restart_bad_config_preserves_evidence(tmp_path: Path, monkeypatch) -> None:

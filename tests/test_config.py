@@ -14,12 +14,14 @@ import pytest
 
 from edge_deploy import config
 from edge_deploy.config import (
+    DEFAULT_OPERATOR_CONFIG_PATH,
     DEFAULT_TUI_EXIT,
     VALID_TUI_EXIT,
     NodeConfig,
     OperatorConfig,
     SmokeCommands,
     ToolProfile,
+    default_operator_config_path,
 )
 
 # Sibling Tool repos live next to edge-deploy-core (…/Projects/{autobench,robocop}).
@@ -293,3 +295,22 @@ def test_autobench_profile_loads_identically_across_backends(monkeypatch) -> Non
 
     # autobench uses no YAML escape sequences, so both backends agree completely.
     assert with_pyyaml == with_fallback
+
+
+def test_default_operator_config_path_respects_runtime_appdata(
+    monkeypatch, tmp_path: Path
+) -> None:
+    runtime = tmp_path / "runtime-appdata"
+    monkeypatch.setenv("APPDATA", str(runtime))
+    assert default_operator_config_path() == runtime / "edge-deploy" / "config.yaml"
+    # Import-time constant stays stable for backward compatibility.
+    assert isinstance(DEFAULT_OPERATOR_CONFIG_PATH, Path)
+    assert DEFAULT_OPERATOR_CONFIG_PATH.name == "config.yaml"
+
+
+def test_default_operator_config_path_falls_back_without_appdata(monkeypatch) -> None:
+    monkeypatch.delenv("APPDATA", raising=False)
+    assert (
+        default_operator_config_path()
+        == Path.home() / ".config" / "edge-deploy" / "config.yaml"
+    )

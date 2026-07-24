@@ -15,10 +15,10 @@ from typing import Any
 
 from edge_deploy.auth import AuthBroker, ensure_kerberos
 from edge_deploy.config import (
-    DEFAULT_OPERATOR_CONFIG_PATH,
     NodeConfig,
     OperatorConfig,
     ToolProfile,
+    default_operator_config_path,
 )
 from edge_deploy.ledger import RunLedger, engine_identity, is_training_ledger
 from edge_deploy.local_check import run_local_check
@@ -667,7 +667,7 @@ def _validate_existing_for_check(
 ) -> list[dict[str, Any]]:
     """Non-mutating presence checks for --check; never installs or clones."""
     checks: list[dict[str, Any]] = []
-    config_path = DEFAULT_OPERATOR_CONFIG_PATH
+    config_path = default_operator_config_path()
     if not config_path.is_file():
         checks.append(
             {
@@ -735,11 +735,11 @@ def _stage_readiness(
 
     registry: NodeSessionRegistry | None = None
     try:
-        if not DEFAULT_OPERATOR_CONFIG_PATH.is_file():
+        if not default_operator_config_path().is_file():
             raise RuntimeError(
                 "operator config is not installed; run onboard without --check first"
             )
-        operator = OperatorConfig.load(DEFAULT_OPERATOR_CONFIG_PATH)
+        operator = OperatorConfig.load(default_operator_config_path())
         tool_roots = {tool: _tool_dest(root, tool) for tool in tools}
         for tool, path in tool_roots.items():
             if not path.is_dir():
@@ -843,7 +843,7 @@ def _stage_practice(
     app_dir: Path,
 ) -> None:
     try:
-        operator = OperatorConfig.load(DEFAULT_OPERATOR_CONFIG_PATH)
+        operator = OperatorConfig.load(default_operator_config_path())
         nodes = sorted(operator.nodes)
         if not nodes:
             nodes = ["node03"]

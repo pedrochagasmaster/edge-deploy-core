@@ -15,10 +15,10 @@ from typing import Any
 import yaml
 
 from edge_deploy.config import (
-    DEFAULT_OPERATOR_CONFIG_PATH,
     DEFAULT_TRANSPORT,
     OperatorConfig,
     _load_yaml_mapping,
+    default_operator_config_path,
 )
 from edge_deploy.reporting import redact
 
@@ -208,7 +208,7 @@ def install_operator_config(
     }
     payload = {key: values[key] for key in _OPERATOR_MAPPING_KEYS}
     OperatorConfig.from_mapping(payload)
-    dest = Path(destination) if destination is not None else DEFAULT_OPERATOR_CONFIG_PATH
+    dest = Path(destination) if destination is not None else default_operator_config_path()
     setter = _default_permission_setter if permission_setter is None else permission_setter
     try:
         written = _write_yaml_atomic(dest, payload)

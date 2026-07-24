@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+from edge_deploy.config import default_operator_config_path
 from edge_deploy.onboarding.checks import CheckResult
 from edge_deploy.onboarding.config_import import load_private_onboarding_source
 from edge_deploy.onboarding.manifest import approved_engine_tag, normalize_tool_id
@@ -1463,15 +1464,7 @@ def test_check_mode_real_orchestration_no_mutations(tmp_path: Path, monkeypatch)
         tools={"autobench": str(tool_path)},
     )
     install_operator_config(merged)
-    config_bytes = (
-        Path(tmp_path / "app" / "edge-deploy" / "config.yaml").read_bytes()
-        if (tmp_path / "app" / "edge-deploy" / "config.yaml").is_file()
-        else None
-    )
-    # DEFAULT_OPERATOR_CONFIG_PATH uses APPDATA
-    from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH
-
-    config_bytes = DEFAULT_OPERATOR_CONFIG_PATH.read_bytes()
+    config_bytes = default_operator_config_path().read_bytes()
 
     state = OnboardingState.create_new(
         path=default_state_path(),
@@ -1565,7 +1558,7 @@ def test_check_mode_real_orchestration_no_mutations(tmp_path: Path, monkeypatch)
     assert mutations["install_config"] == 0
     assert mutations["console"] == 0
     assert mutations["complete"] == 0
-    assert DEFAULT_OPERATOR_CONFIG_PATH.read_bytes() == config_bytes
+    assert default_operator_config_path().read_bytes() == config_bytes
     assert not report_path.exists()
     loaded = OnboardingState.load(default_state_path())
     assert loaded.data["stages"]["readiness"]["outcome"] == "passed"
@@ -1583,3 +1576,42 @@ def test_fail_stub_make_runners_removed() -> None:
     assert not hasattr(runner_mod, "_make_transport_smoke_runner")
     assert not hasattr(runner_mod, "_make_kerberos_runner")
     assert hasattr(runner_mod, "_session_runners_for_readiness")
+
+
+def test_run_onboarding_installs_config_under_runtime_appdata(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = tmp_path / "app"
+    monkeypatch.setenv("APPDATA", str(app))
+    baseline = Path.home() / ".config" / "edge-deploy" / "config.yaml"
+    baseline_before = baseline.read_bytes() if baseline.is_file() else None
+
+    private = _private_yaml(tmp_path)
+    monkeypatch.setattr("edge_deploy.onboarding.runner._platform_name", lambda: "win32")
+    monkeypatch.setattr("edge_deploy.onboarding.runner._command_available", lambda _n: True)
+    monkeypatch.setattr("edge_deploy.onboarding.runner._powershell_compatible", lambda: True)
+    monkeypatch.setattr(
+        "edge_deploy.onboarding.runner._stage_repositories",
+        lambda state, **kw: state.mark_stage("repositories", "passed", inputs={}),
+    )
+    _pass_all_readiness(monkeypatch)
+    monkeypatch.setattr(
+        "edge_deploy.onboarding.runner._stage_practice",
+        lambda state, **kw: state.mark_stage("practice", "passed", inputs={})
+        or state.data.update(practice={"completed": True, "run_id": "t"}),
+    )
+    monkeypatch.setattr(
+        "edge_deploy.onboarding.runner._stage_complete",
+        lambda state, **kw: state.mark_stage("complete", "passed", inputs={}),
+    )
+    monkeypatch.setattr("edge_deploy.onboarding.runner._launch_console", lambda roots: None)
+
+    assert run_onboarding(_args(private, root=str(tmp_path / "root"))) == 0
+    installed = default_operator_config_path()
+    assert installed == app / "edge-deploy" / "config.yaml"
+    assert installed.is_file()
+    assert "op@example.com" in installed.read_text(encoding="utf-8")
+    if baseline_before is None:
+        assert not baseline.is_file()
+    else:
+        assert baseline.read_bytes() == baseline_before
