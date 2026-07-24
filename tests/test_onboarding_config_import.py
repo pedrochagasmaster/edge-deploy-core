@@ -5,6 +5,7 @@ from edge_deploy.onboarding.config_import import (
     install_operator_config,
     load_private_onboarding_source,
     merge_operator_config,
+    parse_private_onboarding_source,
     reject_credential_fields,
 )
 
@@ -72,6 +73,97 @@ def test_load_private_source_parses_yaml(tmp_path) -> None:
         "nodes:\n  node03:\n    host: operator@edge\n    ssh_options: -p 2222\n",
         encoding="utf-8",
     )
-    data = load_private_onboarding_source(path)
-    assert data["operator_email"] == "op@example.com"
-    assert data["checkout_root"] == "C:/edge-deploy"
+    imported = load_private_onboarding_source(path)
+    assert imported.operator_mapping["operator_email"] == "op@example.com"
+    assert imported.checkout_root == "C:/edge-deploy"
+    assert imported.fingerprint == fingerprint_config_bytes(path.read_bytes())
+
+
+def test_load_fingerprints_original_file_bytes(tmp_path) -> None:
+    path_a = tmp_path / "a.yaml"
+    path_b = tmp_path / "b.yaml"
+    # Semantically identical YAML; formatting-only difference must change fingerprint.
+    path_a.write_text(
+        "operator_email: op@example.com\ncheckout_root: C:/edge-deploy\n",
+        encoding="utf-8",
+    )
+    path_b.write_text(
+        "operator_email:   op@example.com\n\ncheckout_root: C:/edge-deploy\n",
+        encoding="utf-8",
+    )
+    imported_a = load_private_onboarding_source(path_a)
+    imported_b = load_private_onboarding_source(path_b)
+    assert imported_a.fingerprint == fingerprint_config_bytes(path_a.read_bytes())
+    assert imported_b.fingerprint == fingerprint_config_bytes(path_b.read_bytes())
+    assert imported_a.fingerprint != imported_b.fingerprint
+    assert imported_a.operator_mapping["operator_email"] == imported_b.operator_mapping["operator_email"]
+    assert imported_a.checkout_root == imported_b.checkout_root
+
+
+def test_parse_requires_source_bytes() -> None:
+    with pytest.raises(TypeError):
+        parse_private_onboarding_source({"operator_email": "op@example.com"})  # type: ignore[call-arg]
+
+
+def test_parse_separates_bitbucket_remotes() -> None:
+    raw = {
+        "operator_email": "op@example.com",
+        "checkout_root": "C:/edge-deploy",
+        "bitbucket_remotes": {
+            "core": "https://bitbucket.example/core.git",
+            "autobench": "https://bitbucket.example/ab.git",
+            "robocop": "https://bitbucket.example/rc.git",
+            "extra": "https://bitbucket.example/ignored.git",
+        },
+        "nodes": {"node03": {"host": "operator@edge", "ssh_options": "-p 2222"}},
+    }
+    source_bytes = b"operator_email: op@example.com\n"
+    imported = parse_private_onboarding_source(raw, source_bytes=source_bytes)
+    assert imported.fingerprint == fingerprint_config_bytes(source_bytes)
+    assert imported.checkout_root == "C:/edge-deploy"
+    assert imported.bitbucket_remotes == {
+        "core": "https://bitbucket.example/core.git",
+        "autobench": "https://bitbucket.example/ab.git",
+        "robocop": "https://bitbucket.example/rc.git",
+    }
+    assert "extra" not in imported.bitbucket_remotes
+    assert "bitbucket_remotes" not in imported.operator_mapping
+    assert "checkout_root" not in imported.operator_mapping
+
+
+def test_parse_rejects_non_mapping_bitbucket_remotes() -> None:
+    with pytest.raises(ValueError, match="bitbucket_remotes"):
+        parse_private_onboarding_source(
+            {
+                "operator_email": "op@example.com",
+                "bitbucket_remotes": "https://bitbucket.example/core.git",
+            },
+            source_bytes=b"x",
+        )
+
+
+def test_node_allowlist_strips_private_metadata(tmp_path) -> None:
+    private = {
+        "operator_email": "op@example.com",
+        "nodes": {
+            "node03": {
+                "host": "operator@edge.example",
+                "ssh_options": "-p 2222",
+                "session": "edge",
+                "transport": "ssh",
+                "region": "us-east",
+                "notes": "do-not-install",
+            }
+        },
+    }
+    merged = merge_operator_config(private, audit_repo=str(tmp_path / "core"), tools={})
+    assert set(merged["nodes"]["node03"]) == {"host", "ssh_options", "session", "transport"}
+    assert "region" not in merged["nodes"]["node03"]
+    assert "notes" not in merged["nodes"]["node03"]
+
+    dest = tmp_path / "config.yaml"
+    install_operator_config(merged, dest, permission_setter=lambda p: None)
+    text = dest.read_text(encoding="utf-8")
+    assert "region" not in text
+    assert "notes" not in text
+    assert "do-not-install" not in text

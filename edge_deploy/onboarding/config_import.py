@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import subprocess
 import sys
@@ -15,14 +14,20 @@ from typing import Any
 
 import yaml
 
-from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, OperatorConfig, _load_yaml_mapping
+from edge_deploy.config import (
+    DEFAULT_OPERATOR_CONFIG_PATH,
+    DEFAULT_TRANSPORT,
+    OperatorConfig,
+    _load_yaml_mapping,
+)
 from edge_deploy.reporting import redact
 
 FORBIDDEN_CONFIG_KEYS = frozenset(
     {"bb_token", "token", "password", "passcode", "secret", "authorization"}
 )
 _BITBUCKET_REMOTE_KEYS = ("core", "autobench", "robocop")
-_OPERATOR_MAPPING_KEYS = frozenset({"operator_email", "audit_repo", "nodes", "tools"})
+_OPERATOR_MAPPING_KEYS = ("operator_email", "audit_repo", "nodes", "tools")
+_NODE_FIELDS = ("host", "ssh_options", "session", "transport")
 
 
 def fingerprint_config_bytes(raw: bytes) -> str:
@@ -45,25 +50,32 @@ def reject_credential_fields(data: dict) -> None:
     _walk(data)
 
 
-def load_private_onboarding_source(path: Path) -> dict:
-    """Parse a pre-provisioned private onboarding YAML into a mapping."""
-    data = _load_yaml_mapping(path)
-    reject_credential_fields(data)
-    return data
+def _project_node(name: str, node: Any) -> dict[str, str]:
+    """Keep only OperatorConfig node fields: host, ssh_options, session, transport."""
+    if isinstance(node, Mapping):
+        values = {
+            "host": str(node.get("host", "") or ""),
+            "ssh_options": str(node.get("ssh_options", "") or ""),
+            "session": str(node.get("session", name) or name),
+            "transport": str(node.get("transport", DEFAULT_TRANSPORT) or DEFAULT_TRANSPORT),
+        }
+    else:
+        values = {
+            "host": str(node),
+            "ssh_options": "",
+            "session": name,
+            "transport": DEFAULT_TRANSPORT,
+        }
+    return {field: values[field] for field in _NODE_FIELDS}
 
 
 def _normalize_nodes(raw_nodes: Any) -> dict[str, Any]:
+    """Project each node to OperatorConfig fields only (no private metadata)."""
     if not raw_nodes:
         return {}
     if not isinstance(raw_nodes, Mapping):
         raise ValueError("nodes must be a mapping")
-    nodes: dict[str, Any] = {}
-    for name, node in raw_nodes.items():
-        if isinstance(node, Mapping):
-            nodes[str(name)] = dict(node)
-        else:
-            nodes[str(name)] = {"host": node}
-    return nodes
+    return {str(name): _project_node(str(name), node) for name, node in raw_nodes.items()}
 
 
 def merge_operator_config(
@@ -80,7 +92,6 @@ def merge_operator_config(
         "nodes": _normalize_nodes(private.get("nodes")),
         "tools": {str(name): str(path) for name, path in tools.items()},
     }
-    # Validate against the public OperatorConfig contract; discard staging keys.
     OperatorConfig.from_mapping(merged)
     return merged
 
@@ -95,26 +106,19 @@ class ImportedPrivateConfig:
     fingerprint: str
 
 
-def parse_private_onboarding_source(
-    raw: dict,
-    *,
-    source_bytes: bytes | None = None,
-    fingerprint: str | None = None,
-) -> ImportedPrivateConfig:
-    """Split staging metadata from OperatorConfig-compatible fields."""
+def parse_private_onboarding_source(raw: dict, *, source_bytes: bytes) -> ImportedPrivateConfig:
+    """Split staging metadata from OperatorConfig fields; fingerprint source_bytes only."""
     reject_credential_fields(raw)
-    if fingerprint is None:
-        if source_bytes is not None:
-            fingerprint = fingerprint_config_bytes(source_bytes)
-        else:
-            fingerprint = fingerprint_config_bytes(
-                json.dumps(raw, sort_keys=True, default=str).encode("utf-8")
-            )
+    fingerprint = fingerprint_config_bytes(source_bytes)
     checkout = raw.get("checkout_root")
     checkout_root = str(checkout) if checkout not in (None, "") else None
-    remotes_in = raw.get("bitbucket_remotes") or {}
-    bitbucket_remotes: dict[str, str] = {}
-    if isinstance(remotes_in, Mapping):
+    if "bitbucket_remotes" not in raw or raw.get("bitbucket_remotes") in (None, ""):
+        bitbucket_remotes: dict[str, str] = {}
+    else:
+        remotes_in = raw["bitbucket_remotes"]
+        if not isinstance(remotes_in, Mapping):
+            raise ValueError("bitbucket_remotes must be a mapping")
+        bitbucket_remotes = {}
         for key in _BITBUCKET_REMOTE_KEYS:
             value = remotes_in.get(key)
             if value not in (None, ""):
@@ -132,6 +136,14 @@ def parse_private_onboarding_source(
         bitbucket_remotes=bitbucket_remotes,
         fingerprint=fingerprint,
     )
+
+
+def load_private_onboarding_source(path: Path) -> ImportedPrivateConfig:
+    """Load private YAML and return ImportedPrivateConfig fingerprinted from file bytes."""
+    config_path = Path(path)
+    source_bytes = config_path.read_bytes()
+    raw = _load_yaml_mapping(config_path)
+    return parse_private_onboarding_source(raw, source_bytes=source_bytes)
 
 
 def _default_permission_setter(path: Path) -> None:
@@ -184,12 +196,17 @@ def install_operator_config(
 ) -> str:
     """Atomically write OperatorConfig YAML; return SHA-256 of installed bytes."""
     reject_credential_fields(merged)
-    # Drop anything that is not an OperatorConfig field before persistence.
-    payload = {key: merged[key] for key in _OPERATOR_MAPPING_KEYS if key in merged}
-    if "nodes" in payload:
-        payload["nodes"] = _normalize_nodes(payload.get("nodes"))
-    if "tools" in payload and isinstance(payload["tools"], Mapping):
-        payload["tools"] = {str(k): str(v) for k, v in payload["tools"].items()}
+    tools_in = merged.get("tools") or {}
+    if not isinstance(tools_in, Mapping):
+        raise ValueError("tools must be a mapping")
+    # Fixed tuple order — never iterate a frozenset for installed YAML keys.
+    values = {
+        "operator_email": str(merged.get("operator_email", "") or ""),
+        "audit_repo": str(merged.get("audit_repo", "") or ""),
+        "nodes": _normalize_nodes(merged.get("nodes")),
+        "tools": {str(name): str(path) for name, path in tools_in.items()},
+    }
+    payload = {key: values[key] for key in _OPERATOR_MAPPING_KEYS}
     OperatorConfig.from_mapping(payload)
     dest = Path(destination) if destination is not None else DEFAULT_OPERATOR_CONFIG_PATH
     setter = _default_permission_setter if permission_setter is None else permission_setter
