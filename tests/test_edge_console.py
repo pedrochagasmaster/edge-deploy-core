@@ -3,21 +3,62 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
+import tempfile
+from http.client import HTTPConnection
 from pathlib import Path
+from threading import Thread
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import edge_console as edge_console_mod  # noqa: E402
 from edge_console import (  # noqa: E402
     _SCHEMA,
     PAGE,
+    PostureProber,
     ToolsProber,
     _tool_name,
+    aggregate_github_write,
+    build_arg_parser,
     build_demo_checkouts,
     collect_runs,
     collect_runs_multi,
+    github_write_command,
     probe_divergence,
+    probe_github_write,
+    resolve_console_roots,
 )
+from edge_deploy.posture import git_probe_command  # noqa: E402
+
+_FORBIDDEN_PRODUCTION_COMMANDS = (
+    "py -m edge_deploy verify",
+    "py -m edge_deploy publish-phase",
+    "py -m edge_deploy deploy",
+    "py -m edge_deploy tag-github",
+    "py -m edge_deploy tag-bitbucket",
+    "py -m edge_deploy release",
+    "py -m edge_deploy abandon",
+    "py -m edge_deploy publish",
+    "release --run",
+    "abandon --run",
+    "tag-github --run",
+    "tag-bitbucket --run",
+)
+
+
+def _pending_phases(nodes: list[str] | None = None) -> dict:
+    nodes = nodes or ["node03"]
+    pending = {"state": "pending", "updated_at": None, "evidence": {}}
+    return {
+        "verify": dict(pending),
+        "publish": dict(pending),
+        "deploy": {name: dict(pending) for name in nodes},
+        "tag_bitbucket": dict(pending),
+        "tag_github": dict(pending),
+    }
 
 
 def _write_state(
@@ -29,6 +70,9 @@ def _write_state(
     source_sha: str = "a" * 40,
     created_at: str = "2026-07-10T00:00:00+00:00",
     kind: str = "release",
+    training: bool | None = None,
+    phases: dict | None = None,
+    operator: str = "pedro.chagas",
 ) -> None:
     run_dir.mkdir(parents=True)
     state = {
@@ -36,7 +80,7 @@ def _write_state(
         "run_id": run_id,
         "tool": tool,
         "source_sha": source_sha,
-        "operator": "pedro.chagas",
+        "operator": operator,
         "created_at": created_at,
         "kind": kind,
         "rollback_tag": None,
@@ -44,9 +88,103 @@ def _write_state(
         "nodes": ["node03"],
         "status": status,
         "abandon_reason": None,
-        "phases": {},
+        "phases": phases if phases is not None else {},
     }
+    if training is not None:
+        state["training"] = training
     (run_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
+
+
+def _page_script_through_run_html() -> str:
+    script = PAGE.split("<script>", 1)[1].split("</script>", 1)[0]
+    marker = "/* ---------- run filter:"
+    assert marker in script, "PAGE script lost the run-filter marker used to extract runHtml"
+    return script.split(marker, 1)[0]
+
+
+def _render_run_html(run: dict, *, tcp_caps: dict | None = None) -> str:
+    """Evaluate PAGE's runHtml() in Node so tests assert real card output."""
+    script = _page_script_through_run_html()
+    with tempfile.NamedTemporaryFile("w", suffix=".mjs", encoding="utf-8", delete=False) as fh:
+        fh.write(script)
+        if tcp_caps is not None:
+            fh.write(f"\ntcpCaps = {json.dumps(tcp_caps)};\n")
+        fh.write("\nprocess.stdout.write(runHtml(")
+        fh.write(json.dumps(run))
+        fh.write("));\n")
+        path = Path(fh.name)
+    try:
+        completed = subprocess.run(
+            ["node", str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        path.unlink(missing_ok=True)
+    assert completed.returncode == 0, completed.stderr
+    return completed.stdout
+
+
+def _phases_through(last_pending: str | None) -> dict:
+    """Build phase map with all phases before last_pending passed; rest pending.
+
+    last_pending=None means every phase passed (open skew / complete).
+    """
+    order = ["verify", "publish", "deploy", "tag_bitbucket", "tag_github"]
+    pending = {"state": "pending", "updated_at": None, "evidence": {}}
+    passed = {"state": "passed", "updated_at": None, "evidence": {}}
+    phases: dict = {}
+    reached = False
+    for name in order:
+        if last_pending is not None and name == last_pending:
+            reached = True
+        if last_pending is None:
+            entry = dict(passed)
+        elif reached:
+            entry = dict(pending)
+        else:
+            entry = dict(passed)
+        if name == "deploy":
+            phases[name] = {"node03": dict(entry)}
+        else:
+            phases[name] = entry
+    return phases
+
+
+def _sample_run(
+    *,
+    kind: str = "release",
+    training: bool | None = None,
+    status: str = "open",
+    run_id: str = "run-20260724T000000Z-train01",
+    operator: str = "trainee",
+    phases: dict | None = None,
+) -> dict:
+    state: dict = {
+        "schema": _SCHEMA,
+        "run_id": run_id,
+        "tool": "autobench",
+        "source_sha": "a" * 40,
+        "operator": operator,
+        "created_at": "2026-07-24T00:00:00+00:00",
+        "kind": kind,
+        "rollback_tag": None,
+        "engine": {"version": "1.4.0", "package_dir": "(test)", "content_sha256": "b" * 64},
+        "nodes": ["node03"],
+        "status": status,
+        "abandon_reason": None,
+        "phases": phases if phases is not None else _pending_phases(),
+    }
+    if training is not None:
+        state["training"] = training
+    return {
+        "state": state,
+        "events": [],
+        "lock": None,
+        "progress": None,
+        "root": "/tmp/training/autobench",
+    }
 
 
 def _fake_git(
@@ -389,3 +527,540 @@ def test_next_command_cds_into_the_runs_root() -> None:
     body = PAGE.split("function nextCommand(run, phase){", 1)[1].split("\n}", 1)[0]
     assert "run.root" in body
     assert 'cd "${run.root}"' in body or "cd \\\"${run.root}\\\"" in body
+
+
+def test_page_mentions_github_write_probe_not_tcp_authority() -> None:
+    assert "git push --dry-run" in PAGE
+    assert "github write" in PAGE.lower()
+    # Must match the JS in Step 3: githubWriteHtml(p.groups.github)
+    assert "p.groups.github" in PAGE
+    assert "githubWriteHtml" in PAGE
+    assert "aggregate" in PAGE
+    assert "github write unavailable" in PAGE.lower()
+
+
+def test_page_render_helpers_include_github_write_statuses() -> None:
+    assert 'status || "unknown"' in PAGE or "status || 'unknown'" in PAGE
+    assert "githubWriteAgg === \"ok\"" in PAGE or 'githubWriteAgg === "ok"' in PAGE
+    assert "githubWriteAgg === \"fail\"" in PAGE or 'githubWriteAgg === "fail"' in PAGE
+
+
+def test_github_write_command_matches_posture_write_argv() -> None:
+    assert github_write_command() == git_probe_command("origin", "write")
+    assert github_write_command() == [
+        "git",
+        "push",
+        "--dry-run",
+        "--force",
+        "origin",
+        "HEAD:refs/edge-deploy/posture-probe",
+    ]
+
+
+def test_probe_github_write_ok_fail_unknown(tmp_path) -> None:
+    root = tmp_path / "autobench"
+    root.mkdir()
+    (root / ".git").mkdir()
+
+    assert probe_github_write(root, runner=lambda cmd, cwd: 0)["status"] == "ok"
+    assert probe_github_write(root, runner=lambda cmd, cwd: 128)["status"] == "fail"
+
+    missing = tmp_path / "missing"
+    assert probe_github_write(missing, runner=lambda cmd, cwd: 0)["status"] == "unknown"
+
+
+def test_probe_github_write_timeout_is_unknown(tmp_path) -> None:
+    root = tmp_path / "robocop"
+    root.mkdir()
+    (root / ".git").mkdir()
+
+    def timed_out(command: list[str], cwd) -> int:
+        del command, cwd
+        return -1
+
+    result = probe_github_write(root, runner=timed_out)
+    assert result["status"] == "unknown"
+    assert result["tool"] == "robocop"
+
+
+def test_probe_github_write_disables_prompts_and_uses_write_argv(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "autobench"
+    root.mkdir()
+    (root / ".git").mkdir()
+    seen: dict = {}
+
+    def fake_run(command, cwd=None, capture_output=None, timeout=None, env=None, **kwargs):
+        seen["command"] = list(command)
+        seen["cwd"] = Path(cwd)
+        seen["env"] = dict(env)
+        seen["timeout"] = timeout
+
+        class Completed:
+            returncode = 0
+
+        return Completed()
+
+    monkeypatch.setattr("edge_console.subprocess.run", fake_run)
+    result = probe_github_write(root, runner=None)
+    assert result["status"] == "ok"
+    assert seen["command"] == github_write_command()
+    assert seen["cwd"] == root
+    assert seen["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    assert seen["env"]["GCM_INTERACTIVE"] == "never"
+    assert seen["timeout"] == 20.0
+
+
+def test_aggregate_github_write_rules() -> None:
+    assert aggregate_github_write([]) == "unknown"
+    assert aggregate_github_write([{"status": "ok"}, {"status": "ok"}]) == "ok"
+    assert aggregate_github_write([{"status": "ok"}, {"status": "fail"}]) == "fail"
+    assert aggregate_github_write([{"status": "ok"}, {"status": "unknown"}]) == "unknown"
+    assert aggregate_github_write([{"status": "fail"}, {"status": "unknown"}]) == "fail"
+
+
+def test_posture_prober_github_uses_write_probes_not_tcp(tmp_path, monkeypatch) -> None:
+    auto = tmp_path / "autobench"
+    robo = tmp_path / "robocop"
+    for root in (auto, robo):
+        root.mkdir()
+        (root / ".git").mkdir()
+
+    monkeypatch.setattr(
+        "edge_console.probe_github_write",
+        lambda root, runner=None, timeout=20.0: {
+            "tool": Path(root).name,
+            "root": str(root),
+            "status": "ok" if Path(root).name == "autobench" else "fail",
+            "detail": "test",
+            "command": github_write_command(),
+        },
+    )
+    prober = PostureProber(demo=False, roots=[auto, robo])
+    # Force TCP groups empty/fast: stub _probe_one True for bitbucket only path by
+    # replacing snapshot internals via monkeypatch on ThreadPoolExecutor path.
+    monkeypatch.setattr("edge_console._edge_endpoints", lambda: [])
+    monkeypatch.setattr("edge_console._probe_one", lambda host, port: True)
+    snap = prober.snapshot()
+    assert snap["groups"]["github"]["aggregate"] == "fail"
+    by_tool = {row["tool"]: row["status"] for row in snap["groups"]["github"]["tools"]}
+    assert by_tool == {"autobench": "ok", "robocop": "fail"}
+    assert isinstance(snap["groups"]["bitbucket"], list)
+
+
+def test_posture_prober_github_unknown_without_roots(monkeypatch) -> None:
+    monkeypatch.setattr("edge_console._edge_endpoints", lambda: [])
+    monkeypatch.setattr("edge_console._probe_one", lambda host, port: False)
+    snap = PostureProber(demo=False, roots=[]).snapshot()
+    assert snap["groups"]["github"]["aggregate"] == "unknown"
+    assert snap["groups"]["github"]["tools"] == []
+
+
+def test_divergence_still_uses_ls_remote_only(tmp_path) -> None:
+    """Regression: write probes must not replace divergence read probes."""
+    deployed = "d" * 40
+    runs_root = tmp_path / "edge-deploy" / "runs"
+    _write_state(
+        runs_root / "run-20260709T000000Z-deploy1",
+        "run-20260709T000000Z-deploy1",
+        status="complete",
+        source_sha=deployed,
+        created_at="2026-07-09T00:00:00+00:00",
+    )
+    runs = collect_runs(runs_root)
+    calls: list[tuple] = []
+
+    def git(root, *args, timeout=None):
+        calls.append(args)
+        return _fake_git(head=deployed, origin=deployed)(root, *args, timeout=timeout)
+
+    result = probe_divergence(tmp_path, runs, git=git)
+    assert result["verdict"] == "up_to_date"
+    assert any(args[:2] == ("ls-remote", "origin") for args in calls)
+    assert not any(args and args[0] == "push" for args in calls)
+
+
+def test_demo_posture_github_is_write_shaped() -> None:
+    snap = PostureProber(demo=True, roots=[]).snapshot()
+    github = snap["groups"]["github"]
+    assert github["aggregate"] in {"ok", "fail", "unknown"}
+    assert {row["tool"] for row in github["tools"]} == {"autobench", "robocop"}
+    assert all(row["status"] in {"ok", "fail", "unknown"} for row in github["tools"])
+
+
+# ---------------------------------------------------------------------------
+# Training ledger visibility (read-only; either marker)
+# ---------------------------------------------------------------------------
+
+
+def test_collect_runs_includes_training_ledger(tmp_path) -> None:
+    runs_root = tmp_path / "edge-deploy" / "runs"
+    run_dir = runs_root / "run-20260724T000000Z-train01"
+    _write_state(
+        run_dir,
+        run_dir.name,
+        kind="training",
+        status="open",
+    )
+    state_path = run_dir / "state.json"
+    data = json.loads(state_path.read_text(encoding="utf-8"))
+    data["training"] = True
+    state_path.write_text(json.dumps(data), encoding="utf-8")
+    runs = collect_runs(runs_root)
+    assert len(runs) == 1
+    assert runs[0]["state"]["kind"] == "training"
+    assert runs[0]["state"]["training"] is True
+
+
+def test_page_has_training_chip_styling() -> None:
+    assert "training" in PAGE
+    assert ".chip.training" in PAGE
+    assert "isTrainingRun" in PAGE
+    assert 'aria-label="TRAINING"' in PAGE or "aria-label='TRAINING'" in PAGE
+
+
+@pytest.mark.parametrize(
+    "kind,training",
+    [
+        ("training", True),
+        ("training", None),  # kind-only legacy
+        ("release", True),  # flag-only legacy
+    ],
+)
+def test_training_card_open_labels_and_blocks_production_commands(kind, training) -> None:
+    html = _render_run_html(_sample_run(kind=kind, training=training, status="open"))
+    assert 'class="chip training"' in html
+    assert 'aria-label="TRAINING"' in html
+    assert "TRAINING ONLY" in html
+    assert "TRAINING ONLY (not a production command)" in html
+    for forbidden in _FORBIDDEN_PRODUCTION_COMMANDS:
+        assert forbidden not in html, forbidden
+    # Copy target must also be training-only when present.
+    if "data-cmd=" in html:
+        assert 'data-cmd="TRAINING ONLY (not a production command)"' in html
+        for forbidden in _FORBIDDEN_PRODUCTION_COMMANDS:
+            assert forbidden not in html
+
+
+@pytest.mark.parametrize(
+    "kind,training",
+    [
+        ("training", True),
+        ("training", None),
+        ("release", True),
+    ],
+)
+def test_training_card_complete_labels_without_production_commands(kind, training) -> None:
+    html = _render_run_html(
+        _sample_run(
+            kind=kind,
+            training=training,
+            status="complete",
+            phases={
+                "verify": {"state": "passed", "updated_at": None, "evidence": {}},
+                "publish": {"state": "passed", "updated_at": None, "evidence": {}},
+                "deploy": {
+                    "node03": {"state": "passed", "updated_at": None, "evidence": {}}
+                },
+                "tag_bitbucket": {"state": "passed", "updated_at": None, "evidence": {}},
+                "tag_github": {"state": "passed", "updated_at": None, "evidence": {}},
+            },
+        )
+    )
+    assert 'class="chip training"' in html
+    assert 'aria-label="TRAINING"' in html
+    assert "TRAINING ONLY" in html
+    assert "release-tagged on GitHub and Bitbucket" not in html
+    for forbidden in _FORBIDDEN_PRODUCTION_COMMANDS:
+        assert forbidden not in html, forbidden
+
+
+def test_training_marker_malformed_and_negative_combinations() -> None:
+    # Strict true / exact kind — malformed truthy strings are not training.
+    not_training = _render_run_html(_sample_run(kind="release", training=False, status="open"))
+    assert 'class="chip training"' not in not_training
+    assert "TRAINING ONLY" not in not_training
+    assert "py -m edge_deploy verify" in not_training
+
+    malformed = _sample_run(kind="release", training=None, status="open")
+    malformed["state"]["training"] = "yes"
+    html = _render_run_html(malformed)
+    assert 'class="chip training"' not in html
+    assert "TRAINING ONLY" not in html
+
+    kind_only_wrong_case = _sample_run(kind="Training", training=None, status="open")
+    html = _render_run_html(kind_only_wrong_case)
+    assert 'class="chip training"' not in html
+
+
+def test_training_card_escapes_operator_and_run_id_html() -> None:
+    nasty = '<img src=x onerror=alert(1)>'
+    html = _render_run_html(
+        _sample_run(
+            kind="training",
+            training=True,
+            status="open",
+            run_id=f"run-{nasty}",
+            operator=f"op{nasty}",
+        )
+    )
+    assert "<img src" not in html
+    assert "&lt;img src=x onerror=alert(1)&gt;" in html
+    assert 'class="chip training"' in html
+
+
+def test_real_release_card_unchanged_without_training_markers() -> None:
+    html = _render_run_html(_sample_run(kind="release", training=None, status="open"))
+    assert 'class="chip training"' not in html
+    assert "TRAINING ONLY" not in html
+    assert "py -m edge_deploy verify" in html
+    assert "cd &quot;/tmp/training/autobench&quot;" in html
+    assert "release-tagged on GitHub and Bitbucket" not in html  # still open
+
+    complete = _render_run_html(
+        _sample_run(
+            kind="release",
+            training=None,
+            status="complete",
+            phases={
+                "verify": {"state": "passed", "updated_at": None, "evidence": {}},
+                "publish": {"state": "passed", "updated_at": None, "evidence": {}},
+                "deploy": {
+                    "node03": {"state": "passed", "updated_at": None, "evidence": {}}
+                },
+                "tag_bitbucket": {"state": "passed", "updated_at": None, "evidence": {}},
+                "tag_github": {"state": "passed", "updated_at": None, "evidence": {}},
+            },
+        )
+    )
+    assert "TRAINING ONLY" not in complete
+    assert "release-tagged on GitHub and Bitbucket" in complete
+
+
+def test_console_http_surface_stays_read_only() -> None:
+    """Training visibility is display-only — HTTP handlers remain GET-only."""
+    source = Path("edge_console.py").read_text(encoding="utf-8")
+    assert "def do_GET" in source
+    assert "def do_POST" not in source
+    assert "def do_PUT" not in source
+    assert "def do_PATCH" not in source
+    assert "def do_DELETE" not in source
+
+
+def test_training_rail_is_simulated_without_live_hot_or_firewall_now_cues() -> None:
+    """Educational rail stays, but never cues a live posture switch."""
+    # Waiting on tag_github would normally hot the firewall-off gate.
+    at_github = _render_run_html(
+        _sample_run(
+            kind="training",
+            training=True,
+            status="open",
+            phases=_phases_through("tag_github"),
+        ),
+        tcp_caps={"bb": False, "edge": False},
+    )
+    assert 'class="rail simulated"' in at_github
+    assert "TRAINING ONLY" in at_github
+    assert "simulated" in at_github.lower()
+    assert "firewall off" in at_github  # educational rail label remains
+    assert " hot" not in at_github
+    assert 'class="gate hot"' not in at_github
+    assert 'class="sep hot"' not in at_github
+    assert 'class="station next"' not in at_github
+    assert "switch needed" not in at_github
+    # Live do-it-now firewall aria copy must not appear on training rails.
+    assert "drop VPNs, firewall off" not in at_github
+    assert "needs firewall-off" not in at_github
+
+    # Waiting on deploy would normally hot the + edge vpn sep when edge is down.
+    at_deploy = _render_run_html(
+        _sample_run(
+            kind="training",
+            training=True,
+            status="open",
+            phases=_phases_through("deploy"),
+        ),
+        tcp_caps={"bb": True, "edge": False},
+    )
+    assert 'class="rail simulated"' in at_deploy
+    assert " hot" not in at_deploy
+    assert 'class="station next"' not in at_deploy
+    assert "join + edge vpn" not in at_deploy  # live join aria suppressed
+
+    # Real release at the same point still gets the live firewall-off hot cue.
+    real = _render_run_html(
+        _sample_run(
+            kind="release",
+            training=None,
+            status="open",
+            phases=_phases_through("tag_github"),
+        ),
+        tcp_caps={"bb": False, "edge": False},
+    )
+    assert 'class="gate hot"' in real
+    assert 'class="station next"' in real
+    assert 'class="rail simulated"' not in real
+    assert "drop VPNs, firewall off" in real
+
+
+def test_open_training_all_phases_passed_awaits_completion_not_finished() -> None:
+    html = _render_run_html(
+        _sample_run(
+            kind="training",
+            training=True,
+            status="open",
+            phases=_phases_through(None),
+        )
+    )
+    assert 'class="chip training"' in html
+    assert "awaits completion" in html.lower()
+    assert "practice finished" not in html.lower()
+    assert "release-tagged on GitHub and Bitbucket" not in html
+    # Must not claim the run is complete while status is still open.
+    assert "complete —" not in html
+    assert "TRAINING ONLY" in html
+    for forbidden in _FORBIDDEN_PRODUCTION_COMMANDS:
+        assert forbidden not in html, forbidden
+
+
+# ---------------------------------------------------------------------------
+# Final-review: --github-write-root separation
+# ---------------------------------------------------------------------------
+
+
+def test_build_arg_parser_accepts_github_write_root() -> None:
+    args = build_arg_parser().parse_args(
+        ["--root", "/training/ab", "--github-write-root", "/real/ab"]
+    )
+    assert args.root == ["/training/ab"]
+    assert args.github_write_root == ["/real/ab"]
+
+
+def test_resolve_console_roots_defaults_write_roots_to_ledger_roots(tmp_path) -> None:
+    ledger = tmp_path / "ledger"
+    ledger.mkdir()
+    args = build_arg_parser().parse_args(["--root", str(ledger)])
+    ledger_roots, write_roots = resolve_console_roots(args)
+    assert ledger_roots == [ledger.resolve()]
+    assert write_roots == [ledger.resolve()]
+
+
+def test_resolve_console_roots_separates_write_roots(tmp_path) -> None:
+    training = tmp_path / "training"
+    real = tmp_path / "real"
+    training.mkdir()
+    real.mkdir()
+    args = build_arg_parser().parse_args(
+        ["--root", str(training), "--github-write-root", str(real)]
+    )
+    ledger_roots, write_roots = resolve_console_roots(args)
+    assert ledger_roots == [training.resolve()]
+    assert write_roots == [real.resolve()]
+
+
+def test_posture_prober_uses_write_roots_not_ledger_roots(tmp_path, monkeypatch) -> None:
+    training = tmp_path / "training" / "autobench"
+    real = tmp_path / "autobench"
+    training.mkdir(parents=True)
+    real.mkdir()
+    (real / ".git").mkdir()
+    # Training has no .git — intentional divergence unknown if probed.
+    del training
+    probed: list[str] = []
+
+    def fake_probe(root, runner=None, timeout=20.0):
+        probed.append(str(root))
+        return {
+            "tool": Path(root).name,
+            "root": str(root),
+            "status": "fail",
+            "detail": "probe",
+            "command": github_write_command(),
+        }
+
+    monkeypatch.setattr("edge_console.probe_github_write", fake_probe)
+    monkeypatch.setattr("edge_console._edge_endpoints", lambda: [])
+    monkeypatch.setattr("edge_console._probe_one", lambda host, port: True)
+    snap = PostureProber(demo=False, roots=[real]).snapshot()
+    assert probed == [str(real)]
+    assert snap["groups"]["github"]["aggregate"] == "fail"
+
+
+def test_api_training_ledger_with_real_write_roots(tmp_path, monkeypatch) -> None:
+    """Training --root can render runs while write aggregate uses real roots."""
+    training = tmp_path / "training" / "autobench"
+    real = tmp_path / "autobench"
+    runs = training / "edge-deploy" / "runs" / "run-train"
+    _write_state(runs, "run-train", kind="training", training=True, status="open")
+    real.mkdir()
+    (real / ".git").mkdir()
+
+    monkeypatch.setattr(
+        "edge_console.probe_github_write",
+        lambda root, runner=None, timeout=20.0: {
+            "tool": Path(root).name,
+            "root": str(root),
+            "status": "fail",
+            "detail": "real write fail",
+            "command": github_write_command(),
+        },
+    )
+    monkeypatch.setattr("edge_console._edge_endpoints", lambda: [])
+    monkeypatch.setattr("edge_console._probe_one", lambda host, port: False)
+
+    edge_console_mod.ConsoleHandler.roots = [training]
+    edge_console_mod.ConsoleHandler.prober = PostureProber(demo=False, roots=[real])
+    edge_console_mod.ConsoleHandler.tools_prober = ToolsProber([training], demo=False)
+    edge_console_mod.ConsoleHandler.demo = False
+    server = edge_console_mod.ThreadingHTTPServer(
+        ("127.0.0.1", 0), edge_console_mod.ConsoleHandler
+    )
+    port = server.server_address[1]
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/api/runs")
+        runs_payload = json.loads(conn.getresponse().read().decode())
+        assert runs_payload["runs"]
+        assert runs_payload["runs"][0]["state"]["kind"] == "training"
+
+        conn.request("GET", "/api/posture")
+        posture = json.loads(conn.getresponse().read().decode())
+        assert posture["groups"]["github"]["aggregate"] == "fail"
+        assert posture["groups"]["github"]["tools"][0]["status"] == "fail"
+        # fail beats unknown: mix fail+unknown → fail
+        assert (
+            aggregate_github_write([{"status": "fail"}, {"status": "unknown"}]) == "fail"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_probe_github_write_forces_prompt_disable_env(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "autobench"
+    root.mkdir()
+    (root / ".git").mkdir()
+    seen: dict = {}
+
+    def fake_run(command, cwd=None, capture_output=None, timeout=None, env=None, **kwargs):
+        del command, cwd, capture_output, timeout, kwargs
+        seen["env"] = dict(env)
+
+        class Completed:
+            returncode = 0
+
+        return Completed()
+
+    monkeypatch.setenv("GIT_TERMINAL_PROMPT", "1")
+    monkeypatch.setenv("GCM_INTERACTIVE", "always")
+    monkeypatch.setattr("edge_console.subprocess.run", fake_run)
+    assert probe_github_write(root, runner=None)["status"] == "ok"
+    assert seen["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    assert seen["env"]["GCM_INTERACTIVE"] == "never"
+
+
+def test_module_doc_does_not_claim_zero_dependency() -> None:
+    doc = (edge_console_mod.__doc__ or "").lower()
+    assert "zero-dependency" not in doc
+    assert "zero-external-dependency" not in doc

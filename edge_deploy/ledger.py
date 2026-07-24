@@ -31,6 +31,18 @@ class RunLockError(LedgerError):
     """Another process holds the run lock."""
 
 
+def is_training_ledger(ledger_or_state: RunLedger | dict) -> bool:
+    """True when either training marker is present (kind or training flag)."""
+    state = ledger_or_state.state if isinstance(ledger_or_state, RunLedger) else ledger_or_state
+    return state.get("kind") == "training" or state.get("training") is True
+
+
+def reject_training_ledger(ledger_or_state: RunLedger | dict) -> None:
+    """Raise when a production command touches a training ledger."""
+    if is_training_ledger(ledger_or_state):
+        raise LedgerError("training ledger rejected by production commands")
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -107,11 +119,27 @@ class RunLedger:
         operator: str,
         kind: str = "release",
         rollback_tag: str | None = None,
+        training: bool = False,
     ) -> RunLedger:
+        is_training = bool(training) or kind == "training"
+        if is_training:
+            kind = "training"
         now = _utc_now()
-        run_id = f"run-{now.strftime('%Y%m%dT%H%M%SZ')}-{source_sha[:7]}"
+        base_id = f"run-{now.strftime('%Y%m%dT%H%M%SZ')}-{source_sha[:7]}"
+        run_id = base_id
         run_dir = runs_root / run_id
-        run_dir.mkdir(parents=True, exist_ok=False)
+        # Same-second creates with the same source_sha prefix (common for
+        # training's fabricated zeros) must not raise FileExistsError.
+        for suffix in range(0, 128):
+            if suffix:
+                run_id = f"{base_id}-{suffix}"
+                run_dir = runs_root / run_id
+            try:
+                run_dir.mkdir(parents=True, exist_ok=False)
+                break
+            except FileExistsError:
+                if suffix == 127:
+                    raise
 
         engine = engine_identity()
         state = {
@@ -135,6 +163,8 @@ class RunLedger:
                 "tag_github": _empty_phase(),
             },
         }
+        if is_training:
+            state["training"] = True
         _write_json_atomic(run_dir / "state.json", state)
         ledger = cls(run_dir=run_dir, state=state)
         ledger.record_event("run_created")
