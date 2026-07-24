@@ -22,7 +22,7 @@ from edge_deploy import __version__, drift, preflight, rollout
 from edge_deploy.audit import AuditAttempt, AuditSyncError, append_audit_attempt
 from edge_deploy.auth import AuthBroker
 from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, OperatorConfig, load_tool_profile
-from edge_deploy.ledger import LedgerError, RunLedger
+from edge_deploy.ledger import LedgerError, RunLedger, is_training_ledger
 from edge_deploy.mirror import MirrorError, mirror_release
 from edge_deploy.onboarding.runner import run_onboarding
 from edge_deploy.phases import PHASE_REGISTRY, EngineMismatchError, enter_phase
@@ -602,6 +602,8 @@ def _cmd_release(args: argparse.Namespace, operator: OperatorConfig) -> int:
             print(f"no such run: {args.run} under {runs_root}", file=sys.stderr)
             return 2
         ledger = RunLedger.load(run_dir)
+        if is_training_ledger(ledger):
+            raise LedgerError("training ledger rejected by production commands")
         if ledger.state["status"] != "open":
             return _refuse_non_open_run("release", args.run, ledger.state["status"])
     else:
@@ -822,6 +824,8 @@ def _cmd_abandon(args: argparse.Namespace, operator: OperatorConfig) -> int:
         print(f"no such run: {args.run} under {runs_root}", file=sys.stderr)
         return 2
     ledger = RunLedger.load(run_dir)
+    if is_training_ledger(ledger):
+        raise LedgerError("training ledger rejected by production commands")
     with ledger.locked():
         ledger.abandon(args.reason)
     print(f"abandoned {args.run}")

@@ -11,7 +11,7 @@ from pathlib import Path
 
 from edge_deploy.audit import AuditSyncError, check_audit_remote
 from edge_deploy.config import OperatorConfig, load_tool_profile
-from edge_deploy.ledger import RunLedger
+from edge_deploy.ledger import LedgerError, RunLedger, is_training_ledger
 from edge_deploy.phases import PHASE_REGISTRY, PhaseSpec, enter_phase
 from edge_deploy.posture import PHASE_ENDPOINTS
 from edge_deploy.publish import LocalCheckError, PublishResult, publish_snapshot
@@ -175,6 +175,8 @@ def _cmd_publish_phase(args: argparse.Namespace, operator: OperatorConfig) -> in
         print(f"no such run: {args.run} under {runs_root}", file=sys.stderr)
         return 2
     ledger = RunLedger.load(run_dir)
+    if is_training_ledger(ledger):
+        raise LedgerError("training ledger rejected by production commands")
     tool = ledger.state["tool"]
     if tool in operator.tools:
         repo_root = Path(operator.tool_path(tool)).resolve()

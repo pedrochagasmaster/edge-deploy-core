@@ -31,6 +31,12 @@ class RunLockError(LedgerError):
     """Another process holds the run lock."""
 
 
+def is_training_ledger(ledger_or_state: RunLedger | dict) -> bool:
+    """True when either training marker is present (kind or training flag)."""
+    state = ledger_or_state.state if isinstance(ledger_or_state, RunLedger) else ledger_or_state
+    return state.get("kind") == "training" or state.get("training") is True
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -107,7 +113,11 @@ class RunLedger:
         operator: str,
         kind: str = "release",
         rollback_tag: str | None = None,
+        training: bool = False,
     ) -> RunLedger:
+        is_training = bool(training) or kind == "training"
+        if is_training:
+            kind = "training"
         now = _utc_now()
         run_id = f"run-{now.strftime('%Y%m%dT%H%M%SZ')}-{source_sha[:7]}"
         run_dir = runs_root / run_id
@@ -135,6 +145,8 @@ class RunLedger:
                 "tag_github": _empty_phase(),
             },
         }
+        if is_training:
+            state["training"] = True
         _write_json_atomic(run_dir / "state.json", state)
         ledger = cls(run_dir=run_dir, state=state)
         ledger.record_event("run_created")
