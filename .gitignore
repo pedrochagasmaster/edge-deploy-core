@@ -9,5 +9,10 @@ __pycache__/
 build/
 dist/
 
+# Node / Remotion
+node_modules/
+release-operator-onboarding/out/
+release-operator-onboarding/dist/
+
 # Generated release evidence
 edge-deploy/reports/
