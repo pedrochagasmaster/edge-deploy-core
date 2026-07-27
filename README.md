@@ -20,6 +20,10 @@ there is no core `release` extra.
 
 ## Release Operator onboarding (zero state)
 
+A Remotion motion tutorial walks the same path:
+[release-operator-onboarding/](release-operator-onboarding/) (`npm run dev` to
+preview, or render composition `ReleaseOperatorOnboarding`).
+
 First-time operators use Windows PowerShell 5.1 on the controller. Connect
 **both** the Bitbucket and Edge VPNs (`both-vpns`) before any clone or install,
 and do not switch VPN or firewall posture during onboarding
