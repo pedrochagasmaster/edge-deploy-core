@@ -15,8 +15,8 @@ entire onboard flow — do not switch to `firewall-off` for routine onboarding.
 ```powershell
 git clone https://github.com/pedrochagasmaster/edge-deploy-core.git
 cd edge-deploy-core
-git checkout v1.5.3
-py -m pip install -e ".[dev]"
+git checkout v1.5.4
+uv sync --extra dev
 ```
 
 Core installs with `.[dev]` only (no core `release` extra). Keep a private

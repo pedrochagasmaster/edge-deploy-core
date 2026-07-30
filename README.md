@@ -35,8 +35,8 @@ and do not switch VPN or firewall posture during onboarding
 ```powershell
 git clone https://github.com/pedrochagasmaster/edge-deploy-core.git
 cd edge-deploy-core
-git checkout v1.5.3
-py -m pip install -e ".[dev]"
+git checkout v1.5.4
+uv sync --extra dev
 ```
 
 Use the tag equal to the package version (`v` + `__version__` /
