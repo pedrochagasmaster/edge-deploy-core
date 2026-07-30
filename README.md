@@ -91,10 +91,11 @@ rendering and against the selected real tool checkouts
 (`--github-write-root`) for GitHub write probes. It shows a **simulated**
 posture rail — do not switch workstation posture for it. Training roots may
 lack git; divergence against them is intentionally soft. The console GitHub
-write indicator is green only when every write-root's `git push --dry-run`
-probe passes; **red in `both-vpns` is expected and is not an onboarding
-failure**. A first real release is a separate boundary after onboarding
-completes, for example:
+write indicator is green only when every write-root's authenticated, empty
+`git-receive-pack` POST passes. The probe sends no update commands and changes
+no refs; **red in `both-vpns` is expected and is not an onboarding failure**.
+A first real release is a separate boundary after onboarding completes, for
+example:
 
 ```powershell
 py -m edge_deploy release --guided --tool autobench

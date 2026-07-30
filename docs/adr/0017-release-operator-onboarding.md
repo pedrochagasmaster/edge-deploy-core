@@ -10,9 +10,12 @@ practice path that taught the guided phase sequence without remote mutation.
 
 Onboarding readiness treats authenticated GitHub CLI access (`gh auth`) as its
 own check, separate from the console's GitHub **write** capability indicator.
-That indicator (and posture gating) uses the non-mutating
-`git push --dry-run` write-path probe from ADR-0012 — not `gh` auth and not
-TCP/read reachability.
+That indicator uses an authenticated, empty `git-receive-pack` POST — not
+`gh` auth and not TCP/read reachability. The request sends only a protocol
+flush packet, so it reaches the write-side HTTP path without requesting a ref
+update. This differs intentionally from posture gating's ADR-0012 dry run:
+HTTP tracing proved that `git push --dry-run` only GETs the receive-pack
+advertisement and can therefore pass while the proxy blocks write POSTs.
 
 The five-posture model (ADR-0013) already makes routine operator work possible
 in `both-vpns`: GitHub read, Bitbucket, and Edge are available together. GitHub
@@ -55,10 +58,10 @@ the default transport (ADR-0014). Tool-owned verification remains
    a real posture switch.
 
 5. **Console GitHub write indicator is separate.** Aggregate green means every
-   watched tool's non-mutating `git push --dry-run` write probe passed
-   (ADR-0012 probe argv). Red or unavailable in `both-vpns` is expected and
-   is not an onboarding failure. Detailed console write-indicator ownership
-   remains the console plan; onboarding only documents the operator meaning.
+   watched tool's authenticated, empty `git-receive-pack` POST passed. The
+   probe retrieves credentials through Git's configured credential helper,
+   keeps them memory-only, and sends no update commands or pack. Red or
+   unavailable in `both-vpns` is expected and is not an onboarding failure.
 
 6. **No secrets in Git; no auto host-key enrollment.** Private onboarding
    YAML and installed operator config forbid credential-shaped keys.

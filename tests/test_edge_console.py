@@ -6,9 +6,11 @@ import json
 import subprocess
 import sys
 import tempfile
+import urllib.request
 from http.client import HTTPConnection
 from pathlib import Path
 from threading import Thread
+from types import SimpleNamespace
 
 import pytest
 
@@ -26,12 +28,10 @@ from edge_console import (  # noqa: E402
     build_demo_checkouts,
     collect_runs,
     collect_runs_multi,
-    github_write_command,
     probe_divergence,
     probe_github_write,
     resolve_console_roots,
 )
-from edge_deploy.posture import git_probe_command  # noqa: E402
 
 _FORBIDDEN_PRODUCTION_COMMANDS = (
     "py -m edge_deploy verify",
@@ -530,7 +530,8 @@ def test_next_command_cds_into_the_runs_root() -> None:
 
 
 def test_page_mentions_github_write_probe_not_tcp_authority() -> None:
-    assert "git push --dry-run" in PAGE
+    assert "git-receive-pack" in PAGE
+    assert "git push --dry-run" not in PAGE
     assert "github write" in PAGE.lower()
     # Must match the JS in Step 3: githubWriteHtml(p.groups.github)
     assert "p.groups.github" in PAGE
@@ -545,28 +546,16 @@ def test_page_render_helpers_include_github_write_statuses() -> None:
     assert "githubWriteAgg === \"fail\"" in PAGE or 'githubWriteAgg === "fail"' in PAGE
 
 
-def test_github_write_command_matches_posture_write_argv() -> None:
-    assert github_write_command() == git_probe_command("origin", "write")
-    assert github_write_command() == [
-        "git",
-        "push",
-        "--dry-run",
-        "--force",
-        "origin",
-        "HEAD:refs/edge-deploy/posture-probe",
-    ]
-
-
 def test_probe_github_write_ok_fail_unknown(tmp_path) -> None:
     root = tmp_path / "autobench"
     root.mkdir()
     (root / ".git").mkdir()
 
-    assert probe_github_write(root, runner=lambda cmd, cwd: 0)["status"] == "ok"
-    assert probe_github_write(root, runner=lambda cmd, cwd: 128)["status"] == "fail"
+    assert probe_github_write(root, runner=lambda cwd: 0)["status"] == "ok"
+    assert probe_github_write(root, runner=lambda cwd: 128)["status"] == "fail"
 
     missing = tmp_path / "missing"
-    assert probe_github_write(missing, runner=lambda cmd, cwd: 0)["status"] == "unknown"
+    assert probe_github_write(missing, runner=lambda cwd: 0)["status"] == "unknown"
 
 
 def test_probe_github_write_timeout_is_unknown(tmp_path) -> None:
@@ -574,8 +563,8 @@ def test_probe_github_write_timeout_is_unknown(tmp_path) -> None:
     root.mkdir()
     (root / ".git").mkdir()
 
-    def timed_out(command: list[str], cwd) -> int:
-        del command, cwd
+    def timed_out(cwd) -> int:
+        del cwd
         return -1
 
     result = probe_github_write(root, runner=timed_out)
@@ -583,31 +572,59 @@ def test_probe_github_write_timeout_is_unknown(tmp_path) -> None:
     assert result["tool"] == "robocop"
 
 
-def test_probe_github_write_disables_prompts_and_uses_write_argv(tmp_path, monkeypatch) -> None:
+def test_probe_github_write_sends_empty_authenticated_receive_pack_post(
+    tmp_path, monkeypatch
+) -> None:
+    """Regression: a dry-run GET must not masquerade as GitHub write access."""
     root = tmp_path / "autobench"
     root.mkdir()
     (root / ".git").mkdir()
-    seen: dict = {}
+    requests = []
 
-    def fake_run(command, cwd=None, capture_output=None, timeout=None, env=None, **kwargs):
-        seen["command"] = list(command)
-        seen["cwd"] = Path(cwd)
-        seen["env"] = dict(env)
-        seen["timeout"] = timeout
+    class Response:
+        status = 200
 
-        class Completed:
-            returncode = 0
+        def __enter__(self):
+            return self
 
-        return Completed()
+        def __exit__(self, *args):
+            return None
+
+        def read(self):
+            return b"0000"
+
+    def fake_urlopen(request, timeout):
+        requests.append((request, timeout))
+        return Response()
+
+    def fake_run(command, **kwargs):
+        assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+        assert kwargs["env"]["GCM_INTERACTIVE"] == "never"
+        assert kwargs["timeout"] == 20.0
+        if command[-3:] == ["remote", "get-url", "origin"]:
+            assert Path(kwargs["cwd"]) == root
+            return SimpleNamespace(
+                returncode=0,
+                stdout=b"https://github.com/example/autobench.git\n",
+            )
+        assert command == ["git", "credential", "fill"]
+        assert kwargs["input"] == b"protocol=https\nhost=github.com\n\n"
+        return SimpleNamespace(
+            returncode=0,
+            stdout=b"protocol=https\nhost=github.com\nusername=user\npassword=secret\n",
+        )
 
     monkeypatch.setattr("edge_console.subprocess.run", fake_run)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     result = probe_github_write(root, runner=None)
+
     assert result["status"] == "ok"
-    assert seen["command"] == github_write_command()
-    assert seen["cwd"] == root
-    assert seen["env"]["GIT_TERMINAL_PROMPT"] == "0"
-    assert seen["env"]["GCM_INTERACTIVE"] == "never"
-    assert seen["timeout"] == 20.0
+    assert len(requests) == 1
+    request, timeout = requests[0]
+    assert request.method == "POST"
+    assert request.data == b"0000"
+    assert request.full_url.endswith("/git-receive-pack")
+    assert timeout == 20.0
 
 
 def test_aggregate_github_write_rules() -> None:
@@ -632,7 +649,6 @@ def test_posture_prober_github_uses_write_probes_not_tcp(tmp_path, monkeypatch) 
             "root": str(root),
             "status": "ok" if Path(root).name == "autobench" else "fail",
             "detail": "test",
-            "command": github_write_command(),
         },
     )
     prober = PostureProber(demo=False, roots=[auto, robo])
@@ -974,7 +990,6 @@ def test_posture_prober_uses_write_roots_not_ledger_roots(tmp_path, monkeypatch)
             "root": str(root),
             "status": "fail",
             "detail": "probe",
-            "command": github_write_command(),
         }
 
     monkeypatch.setattr("edge_console.probe_github_write", fake_probe)
@@ -1001,7 +1016,6 @@ def test_api_training_ledger_with_real_write_roots(tmp_path, monkeypatch) -> Non
             "root": str(root),
             "status": "fail",
             "detail": "real write fail",
-            "command": github_write_command(),
         },
     )
     monkeypatch.setattr("edge_console._edge_endpoints", lambda: [])
@@ -1035,29 +1049,6 @@ def test_api_training_ledger_with_real_write_roots(tmp_path, monkeypatch) -> Non
     finally:
         server.shutdown()
         server.server_close()
-
-
-def test_probe_github_write_forces_prompt_disable_env(tmp_path, monkeypatch) -> None:
-    root = tmp_path / "autobench"
-    root.mkdir()
-    (root / ".git").mkdir()
-    seen: dict = {}
-
-    def fake_run(command, cwd=None, capture_output=None, timeout=None, env=None, **kwargs):
-        del command, cwd, capture_output, timeout, kwargs
-        seen["env"] = dict(env)
-
-        class Completed:
-            returncode = 0
-
-        return Completed()
-
-    monkeypatch.setenv("GIT_TERMINAL_PROMPT", "1")
-    monkeypatch.setenv("GCM_INTERACTIVE", "always")
-    monkeypatch.setattr("edge_console.subprocess.run", fake_run)
-    assert probe_github_write(root, runner=None)["status"] == "ok"
-    assert seen["env"]["GIT_TERMINAL_PROMPT"] == "0"
-    assert seen["env"]["GCM_INTERACTIVE"] == "never"
 
 
 def test_module_doc_does_not_claim_zero_dependency() -> None:

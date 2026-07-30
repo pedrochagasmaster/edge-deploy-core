@@ -21,8 +21,8 @@ operator through starting one (posture to hold, optional ``preflight`` /
 
 Deliberately outside the ``edge_deploy`` package: Engine Identity (ADR-0008)
 hashes every package ``*.py``, so UI code must live here or every open Run
-would be orphaned. This file never writes to the ledger. It imports a few
-engine helpers for probe argv and Edge endpoints only.
+would be orphaned. This file never writes to the ledger. It imports engine
+helpers for Edge endpoints only.
 
 Usage:
 
@@ -33,16 +33,18 @@ Usage:
     py edge_console.py --demo                       # fabricated checkouts, no probes
 
 Posture probes: Bitbucket and Edge remain TCP-only and labelled as such. The
-GitHub capability light is a per-watched-tool ``git push --dry-run`` write
-probe (same argv as posture gating); it never updates a remote ref. Write
-probes use ``--github-write-root`` when set, otherwise the same paths as
-``--root``. Divergence facts still use read-only git on ``--root`` checkouts
+GitHub capability light is a per-watched-tool authenticated, empty
+``git-receive-pack`` POST. It reaches the write-side HTTP path but sends no
+update commands, pack, or ref mutation. Write probes use
+``--github-write-root`` when set, otherwise the same paths as ``--root``.
+Divergence facts still use read-only git on ``--root`` checkouts
 (``ls-remote`` for GitHub main); training roots may lack git on purpose.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -51,13 +53,15 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, load_operator_config
-from edge_deploy.posture import git_probe_command
 from edge_deploy.preflight import endpoint_from_node
 
 _SCHEMA = "edge-deploy/run/1"
@@ -148,28 +152,86 @@ def collect_runs_multi(roots: list[Path]) -> list[dict]:
 _GITHUB_WRITE_TIMEOUT = 20.0
 
 
-def github_write_command() -> list[str]:
-    """Exact write-path argv used by posture gating (ADR-0012)."""
-    return list(git_probe_command("origin", "write"))
+def _github_receive_pack_url(remote_url: str) -> str | None:
+    """Authenticated Smart HTTP write endpoint for a GitHub remote."""
+    remote_url = remote_url.strip()
+    if remote_url.startswith("git@github.com:"):
+        path = remote_url.removeprefix("git@github.com:")
+    else:
+        parsed = urllib.parse.urlsplit(remote_url)
+        if parsed.scheme != "https" or parsed.hostname != "github.com":
+            return None
+        path = parsed.path.lstrip("/")
+    path = path.removesuffix(".git").strip("/")
+    if path.count("/") != 1:
+        return None
+    return f"https://github.com/{path}.git/git-receive-pack"
 
 
-def _default_github_write_runner(command: list[str], repo_root: Path, *, timeout: float) -> int:
+def _default_github_write_runner(repo_root: Path, *, timeout: float) -> int:
+    """Send an authenticated receive-pack request containing only a flush packet.
+
+    ``git push --dry-run`` stops after GETting the receive-pack advertisement,
+    so it cannot distinguish read-capable postures from a blocked write POST.
+    A lone ``0000`` flush packet reaches the real write endpoint while
+    requesting no ref update.
+    """
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GCM_INTERACTIVE"] = "never"
     try:
-        completed = subprocess.run(
-            command,
+        remote = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
             cwd=repo_root,
             capture_output=True,
             timeout=timeout,
             env=env,
         )
-    except subprocess.TimeoutExpired:
+        if remote.returncode != 0:
+            return remote.returncode
+        endpoint = _github_receive_pack_url(remote.stdout.decode().strip())
+        if endpoint is None:
+            return -1
+
+        credential = subprocess.run(
+            ["git", "credential", "fill"],
+            input=b"protocol=https\nhost=github.com\n\n",
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+        )
+        if credential.returncode != 0:
+            return credential.returncode
+        fields = dict(
+            line.split(b"=", 1)
+            for line in credential.stdout.splitlines()
+            if b"=" in line
+        )
+        username = fields.get(b"username", b"x-access-token")
+        password = fields.get(b"password")
+        if not password:
+            return -1
+        authorization = base64.b64encode(username + b":" + password).decode("ascii")
+        request = urllib.request.Request(
+            endpoint,
+            data=b"0000",
+            headers={
+                "Authorization": f"Basic {authorization}",
+                "Content-Type": "application/x-git-receive-pack-request",
+                "Accept": "application/x-git-receive-pack-result",
+                "User-Agent": "git/edge-deploy-posture-probe",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response.read()
+            return 0 if response.status == 200 else response.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
+    except (subprocess.TimeoutExpired, TimeoutError):
         return -1
-    except OSError:
+    except (OSError, UnicodeError, ValueError):
         return -1
-    return completed.returncode
 
 
 def probe_github_write(
@@ -193,26 +255,24 @@ def probe_github_write(
             "status": "unknown",
             "detail": "checkout missing or not a git repository",
         }
-    command = github_write_command()
     if runner is None:
-        code = _default_github_write_runner(command, root, timeout=timeout)
+        code = _default_github_write_runner(root, timeout=timeout)
     else:
-        code = runner(command, root)
+        code = runner(root)
     if code == 0:
         status = "ok"
-        detail = "git push --dry-run write probe passed"
+        detail = "authenticated git-receive-pack POST passed"
     elif code < 0:
         status = "unknown"
         detail = f"write probe timed out or could not run (code {code})"
     else:
         status = "fail"
-        detail = f"write probe exited {code}"
+        detail = f"git-receive-pack POST failed (code {code})"
     return {
         "tool": tool,
         "root": str(root),
         "status": status,
         "detail": detail,
-        "command": command,
     }
 
 
@@ -1199,9 +1259,9 @@ footer code{font-family:var(--mono)}
   <div id="tools"></div>
   <div class="filterbar" id="filterbar" aria-label="filter runs by tool and status"></div>
   <div id="runs"></div>
-  <footer>Bitbucket/Edge lights are TCP-only. The GitHub light is a per-tool
-  <code>git push --dry-run</code> write probe (no ref update); green only when every
-  watched tool passes. Divergence still uses read-only <code>ls-remote</code>
+  <footer>Bitbucket/Edge lights are TCP-only. The GitHub light sends a per-tool
+  authenticated, empty <code>git-receive-pack</code> POST (no ref update); green
+  only when every watched tool passes. Divergence still uses read-only <code>ls-remote</code>
   (GitHub read works in every posture). Phase git-protocol probes remain
   authoritative for release commands (ADR-0012/0013).</footer>
 </main>
