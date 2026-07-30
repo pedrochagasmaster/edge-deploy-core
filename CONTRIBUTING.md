@@ -9,9 +9,12 @@ Release Operator responsibility.
 git switch main
 git pull --ff-only origin main
 git switch -c <short-branch-name>
-python -m pip install -e ".[dev]"
-python -m pytest -n 4 --dist loadfile
+uv sync --extra dev
+uv run pytest -n 4 --dist loadfile
 ```
+
+`uv sync` creates or updates `.venv` from the committed `uv.lock`. Use
+`uv lock --check` before committing dependency metadata changes.
 
 Commit the focused change, push the branch to GitHub, and open a pull request
 against `main`. Contributors without write access may use a fork.

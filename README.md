@@ -11,8 +11,8 @@ do not need Bitbucket, Edge access, SSH, Kerberos, or RSA credentials. See
 ## Development
 
 ```powershell
-python -m pip install -e ".[dev]"
-python -m pytest
+uv sync --extra dev
+uv run pytest
 ```
 
 Python 3.10 and 3.12 are tested in CI. Core declares only the `dev` extra;
