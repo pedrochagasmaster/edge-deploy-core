@@ -31,6 +31,8 @@ def demo_git(root: Path, *args: str, timeout: float | None = None) -> str | None
         return f"{head}\trefs/heads/main"
     if args[0] == "rev-list":
         return DEMO_AHEAD_BY_TOOL.get(root.name)
+    if args[0] == "status":
+        return "## main...origin/main"  # on main, clean tree
     return None
 
 

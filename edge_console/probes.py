@@ -329,6 +329,34 @@ def _tool_name(root: Path, runs: list[dict]) -> str:
     return root.name
 
 
+def _checkout_state(root: Path, git=_git) -> dict:
+    """Which branch the checkout is on, and whether the tree is clean.
+
+    The engine's own gate (``repository.inspect_repository``) refuses a release
+    unless the checkout is on ``main`` with a clean tree, *before* it compares
+    any SHA — so a card that only compares SHAs can show an all-clear for a
+    checkout the engine will turn away.
+
+    ``--branch`` is what makes this answerable: it puts a ``## …`` header on the
+    output, so a clean tree is still distinguishable from a failed command.
+    """
+    status = git(root, "status", "--porcelain", "--branch", "--untracked-files=all")
+    if not status:
+        return {"branch": None, "on_main": None, "dirty": None}
+    lines = status.splitlines()
+    if not lines[0].startswith("## "):
+        return {"branch": None, "on_main": None, "dirty": None}
+    name = lines[0][3:].split("...")[0].strip()
+    detached = name == "HEAD" or name.startswith("HEAD (")
+    branch = "(detached HEAD)" if detached else name
+    # Generated release reports are the one untracked path the engine forgives.
+    dirty = any(
+        line.strip() and not line.startswith("?? edge-deploy/reports/")
+        for line in lines[1:]
+    )
+    return {"branch": branch, "on_main": (not detached) and name == "main", "dirty": dirty}
+
+
 def _last_deployed(runs: list[dict]) -> dict | None:
     """The newest complete run: what the Edge Nodes are believed to hold.
 
@@ -364,6 +392,10 @@ def probe_divergence(root: Path, runs: list[dict], *, git=_git) -> dict:
     range counts need it: "local_behind" (pull), "local_ahead" (unpushed work:
     push/PR first — verify needs green GitHub CI on HEAD), "forked" (both
     moved), or None when git cannot tell.
+
+    ``branch`` / ``on_main`` / ``dirty`` carry the rest of the engine's release
+    gate, which SHAs alone cannot see: a feature branch sitting exactly on
+    origin/main compares as perfectly in sync and is still refused.
     """
     deployed = _last_deployed(runs)
     head = git(root, "rev-parse", "HEAD", timeout=5.0)
@@ -406,6 +438,7 @@ def probe_divergence(root: Path, runs: list[dict], *, git=_git) -> dict:
         "deployed": deployed,
         "head": head,
         "origin_main": origin_main,
+        **_checkout_state(root, git=git),
         "ahead": ahead,
         "ahead_exact": ahead_exact,
         "stale": stale,

@@ -848,6 +848,12 @@ function staleReadHtml(t){
 function headlineFor(t){
   if(t.verdict === "unknown")
     return {text:"Git state unavailable — is this directory a tool checkout?", calm:true};
+  // Lead with the thing that stops a release outright: comparing commits is
+  // beside the point when the checkout is not a releasable one.
+  if(t.on_main === false)
+    return {text:`This checkout is on ${t.branch}, not main — nothing can be released from it.`, calm:false};
+  if(t.dirty === true)
+    return {text:"This checkout has uncommitted changes — nothing can be released from it until the tree is clean.", calm:false};
   if(t.verdict === "up_to_date")
     return {text:"Nothing to release. The Edge Nodes, this checkout, and GitHub main are all on the same commit.", calm:true};
   if(t.verdict === "never_released")
@@ -898,6 +904,16 @@ function checklistHtml(t, blocker){
     `<li class="${cls}"><span class="ctext">${text}</span>` +
     (action ? `<span class="grow"></span>${action}` : "") + `</li>`);
 
+  // The engine's first two gates, before it compares anything: on main, clean.
+  if(t.on_main === false)
+    item("blocked", `<b>This checkout is on ${esc(t.branch)}.</b> The engine releases from
+      <code>main</code> only — switch back before starting.`);
+  else if(t.dirty === true)
+    item("blocked", `<b>The working tree is not clean.</b> Commit or stash the changes;
+      generated reports under <code>edge-deploy/reports/</code> are the only thing the engine ignores.`);
+  else if(t.on_main === true && t.dirty === false)
+    item("ok", `On <code>main</code> with a clean working tree.`);
+
   if(t.verdict === "unknown"){
     item("blocked", `<b>No git state.</b> Point the console at a tool checkout with <code>--root</code>.`);
   } else if(!t.stale){
@@ -938,6 +954,13 @@ function checklistHtml(t, blocker){
 // checkout blocks, not just the two that also lack CI.
 function releaseBlocker(t){
   if(t.verdict === "unknown") return "This checkout has no readable git state.";
+  // inspect_repository checks the branch and the working tree before it looks
+  // at any SHA, so a feature branch sitting exactly on origin/main compares as
+  // perfectly in sync and is still refused.
+  if(t.on_main === false)
+    return `The engine releases from branch main only, and this checkout is on ${t.branch}.`;
+  if(t.dirty === true)
+    return "The engine requires a clean working tree, and this checkout has uncommitted changes.";
   if(t.stale && t.stale_direction === "local_ahead")
     return "The engine requires HEAD to equal github main, and these commits are not pushed yet — verify would also find no CI result for them.";
   if(t.stale && t.stale_direction === "forked")

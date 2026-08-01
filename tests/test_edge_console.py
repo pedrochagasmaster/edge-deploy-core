@@ -954,6 +954,101 @@ def test_phase_timestamps_are_escaped_like_everything_else_off_disk() -> None:
     assert "&lt;img src=x onerror=alert(1)&gt;" in html
 
 
+def test_divergence_reports_the_branch_and_the_working_tree(tmp_path) -> None:
+    """SHAs alone cannot see the engine's first two gates: a feature branch
+    sitting exactly on origin/main compares as perfectly in sync, and a dirty
+    tree does not move HEAD at all."""
+    answers: dict[tuple, str | None] = {}
+
+    def fake_git(root, *args, timeout=None):
+        del root, timeout
+        return answers.get(args)
+
+    status = ("status", "--porcelain", "--branch", "--untracked-files=all")
+    head = "a" * 40
+
+    answers = {("rev-parse", "HEAD"): head, status: "## main...origin/main"}
+    clean = probe_divergence(tmp_path, [], git=fake_git)
+    assert (clean["branch"], clean["on_main"], clean["dirty"]) == ("main", True, False)
+
+    answers[status] = "## feature/x...origin/main [ahead 1]"
+    other = probe_divergence(tmp_path, [], git=fake_git)
+    assert (other["branch"], other["on_main"]) == ("feature/x", False)
+
+    answers[status] = "## HEAD (no branch)"
+    detached = probe_divergence(tmp_path, [], git=fake_git)
+    assert (detached["branch"], detached["on_main"]) == ("(detached HEAD)", False)
+
+    # Generated release reports are the one untracked path the engine forgives.
+    answers[status] = "## main...origin/main\n?? edge-deploy/reports/release.json"
+    assert probe_divergence(tmp_path, [], git=fake_git)["dirty"] is False
+    answers[status] = "## main...origin/main\n M edge_deploy/cli.py"
+    assert probe_divergence(tmp_path, [], git=fake_git)["dirty"] is True
+
+    # A checkout git cannot answer for stays unknown rather than guessed.
+    answers[status] = None
+    unknown = probe_divergence(tmp_path, [], git=fake_git)
+    assert (unknown["branch"], unknown["on_main"], unknown["dirty"]) == (None, None, None)
+
+
+def test_checkout_state_matches_the_engine_gate_on_a_real_repository(tmp_path) -> None:
+    """The parsing above is only worth anything if it matches real git output
+    and the engine's own reading of it."""
+    from edge_deploy.repository import RepositoryError, inspect_repository
+
+    root = tmp_path / "autobench"
+    root.mkdir()
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "operator@example.com")
+    git("config", "user.name", "operator")
+    (root / "f.txt").write_text("one", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "one")
+    subprocess.run(
+        ["git", "init", "-q", "--bare", str(tmp_path / "origin.git")], check=True, capture_output=True
+    )
+    git("remote", "add", "origin", str(tmp_path / "origin.git"))
+    git("remote", "add", "bitbucket", str(tmp_path / "origin.git"))
+    git("push", "-q", "-u", "origin", "main")
+
+    assert probe_divergence(root, [])["on_main"] is True
+    inspect_repository(
+        root,
+        tool="autobench",
+        expected_origin=str(tmp_path / "origin.git"),
+        expected_bitbucket=str(tmp_path / "origin.git"),
+    )
+
+    # A branch level with origin/main: identical SHAs, and still not releasable.
+    git("checkout", "-qb", "feature")
+    state = probe_divergence(root, [])
+    assert state["head"] == state["origin_main"], "the SHA comparison sees nothing wrong"
+    assert state["stale"] is False
+    assert (state["branch"], state["on_main"]) == ("feature", False)
+    with pytest.raises(RepositoryError, match="requires branch 'main'"):
+        inspect_repository(
+            root,
+            tool="autobench",
+            expected_origin=str(tmp_path / "origin.git"),
+            expected_bitbucket=str(tmp_path / "origin.git"),
+        )
+
+    git("checkout", "-q", "main")
+    (root / "f.txt").write_text("dirty", encoding="utf-8")
+    assert probe_divergence(root, [])["dirty"] is True
+    with pytest.raises(RepositoryError, match="clean working tree"):
+        inspect_repository(
+            root,
+            tool="autobench",
+            expected_origin=str(tmp_path / "origin.git"),
+            expected_bitbucket=str(tmp_path / "origin.git"),
+        )
+
+
 def test_release_cta_is_blocked_whenever_the_checkout_is_not_github_main() -> None:
     """inspect_repository refuses unless HEAD == origin/main, before a run is
     even created — so every stale direction blocks, not only the two that also
@@ -964,6 +1059,9 @@ def test_release_cta_is_blocked_whenever_the_checkout_is_not_github_main() -> No
         fh.write(f"function releaseBlocker(t){{{body}\n}}\n")
         fh.write(
             "const cases = ["
+            '  {verdict:"diverged", stale:false, on_main:false, branch:"feature/x"},'
+            '  {verdict:"diverged", stale:false, on_main:false, branch:"(detached HEAD)"},'
+            '  {verdict:"diverged", stale:false, on_main:true, dirty:true},'
             '  {verdict:"diverged", stale:true, stale_direction:"local_behind"},'
             '  {verdict:"checkout_stale", stale:true, stale_direction:"local_behind"},'
             '  {verdict:"diverged", stale:true, stale_direction:"local_ahead", ahead_of_origin:2},'
@@ -972,7 +1070,8 @@ def test_release_cta_is_blocked_whenever_the_checkout_is_not_github_main() -> No
             '  {verdict:"up_to_date", stale:false},'
             '  {verdict:"unknown", stale:false},'
             "];\n"
-            "const open = {verdict:'diverged', stale:false, stale_direction:null};\n"
+            "const open = {verdict:'diverged', stale:false, stale_direction:null,"
+        " on_main:true, dirty:false};\n"
             "process.stdout.write(JSON.stringify({"
             "blocked: cases.map(c => releaseBlocker(c) !== null),"
             "open: releaseBlocker(open)}));\n"
