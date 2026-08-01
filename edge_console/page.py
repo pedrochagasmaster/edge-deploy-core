@@ -991,7 +991,7 @@ function promptHtml(a){
       <div class="pform">
         <input type="password" class="secretbox" autocomplete="off" autocapitalize="off"
           spellcheck="false" aria-label="${esc(p.title)}" placeholder="passcode">
-        <button class="run primary" data-answer="secret">Send to the engine</button>
+        <button class="run primary" data-answer="secret" disabled>Send to the engine</button>
       </div>
       <div class="psafe">Written straight to the running process stdin. <b>Never stored, logged, echoed back, or sent anywhere else</b> — the transcript above shows only asterisks.</div>
     </div>`;
@@ -1019,7 +1019,7 @@ function promptHtml(a){
     ${head}
     <div class="pform">
       <input type="text" class="textbox" autocomplete="off" aria-label="${esc(p.title)}">
-      <button class="run primary" data-answer="text">Send</button>
+      <button class="run primary" data-answer="text" disabled>Send</button>
     </div>
   </div>`;
 }
@@ -1050,9 +1050,14 @@ function renderTerm(id){
   }
 }
 
-// Terminals live outside the re-rendered HTML so their scroll position, their
-// text, and a half-typed passcode all survive every poll.
+// Terminals live outside the re-rendered HTML so their text survives every
+// poll. Re-parenting a live node still drops focus and scroll, though, and the
+// stage re-renders whenever release-progress.json moves — which is exactly
+// while a passcode is being typed. Both are captured and restored here.
 function placeTerminals(){
+  const focused = document.activeElement;
+  const caret = focused && focused.tagName === "INPUT"
+    ? {el: focused, start: focused.selectionStart, end: focused.selectionEnd} : null;
   const byRoot = new Map();
   for(const a of actionsById.values()){
     const current = byRoot.get(a.root);
@@ -1062,8 +1067,16 @@ function placeTerminals(){
     const a = byRoot.get(slot.dataset.root);
     if(!a){ slot.replaceChildren(); continue; }
     const t = termEl(a.id);
-    if(t.el.parentElement !== slot) slot.replaceChildren(t.el);
+    if(t.el.parentElement !== slot){
+      const scroll = t.out.scrollTop;
+      slot.replaceChildren(t.el);
+      t.out.scrollTop = t.pinned ? t.out.scrollHeight : scroll;
+    }
     renderTerm(a.id);
+  }
+  if(caret && caret.el.isConnected && document.activeElement !== caret.el){
+    caret.el.focus();
+    try{ caret.el.setSelectionRange(caret.start, caret.end); }catch(_e){ /* not selectable */ }
   }
 }
 
@@ -1359,11 +1372,16 @@ document.addEventListener("click", async ev => {
     } else if(mode === "value"){
       value = answerBtn.dataset.value;
     }
+    const id = dock.dataset.action;
     answerBtn.disabled = true;
     try{
-      await post(`/api/actions/${dock.dataset.action}/answer`,
-                 {prompt_id: dock.dataset.prompt, value});
+      // Adopt the answered snapshot straight away, or the next render tick
+      // would redraw the prompt from stale state before the poll catches up.
+      const answered = await post(`/api/actions/${id}/answer`,
+                                  {prompt_id: dock.dataset.prompt, value});
+      actionsById.set(id, Object.assign({}, actionsById.get(id), answered));
       dock.remove();
+      renderTerm(id);
     }catch(err){
       answerBtn.disabled = false;
       toast(err.message);
@@ -1386,13 +1404,23 @@ document.addEventListener("click", async ev => {
   }
 });
 
+// An empty answer to a passcode prompt reads as "the operator gave up" to the
+// engine, and it is far too easy to produce by accident: keep Send off until
+// something has been typed.
+document.addEventListener("input", ev => {
+  const box = ev.target.closest(".prompt input");
+  if(!box) return;
+  box.closest(".prompt").querySelector("[data-answer]").disabled = !box.value;
+});
+
 // Enter submits a prompt without reaching for the mouse.
 document.addEventListener("keydown", ev => {
   if(ev.key !== "Enter") return;
   const box = ev.target.closest(".prompt input");
   if(!box) return;
   ev.preventDefault();
-  box.closest(".prompt").querySelector("[data-answer]").click();
+  const send = box.closest(".prompt").querySelector("[data-answer]");
+  if(!send.disabled) send.click();
 });
 
 pollRuns(); pollPosture(); pollTools(); pollActions();

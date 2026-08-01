@@ -513,7 +513,10 @@ class ActionRunner:
             if prompt is None or prompt.id != prompt_id:
                 raise ActionError("that prompt is no longer waiting", status=409)
             if prompt.kind == "secret":
-                echo = "********\n"
+                # An empty answer is a real thing the operator can send (the
+                # engine reads it as "no code"), so the transcript must not
+                # claim a secret was typed when none was.
+                echo = "********\n" if value else "\n"
                 if len(value) >= 4:
                     self._secrets.append(value)
             else:

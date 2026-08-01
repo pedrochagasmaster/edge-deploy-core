@@ -1372,6 +1372,38 @@ def test_runner_offers_an_answer_box_for_a_prompt_it_does_not_recognise(tmp_path
     _await(lambda: runner.snapshot()["status"] == "exited", what="the command to exit")
 
 
+def test_an_empty_secret_is_not_transcribed_as_a_passcode(tmp_path) -> None:
+    """The engine reads an empty answer as "no code given". The transcript must
+    not show asterisks as though one was typed, and the page keeps Send off
+    until the field has something in it."""
+    root = _checkout(tmp_path)
+    script = (
+        "import sys\n"
+        "sys.stdout.write('[node03] Enter RSA PASSCODE: '); sys.stdout.flush()\n"
+        "print('got: ' + repr(sys.stdin.readline()))\n"
+    )
+    registry = _registry([root], script=script)
+    runner = registry.start({"action": "status", "root": str(root)})
+    prompt = _await(lambda: runner.snapshot()["prompt"], what="the RSA prompt")
+    runner.answer(prompt["id"], "")
+    _await(lambda: runner.snapshot()["status"] == "exited", what="the command to exit")
+    assert "********" not in runner.output(0)["text"]
+
+    assert 'data-answer="secret" disabled' in PAGE
+    assert 'data-answer="text" disabled' in PAGE
+
+
+def test_page_keeps_a_half_typed_answer_focused_across_re_renders() -> None:
+    """The stage re-renders whenever release-progress.json moves, which is
+    exactly while a passcode is being typed. Re-parenting the terminal must not
+    silently drop the caret out of the field."""
+    body = PAGE.split("function placeTerminals(){", 1)[1].split("\n}\n", 1)[0]
+    assert "document.activeElement" in body
+    assert "selectionStart" in body
+    assert "setSelectionRange" in body
+    assert "scrollTop" in body
+
+
 def test_answering_a_stale_prompt_is_refused(tmp_path) -> None:
     root = _checkout(tmp_path)
     registry = _registry([root], script="print('done')")
