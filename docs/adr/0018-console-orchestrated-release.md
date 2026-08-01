@@ -114,11 +114,16 @@ engine says while they run.** It gains no release logic of its own.
    the ledger is no longer in the operator config; no PowerShell is on PATH to
    run that gate; `audit_repo` is unset or audit records are still queued.
    Each of those is stated before
-   the button is pressed and disables exactly the actions it would refuse —
-   never `status`, which reads local ledgers only and is the one command that
-   still works when everything else does not. This matters most in a guided
-   release, where a refusal the console could have predicted otherwise arrives
-   several phases and a manual posture switch later.
+   the button is pressed and disables the actions it would refuse, scoped to
+   the phases the run has not passed yet — a missing `BB_TOKEN` does not
+   disable a run whose only remaining phase is `tag_github`, which pushes to
+   GitHub. `status` is never disabled: it reads local ledgers only and is the
+   one command that still works when everything else does not. This matters
+   most in a guided release, where a refusal the console could have predicted
+   otherwise arrives several phases and a manual posture switch later.
+
+   Taking a working button away is worse than failing to predict a refusal, so
+   where the console cannot tell, it does not block.
 
    What the console cannot predict cheaply and honestly is left to the
    streamed refusal: GitHub CI state (needs `gh` and the network, and goes

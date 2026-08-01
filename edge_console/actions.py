@@ -11,7 +11,9 @@ verbatim, and when the engine stops to ask the operator something (the RSA
 passcode, a Kerberos password, a guided posture acknowledgement, a y/N gate) it
 surfaces that question as a prompt and relays the answer to the process stdin.
 Secrets are written straight through to the child process, never persisted, and
-masked in the transcript (ADR-0002).
+masked in the transcript (ADR-0002). The Kerberos prompt is recognised as a
+safety net: no allowlisted command passes ``--smoke deep``, which is the only
+thing that asks for it.
 
 Switching the workstation firewall posture stays manual and outside this
 allowlist: the console can only show the boundary and forward the operator's
@@ -375,9 +377,12 @@ class ActionRunner:
                 bufsize=0,
                 env=env,
             )
-        except OSError as exc:
+        except Exception as exc:
+            # Anything at all: leaving status at "starting" would keep this
+            # checkout busy — and so refusing every later command — for the
+            # lifetime of the console.
             self.status = "failed"
-            self.error = f"could not start {self.argv[0]}: {exc}"
+            self.error = f"could not start {self.argv[0]}: {type(exc).__name__}: {exc}"
             self.finished_at = time.time()
             self._append(f"[console] {self.error}\n")
             if self._on_finish:
@@ -734,6 +739,13 @@ class ActionRegistry:
                         "training ledgers are practice-only; the console never runs "
                         "production commands against them",
                         status=403,
+                    )
+                # enter_phase refuses a closed run, but abandon does not — it
+                # would happily mark a completed release abandoned.
+                if state.get("status") != "open":
+                    raise ActionError(
+                        f"run {run_id} is {state.get('status')}; only open runs can be acted on",
+                        status=409,
                     )
                 params["run_id"] = run_id
         if "nodes" in spec.params:

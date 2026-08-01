@@ -416,6 +416,7 @@ let githubWriteAgg = null; // github write aggregate from /api/posture
 let readOnly = false;      // --read-only, from /api/runs
 let runsData = null;       // /api/runs
 let toolsData = null;      // /api/tools, including the environment block
+let actionsById = new Map(); // action id -> latest snapshot from /api/actions
 
 function esc(s){
   return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -543,30 +544,110 @@ function environment(){
 function toolFor(root){
   return ((toolsData && toolsData.tools) || []).find(t => t.root === root) || null;
 }
+// A console-driven release holds the run lock for its whole life, so the lock
+// the card is looking at is often our own child rather than a foreign process.
+function consoleIsBusyIn(root){
+  for(const a of actionsById.values())
+    if(a.root === root && (a.status === "running" || a.status === "starting")) return true;
+  return false;
+}
+
+// Conditions that come from the console's own environment rather than from any
+// one run. Declared once, so the banner, the run cards and the decision card
+// cannot drift apart. `phases` is which phases the condition actually stops —
+// null when it stops everything.
+function environmentProblems(env){
+  if(!env) return [];
+  const out = [];
+  const config = env.operator_config;
+  if(config && config.status === "missing")
+    out.push({phases: null, short: "no operator config",
+      cta: "There is no operator config, so no engine command can run.",
+      text: `<b>No operator config at <code>${esc(config.path)}</code>.</b> Every engine command exits
+        immediately without it. Only <code>status</code> and the git buttons work.`});
+  else if(config && config.status === "invalid")
+    out.push({phases: null, short: "operator config invalid",
+      cta: "The operator config cannot be read, so no engine command can run.",
+      text: `<b>The operator config could not be read</b> (<code>${esc(config.path)}</code>):
+        ${esc(config.detail || "")}`});
+
+  if(env.bb_token && env.bb_token.present === false)
+    out.push({phases: ["publish", "tag_bitbucket"], short: "no BB_TOKEN",
+      cta: "BB_TOKEN is not in this console's environment, so the release would refuse at publish.",
+      text: `<b><code>BB_TOKEN</code> is not set in this console's environment</b>, which is the environment
+        every command inherits. Publish and tag-bitbucket refuse. Setting it in another shell will not help —
+        restart the console from a shell that has it.`});
+
+  const audit = env.audit;
+  if(config && config.status === "ok" && audit && !audit.repo)
+    out.push({phases: ["publish"], short: "no audit_repo",
+      cta: "The operator config does not define audit_repo, so the release would refuse at publish.",
+      text: `<b>The operator config does not define <code>audit_repo</code>.</b> Publish appends a redacted
+        record to the audit branch and refuses without it.`});
+  else if(audit && audit.queued)
+    out.push({phases: ["publish"], short: "audit records queued",
+      cta: `Unsynchronized audit records are waiting in ${audit.outbox}; publish refuses until they are sent.`,
+      text: `<b>Unsynchronized audit records are waiting in <code>${esc(audit.outbox)}</code>.</b>
+        Publish refuses until they reach the audit branch.`});
+
+  if(env.powershell && env.powershell.present === false)
+    out.push({phases: ["verify"], short: "no powershell",
+      cta: "Neither pwsh nor powershell is on PATH, so verify cannot run this tool's committed gate.",
+      text: `<b>Neither <code>pwsh</code> nor <code>powershell</code> is on this machine's PATH.</b>
+        Verify runs the tool's committed <code>local_check.ps1</code> through it and blocks the release
+        without one.`});
+  return out;
+}
 
 // The parts of the release gate that come from the checkout itself rather than
-// from its commits: both remotes must match the tool's committed profile, and
-// the committed verification gate has to be there to run (ADR-0016).
-function sourceGateBlockers(t){
+// from its commits. All of them are read by verify (ADR-0016, inspect_repository).
+function sourceProblems(t){
+  if(!t) return [];
   const out = [];
+  if(t.profile && t.profile.ok === false)
+    out.push({phases: ["verify"], short: "profile unusable",
+      cta: `This checkout's edge_deploy.yaml cannot be used: ${t.profile.detail}.`,
+      text: `<b>This checkout's <code>edge_deploy.yaml</code> cannot be used:</b> ${esc(t.profile.detail)}.
+        Verify reads the same file and stops on it.`});
   if(t.remotes && t.remotes.ok === false)
-    out.push({blocks: ["release","verify"], short: "wrong remote",
+    out.push({phases: ["verify"], short: "wrong remote",
+      cta: `A git remote does not match this tool's edge_deploy.yaml: ${t.remotes.detail}.`,
       text: `<b>A git remote does not match this tool's <code>edge_deploy.yaml</code>:</b>
         ${esc(t.remotes.detail)}. Verify refuses rather than publish somewhere unexpected.`});
   if(t.local_check === false)
-    out.push({blocks: ["release","verify"], short: "no local_check.ps1",
+    out.push({phases: ["verify"], short: "no local_check.ps1",
+      cta: "This checkout has no tools/dev/local_check.ps1, which verify runs as the tool's own gate.",
       text: `<b>This checkout has no <code>tools/dev/local_check.ps1</code>.</b> Verify runs the tool's own
         committed gate and blocks the release when it is missing.`});
   return out;
 }
 
-function runBlockers(run, env, tool){
+// Turn a condition into the buttons it stops for THIS run. A condition that
+// only affects phases already behind us stops nothing: "Resume guided release"
+// on a run waiting at tag_github is not blocked by a missing BB_TOKEN, because
+// tag-github pushes to GitHub with the git credential helper.
+function scopeToRun(run, problem){
+  if(problem.phases === null)
+    return {blocks: ALL_RUN_ACTIONS, short: problem.short, text: problem.text};
+  const ahead = problem.phases.filter(phase => !phasePassed(run, phase));
+  if(!ahead.length) return null;
+  return {
+    blocks: [...ahead.map(phase => PHASE_ACTION[phase]), "release"],
+    short: problem.short,
+    text: problem.text,
+  };
+}
+
+function runBlockers(run, env, tool, consoleHoldsLock){
   const st = run.state, out = [];
   if(run.lock)
     out.push({blocks: ALL_RUN_ACTIONS, short: "run is locked",
-      text: `<b>Another process holds this run's lock</b> (pid ${esc(run.lock.pid)} on ${esc(run.lock.hostname)}).
-        Every phase refuses, and so does abandon. If that process is gone, release it from a terminal with
-        <code>--force-lock</code> — the console deliberately cannot steal a lock.`});
+      text: consoleHoldsLock
+        ? `<b>The command running above holds this run's lock.</b> Everything else on this run waits for it;
+           stopping it releases the lock.`
+        : `<b>Another process holds this run's lock</b> (pid ${esc(run.lock.pid)} on ${esc(run.lock.hostname)}).
+           Every phase refuses, and so does abandon. If that process is gone, release it from a terminal with
+           <code>--force-lock</code> — the console deliberately cannot steal a lock.`});
 
   const runSha = st.engine && st.engine.content_sha256;
   const live = env && env.engine;
@@ -576,59 +657,33 @@ function runBlockers(run, env, tool){
         <code>${esc(runSha.slice(0,8))}</code> and the console would run <code>${esc(live.content_sha256.slice(0,8))}</code>.
         Every phase refuses on Engine Identity: finish it with the engine that created it, or abandon it.`});
 
-  const config = env && env.operator_config;
-  if(config && config.status === "missing")
-    out.push({blocks: ALL_RUN_ACTIONS, short: "no operator config",
-      text: `<b>No operator config at <code>${esc(config.path)}</code>.</b> Every engine command exits
-        immediately without it.`});
-  else if(config && config.status === "invalid")
-    out.push({blocks: ALL_RUN_ACTIONS, short: "operator config invalid",
-      text: `<b>The operator config could not be read.</b> ${esc(config.detail || "")}`});
+  for(const problem of environmentProblems(env).concat(sourceProblems(tool))){
+    const scoped = scopeToRun(run, problem);
+    if(scoped) out.push(scoped);
+  }
 
-  if(env && env.bb_token && env.bb_token.present === false)
-    out.push({blocks: ["release","publish","tag_bitbucket"], short: "no BB_TOKEN",
-      text: `<b><code>BB_TOKEN</code> is not set in this console's environment</b>, which is the environment
-        every command inherits. Publish and tag-bitbucket refuse. Setting it in another shell will not help —
-        restart the console from a shell that has it.`});
-
-  const audit = env && env.audit;
-  if(config && config.status === "ok" && audit && !audit.repo)
-    out.push({blocks: ["release","publish"], short: "no audit_repo",
-      text: `<b>The operator config does not define <code>audit_repo</code>.</b> Publish appends a redacted
-        record to the audit branch and refuses without it.`});
-  else if(audit && audit.queued)
-    out.push({blocks: ["release","publish"], short: "audit records queued",
-      text: `<b>Unsynchronized audit records are waiting in <code>${esc(audit.outbox)}</code>.</b>
-        Publish refuses until they reach the audit branch.`});
-
-  if(env && env.powershell && env.powershell.present === false)
-    out.push({blocks: ["release","verify"], short: "no powershell",
-      text: `<b>Neither <code>pwsh</code> nor <code>powershell</code> is on this machine's PATH.</b>
-        Verify runs the tool's committed <code>local_check.ps1</code> through it and blocks the release
-        without one.`});
-
-  // The checkout gates only bite while verify is still unsatisfied; after that
-  // the engine reuses the ledger's evidence instead of re-inspecting.
+  // Only verify re-inspects the checkout; once it has passed the engine reuses
+  // its evidence, so these stop applying to the rest of the run.
   if(tool && !phasePassed(run, "verify")){
     if(tool.on_main === false)
-      out.push({blocks: ["release","verify"], short: "not on main",
+      out.push({blocks: ["verify","release"], short: "not on main",
         text: `<b>The checkout is on ${esc(tool.branch)}, not main.</b> Verify re-inspects the repository and refuses.`});
     else if(tool.dirty === true)
-      out.push({blocks: ["release","verify"], short: "tree not clean",
+      out.push({blocks: ["verify","release"], short: "tree not clean",
         text: `<b>The checkout has uncommitted changes.</b> Verify requires a clean working tree.`});
     else if(tool.head && st.kind === "release" && tool.head !== st.source_sha)
-      out.push({blocks: ["release","verify"], short: "checkout drift",
+      out.push({blocks: ["verify","release"], short: "checkout drift",
         text: `<b>The checkout has moved off this run's source.</b> The run expects
           <code>${esc(st.source_sha.slice(0,7))}</code> and the checkout is at <code>${esc(tool.head.slice(0,7))}</code>.
           Switch the checkout back to the reviewed commit, or abandon the run.`});
-    for(const item of sourceGateBlockers(tool)) out.push(item);
   }
 
+  const config = env && env.operator_config;
   const configured = config && config.nodes;
-  if(configured && configured.length){
+  if(configured && configured.length && !phasePassed(run, "deploy")){
     const missing = Object.keys(st.phases.deploy || {}).filter(n => !configured.includes(n));
     if(missing.length)
-      out.push({blocks: ["release","deploy"], short: "unknown node",
+      out.push({blocks: ["deploy","release"], short: "unknown node",
         text: `<b>${esc(missing.join(", "))} ${missing.length === 1 ? "is" : "are"} no longer in the operator config.</b>
           Deploy resolves node names against it and stops on the first one it does not know.`});
   }
@@ -873,7 +928,7 @@ function runHtml(run, opts){
       <code>${esc(guidance)}</code>
     </div>`;
   } else if(st.status === "open"){
-    const blockers = runBlockers(run, environment(), toolFor(run.root));
+    const blockers = runBlockers(run, environment(), toolFor(run.root), consoleIsBusyIn(run.root));
     const rows = runActions(run, blockers);
     tail = blockersHtml(blockers) +
       (rows.length ? `<div class="actions">${rows.map(actionRow).join("")}</div>` : "");
@@ -1021,7 +1076,7 @@ function evidenceHtml(t){
 }
 
 // Preconditions, each with the button that fixes it where one exists.
-function checklistHtml(t, blocker){
+function checklistHtml(t){
   const items = [];
   // Every checklist button carries the posture it needs, for the same reason
   // the action rows do: git push wants firewall-off, the node probes want the
@@ -1089,23 +1144,10 @@ function checklistHtml(t, blocker){
 // HEAD == origin/main, before a run is even created. So every kind of stale
 // checkout blocks, not just the two that also lack CI.
 function releaseBlocker(t, env){
-  const config = env && env.operator_config;
-  if(config && config.status === "missing")
-    return "There is no operator config, so no engine command can run.";
-  if(config && config.status === "invalid")
-    return "The operator config cannot be read, so no engine command can run.";
-  if(env && env.bb_token && env.bb_token.present === false)
-    return "BB_TOKEN is not in this console's environment, so the release would refuse at publish.";
-  if(env && env.powershell && env.powershell.present === false)
-    return "Neither pwsh nor powershell is on PATH, so verify cannot run this tool's committed gate.";
-  if(config && config.status === "ok" && env.audit && !env.audit.repo)
-    return "The operator config does not define audit_repo, so the release would refuse at publish.";
-  if(env && env.audit && env.audit.queued)
-    return `Unsynchronized audit records are waiting in ${env.audit.outbox}; publish refuses until they are sent.`;
-  const gate = sourceGateBlockers(t)[0];
-  if(gate) return gate.short === "wrong remote"
-    ? `A git remote does not match this tool's edge_deploy.yaml: ${t.remotes.detail}.`
-    : "This checkout has no tools/dev/local_check.ps1, which verify runs as the tool's own gate.";
+  // A new release runs every phase, so every environment or source problem
+  // applies — same list the run cards use, so the two cannot disagree.
+  const problem = environmentProblems(env).concat(sourceProblems(t))[0];
+  if(problem) return problem.cta;
   if(t.verdict === "unknown") return "This checkout has no readable git state.";
   // inspect_repository checks the branch and the working tree before it looks
   // at any SHA, so a feature branch sitting exactly on origin/main compares as
@@ -1145,8 +1187,9 @@ function decisionHtml(t){
   const headline = headlineFor(t);
   const blocker = releaseBlocker(t, environment());
   // aria-describedby, not just proximity: a disabled button announces nothing
-  // about why it is disabled unless the reason is wired to it.
-  const whyId = `why-${t.tool.replace(/[^a-z0-9_-]/gi, "")}`;
+  // about why it is disabled unless the reason is wired to it. Keyed by root,
+  // because two watched checkouts can be the same tool (training and real).
+  const whyId = `why-${t.root.replace(/[^a-z0-9_-]/gi, "-")}`;
   const cta = `<div class="cta">
       <button class="run primary big" data-payload="${esc(JSON.stringify({action:"release", root:t.root, tool:t.tool}))}"
         ${readOnly || blocker ? "disabled" : ""} aria-describedby="${esc(whyId)}"
@@ -1161,15 +1204,14 @@ function decisionHtml(t){
     ${head}
     <p class="headline${headline.calm ? " calm" : ""}">${esc(headline.text)}</p>
     ${evidenceHtml(t)}
-    ${checklistHtml(t, blocker)}
+    ${checklistHtml(t)}
     ${cta}
     <div class="term-slot" data-root="${esc(t.root)}"></div>
   </article>`;
 }
 
 /* ---------- terminals: one persistent element per action ---------- */
-const terms = new Map();     // action id -> {el, out, cursor, pinned, data}
-let actionsById = new Map(); // action id -> latest snapshot
+const terms = new Map();     // action id -> {el, out, cursor, pinned, …}
 
 function termEl(id){
   let t = terms.get(id);
@@ -1469,19 +1511,11 @@ function renderBanners(){
     parts.push(`<div class="banner readonly"><b>READ-ONLY</b> — this console was started with
       <code>--read-only</code>, so every command button is disabled. Copy the commands and run them in a terminal.</div>`);
 
-  // Conditions that refuse every command, whichever checkout it runs in.
+  // Conditions that apply to every watched checkout, from the one list the
+  // run cards and the decision cards also read.
   const env = environment();
-  const config = env && env.operator_config;
-  if(config && config.status === "missing")
-    parts.push(`<div class="banner offline"><b>No operator config</b> at <code>${esc(config.path)}</code> —
-      every engine command exits immediately. Only <code>status</code> and the git buttons work without it.</div>`);
-  else if(config && config.status === "invalid")
-    parts.push(`<div class="banner offline"><b>The operator config could not be read</b>
-      (<code>${esc(config.path)}</code>): ${esc(config.detail || "")}</div>`);
-  if(env && env.bb_token && env.bb_token.present === false)
-    parts.push(`<div class="banner demo"><b><code>BB_TOKEN</code> is not set</b> in the environment this console
-      was started from, and that is the environment every command inherits. Publish and tag-bitbucket will refuse.
-      Exporting it elsewhere will not reach these buttons — restart the console from a shell that has it.</div>`);
+  for(const problem of environmentProblems(env))
+    parts.push(`<div class="banner ${problem.phases === null ? "offline" : "demo"}">${problem.text}</div>`);
   if(env && env.engine && env.engine.status === "unknown")
     parts.push(`<div class="banner offline"><b>The release engine could not be identified</b>
       (${esc(env.engine.detail || "")}). Commands may not run at all; check

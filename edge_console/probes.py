@@ -374,22 +374,33 @@ def _release_source_state(root: Path, git=_git) -> dict:
     (ADR-0016). Both refuse before anything is published, and both are a file
     read away.
     """
-    state: dict = {"remotes": None, "local_check": None}
+    state: dict = {"profile": None, "remotes": None, "local_check": None}
     try:
         profile = load_tool_profile(root)
-    except Exception:
-        return state  # no profile, nothing to compare against
-    if profile.github_url or profile.bitbucket_url:
-        wrong = []
-        for remote, expected in (("origin", profile.github_url), ("bitbucket", profile.bitbucket_url)):
-            if not expected:
-                continue
-            actual = git(root, "remote", "get-url", remote, timeout=5.0)
-            if actual is None:
-                wrong.append(f"{remote} is not configured")
-            elif _normalize_remote(actual) != _normalize_remote(expected):
-                wrong.append(f"{remote} points at {actual}")
-        state["remotes"] = {"ok": not wrong, "detail": "; ".join(wrong)}
+    except Exception as exc:
+        # verify loads the same file and dies on it, so say so rather than
+        # letting a mistyped --root look like a healthy checkout.
+        state["profile"] = {"ok": False, "detail": f"{type(exc).__name__}: {exc}"}
+        return state
+    missing = [
+        field for field, value in (("github_url", profile.github_url),
+                                   ("bitbucket_url", profile.bitbucket_url))
+        if not value
+    ]
+    state["profile"] = {
+        "ok": not missing,
+        "detail": f"edge_deploy.yaml does not define {' or '.join(missing)}" if missing else "",
+    }
+    wrong = []
+    for remote, expected in (("origin", profile.github_url), ("bitbucket", profile.bitbucket_url)):
+        if not expected:
+            continue
+        actual = git(root, "remote", "get-url", remote, timeout=5.0)
+        if actual is None:
+            wrong.append(f"{remote} is not configured")
+        elif _normalize_remote(actual) != _normalize_remote(expected):
+            wrong.append(f"{remote} points at {actual}")
+    state["remotes"] = {"ok": not wrong, "detail": "; ".join(wrong)}
     state["local_check"] = (root / "tools" / "dev" / "local_check.ps1").is_file()
     return state
 

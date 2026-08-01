@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -188,8 +189,15 @@ def _page_script_through_run_html() -> str:
     return script.split(marker, 1)[0]
 
 
+def _require_node() -> None:
+    """The page's own JS is executed to assert on it; skip where node is absent."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required to execute the page's JavaScript")
+
+
 def _render_run_html(run: dict, *, tcp_caps: dict | None = None) -> str:
     """Evaluate PAGE's runHtml() in Node so tests assert real card output."""
+    _require_node()
     script = _page_script_through_run_html()
     with tempfile.NamedTemporaryFile("w", suffix=".mjs", encoding="utf-8", delete=False) as fh:
         fh.write(script)
@@ -1135,12 +1143,14 @@ def test_release_cta_is_blocked_whenever_the_checkout_is_not_github_main() -> No
     """inspect_repository refuses unless HEAD == origin/main, before a run is
     even created — so every stale direction blocks, not only the two that also
     lack CI."""
+    _require_node()
     script = PAGE.split("<script>", 1)[1].split("</script>", 1)[0]
     body = script.split("function releaseBlocker(t, env){", 1)[1].split("\n}\n", 1)[0]
-    gate = script.split("function sourceGateBlockers(t){", 1)[1].split("\n}\n", 1)[0]
     with tempfile.NamedTemporaryFile("w", suffix=".mjs", encoding="utf-8", delete=False) as fh:
+        # releaseBlocker reads the same problem lists the run cards do.
+        for name in ("function environmentProblems(env){", "function sourceProblems(t){"):
+            fh.write(name + script.split(name, 1)[1].split("\n}\n", 1)[0] + "\n}\n")
         fh.write("function esc(s){return String(s);}\n")
-        fh.write(f"function sourceGateBlockers(t){{{gate}\n}}\n")
         fh.write(f"function releaseBlocker(t, env){{{body}\n}}\n")
         fh.write(
             "const cases = ["
@@ -1190,13 +1200,16 @@ def test_release_cta_is_blocked_whenever_the_checkout_is_not_github_main() -> No
     assert "local_check.ps1" in result["noGate"]
 
 
-def _run_blockers(run: dict, env: dict | None, tool: dict | None) -> list[dict]:
+def _run_blockers(
+    run: dict, env: dict | None, tool: dict | None, *, console_busy: bool = False
+) -> list[dict]:
     """Evaluate the page's runBlockers() in Node against explicit inputs."""
+    _require_node()
     script = _page_script_through_run_html()
     with tempfile.NamedTemporaryFile("w", suffix=".mjs", encoding="utf-8", delete=False) as fh:
         fh.write(script)
         fh.write("\nprocess.stdout.write(JSON.stringify(runBlockers(")
-        fh.write(f"{json.dumps(run)},{json.dumps(env)},{json.dumps(tool)}")
+        fh.write(f"{json.dumps(run)},{json.dumps(env)},{json.dumps(tool)},{json.dumps(console_busy)}")
         fh.write(")));\n")
         path = Path(fh.name)
     try:
@@ -1249,14 +1262,58 @@ def test_run_blockers_catch_the_refusals_the_engine_would_produce() -> None:
     assert "No operator config" in missing_config[0]["text"]
 
     no_token = _run_blockers(_open_run(), {**_OK_ENV, "bb_token": {"present": False}}, None)
-    assert no_token[0]["blocks"] == ["release", "publish", "tag_bitbucket"]
+    assert sorted(no_token[0]["blocks"]) == ["publish", "release", "tag_bitbucket"]
     assert "restart the console" in no_token[0]["text"]
 
     unknown_node = _run_blockers(
         _open_run(), {**_OK_ENV, "operator_config": {"status": "ok", "path": "/c", "nodes": ["node99"]}}, None
     )
     assert "node03" in unknown_node[0]["text"]
-    assert unknown_node[0]["blocks"] == ["release", "deploy"]
+    assert sorted(unknown_node[0]["blocks"]) == ["deploy", "release"]
+
+
+def test_blockers_do_not_disable_commands_for_phases_already_behind_the_run() -> None:
+    """A condition that only stops a phase the run has passed stops nothing.
+    Taking a working button away is worse than not predicting the refusal:
+    tag-github pushes to GitHub with the credential helper, so a missing
+    BB_TOKEN must not disable a run that only has tag-github left."""
+    late = _open_run()
+    for phase in ("verify", "publish", "tag_bitbucket"):
+        late["state"]["phases"][phase] = {"state": "passed", "updated_at": None, "evidence": {}}
+    late["state"]["phases"]["deploy"] = {
+        "node03": {"state": "passed", "updated_at": None, "evidence": {}}
+    }
+
+    for env_key, value in (
+        ("bb_token", {"present": False}),
+        ("audit", {"repo": None, "queued": False}),
+        ("powershell", {"present": False}),
+    ):
+        assert _run_blockers(late, {**_OK_ENV, env_key: value}, None) == [], env_key
+
+    # A checkout problem is likewise only verify's business once verify passed.
+    broken = {"on_main": False, "branch": "feature/x", "dirty": True,
+              "local_check": False, "remotes": {"ok": False, "detail": "origin points at x"}}
+    assert _run_blockers(late, _OK_ENV, broken) == []
+
+    # …but the same conditions do block a run that has not reached them yet.
+    early = _open_run()
+    assert [b["short"] for b in _run_blockers(early, {**_OK_ENV, "bb_token": {"present": False}}, None)] \
+        == ["no BB_TOKEN"]
+    assert [b["short"] for b in _run_blockers(early, {**_OK_ENV, "powershell": {"present": False}}, None)] \
+        == ["no powershell"]
+
+
+def test_a_lock_the_console_itself_holds_is_not_reported_as_a_foreign_process() -> None:
+    """A console-driven release holds the run lock for its whole life, so the
+    advice to steal it with --force-lock would be exactly wrong."""
+    run = _open_run()
+    run["lock"] = {"pid": 4242, "hostname": "THIS-HOST", "acquired_at": "2026-07-10T00:00:00+00:00"}
+    ours = _run_blockers(run, _OK_ENV, None, console_busy=True)
+    assert "--force-lock" not in ours[0]["text"]
+    assert "command running above" in ours[0]["text"]
+    theirs = _run_blockers(run, _OK_ENV, None, console_busy=False)
+    assert "--force-lock" in theirs[0]["text"]
 
 
 def test_run_blockers_carry_the_checkout_gate_onto_open_runs() -> None:
@@ -1273,7 +1330,7 @@ def test_run_blockers_carry_the_checkout_gate_onto_open_runs() -> None:
     ):
         blockers = _run_blockers(run, _OK_ENV, tool)
         assert [b["short"] for b in blockers] == [expected], (tool, blockers)
-        assert blockers[0]["blocks"] == ["release", "verify"]
+        assert sorted(blockers[0]["blocks"]) == ["release", "verify"]
 
     # Once verify has passed the engine reuses its evidence, so these stop applying.
     passed = _open_run()
@@ -1719,6 +1776,25 @@ def test_registry_refuses_production_commands_against_a_training_ledger(tmp_path
         registry.start({"action": "verify", "root": str(root), "run_id": "run-train"})
     assert refused.value.status == 403
     assert "training" in str(refused.value)
+
+
+def test_only_open_runs_can_be_acted_on(tmp_path) -> None:
+    """enter_phase refuses a closed run, but abandon does not — it would mark a
+    completed release abandoned. The page never offers it; the server refuses
+    it too, so a stale tab cannot rewrite finished history."""
+    root = _checkout(tmp_path)
+    for run_id, status in (("run-done", "complete"), ("run-gone", "abandoned")):
+        _write_state(
+            root / "edge-deploy" / "runs" / run_id, run_id, status=status, phases=_pending_phases()
+        )
+    registry = _registry([root])
+    for run_id in ("run-done", "run-gone"):
+        with pytest.raises(ActionError) as closed:
+            registry.start(
+                {"action": "abandon", "root": str(root), "run_id": run_id, "reason": "why"}
+            )
+        assert closed.value.status == 409
+        assert "only open runs" in str(closed.value)
 
 
 def test_registry_validates_node_names_and_abandon_reasons(tmp_path) -> None:

@@ -331,7 +331,9 @@ buttons (`git pull`, `git push`, `preflight`, `transport-smoke`), and one
 release would fail.
 
 Refusals the console can see coming are stated before you press anything, and
-disable exactly the commands they would stop: a run created by a different
+disable the commands they would stop — scoped to the phases a run has not
+reached yet, so a condition that only affects a phase already behind it takes
+nothing away: a run created by a different
 engine build, a run lock another process holds, a missing or unreadable
 operator config, `BB_TOKEN` absent from the environment the console was started
 in, a checkout that is not on `main` or not clean or has drifted off the run's
