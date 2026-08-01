@@ -75,6 +75,7 @@ header{border-bottom:1px solid var(--line);background:var(--panel);position:stic
 
 /* ---------- banners ---------- */
 .banner{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:16px;padding:9px 14px;border-radius:7px;font-size:12px;border:1px solid var(--line);background:var(--panel);color:var(--dim)}
+.banner[hidden]{display:none}  /* a class-level display: wins over [hidden] */
 .banner b{color:var(--ink)}
 .banner.demo{border-color:var(--warn);color:var(--warn)}
 .banner.readonly{border-color:var(--gh);color:var(--gh)}
@@ -217,6 +218,9 @@ button.copy:focus-visible{outline:2px solid var(--gh);outline-offset:2px}
 .checklist li.manual::before{content:"◈";color:var(--warn)}
 .checklist li b{color:var(--ink);font-weight:600}
 .checklist li .grow{flex:1 1 40px}
+/* Button, command and posture belong together: let the group wrap as a unit
+   rather than stranding a lone readiness marker on the next line. */
+.checkact{display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
 .cta{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:12px 16px 14px;border-top:1px solid var(--line)}
 .cta code{font-family:var(--mono);font-size:11px;color:var(--faint);background:var(--sunk);border:1px solid var(--line);border-radius:5px;padding:5px 9px}
 .ctawhy{font-size:11.5px;color:var(--faint);flex:1 1 200px}
@@ -878,12 +882,15 @@ function checklistHtml(t, blocker){
   // the action rows do: git push wants firewall-off, the node probes want the
   // Edge VPN, and finding that out from a failure is a bad way to find out.
   const btn = (label, payload, cmd, cap) =>
+    `<span class="checkact">` +
     `<button class="run" data-payload="${esc(JSON.stringify(payload))}" ${readOnly ? "disabled" : ""}
       title="${esc(cmd)}">${esc(label)}</button>` +
     `<code style="font-family:var(--mono);font-size:10.5px;color:var(--faint)">${esc(cmd)}</code>` +
-    (cap && cap !== "any"
-      ? `<span class="need ${cap}">needs ${esc(REQ_POSTURE[cap])}</span>${readinessHtml(cap)}`
-      : "");
+    (cap && cap !== "any" ? `<span class="need ${cap}">needs ${esc(REQ_POSTURE[cap])}</span>` : "") +
+    // Only the blocked case earns a marker here: a green tick on every row is
+    // noise, and the posture line above already reports the good news.
+    (cap && cap !== "any" && postureReady(cap) === false ? readinessHtml(cap) : "") +
+    `</span>`;
 
   if(t.verdict === "unknown"){
     items.push(`<li class="blocked"><b>No git state.</b> Point the console at a tool checkout with <code>--root</code>.</li>`);
@@ -902,9 +909,9 @@ function checklistHtml(t, blocker){
   }
 
   const ready = postureReady("both");
-  items.push(`<li class="${ready === true ? "ok" : "manual"}">Hold <b>both-vpns</b> before starting — the guided release then needs
-    exactly one more switch, to firewall-off for tag-github. Posture changes stay manual.
-    <span class="grow"></span>${readinessHtml("both")}</li>`);
+  items.push(`<li class="${ready === true ? "ok" : "manual"}">Start on <b>both-vpns</b> if you can — the guided release
+    then needs exactly one more switch, to firewall-off for tag-github. It will pause and ask at every
+    boundary either way, and posture changes stay manual. ${readinessHtml("both")}</li>`);
 
   const node = (t.nodes && t.nodes[0]) || null;
   if(node){
@@ -1149,12 +1156,22 @@ function setHealth(message){
   el.innerHTML = message || "";
 }
 
+const UNREACHABLE = `Console unreachable — nothing on this page is live. Check the terminal
+  that started it, then reload.`;
+
 async function post(url, body){
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {"Content-Type": "application/json", "X-Edge-Console-Token": TOKEN},
-    body: JSON.stringify(body || {}),
-  });
+  let res;
+  try{
+    res = await fetch(url, {
+      method: "POST",
+      headers: {"Content-Type": "application/json", "X-Edge-Console-Token": TOKEN},
+      body: JSON.stringify(body || {}),
+    });
+  }catch(_e){
+    // "Failed to fetch" tells an operator nothing they can act on.
+    setHealth(UNREACHABLE);
+    throw new Error("The console is not answering. Check the terminal that started it, then reload.");
+  }
   const data = await res.json().catch(() => ({}));
   if(!res.ok){
     if(res.status === 403 && /token/.test(data.error || ""))
@@ -1346,9 +1363,7 @@ async function pollRuns(){
   }catch(_e){
     // Everything on screen is now a snapshot of an unknown age; say so rather
     // than letting a dead console look like a live one.
-    if(++pollFailures >= 3)
-      setHealth(`Console unreachable — nothing on this page is live. Check the terminal
-        that started it, then reload.`);
+    if(++pollFailures >= 3) setHealth(UNREACHABLE);
   }
 }
 
