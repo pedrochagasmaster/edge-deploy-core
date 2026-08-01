@@ -164,6 +164,9 @@ header{border-bottom:1px solid var(--line);background:var(--panel);position:stic
 .blockers{list-style:none;margin:0;padding:10px 16px 4px;border-top:1px solid var(--line);background:rgba(226,104,92,.05)}
 .blockers li{display:flex;gap:9px;align-items:flex-start;padding:4px 0;font-size:12.5px;color:var(--dim)}
 .blockers li::before{content:"!";color:var(--fail);font-weight:700;flex:none;width:12px;text-align:center}
+/* One flex item for the whole sentence, or each run of text between <b> and
+   <code> tags wraps on its own. */
+.blockers li>span{flex:1 1 auto}
 .blockers li b{color:var(--ink);font-weight:600}
 .blockers li code{font-family:var(--mono);font-size:11px;color:var(--faint)}
 .actside .blocked-why{font-size:10px;color:var(--fail);max-width:22ch;text-align:right;line-height:1.35}
@@ -602,7 +605,7 @@ function runBlockers(run, env, tool){
 function blockersHtml(blockers){
   if(!blockers.length) return "";
   return `<ul class="blockers" role="status">` +
-    blockers.map(b => `<li>${b.text}</li>`).join("") + `</ul>`;
+    blockers.map(b => `<li><span>${b.text}</span></li>`).join("") + `</ul>`;
 }
 
 function runActions(run, blockers){
