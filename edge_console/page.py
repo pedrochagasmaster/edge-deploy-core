@@ -218,6 +218,9 @@ button.copy:focus-visible{outline:2px solid var(--gh);outline-offset:2px}
 .checklist li.manual::before{content:"◈";color:var(--warn)}
 .checklist li b{color:var(--ink);font-weight:600}
 .checklist li .grow{flex:1 1 40px}
+/* One flex item for the whole sentence: otherwise each run of text between
+   <b> tags becomes its own item and the row breaks in odd places. */
+.checklist .ctext{flex:1 1 280px}
 /* Button, command and posture belong together: let the group wrap as a unit
    rather than stranding a lone readiness marker on the next line. */
 .checkact{display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
@@ -891,34 +894,40 @@ function checklistHtml(t, blocker){
     // noise, and the posture line above already reports the good news.
     (cap && cap !== "any" && postureReady(cap) === false ? readinessHtml(cap) : "") +
     `</span>`;
+  const item = (cls, text, action) => items.push(
+    `<li class="${cls}"><span class="ctext">${text}</span>` +
+    (action ? `<span class="grow"></span>${action}` : "") + `</li>`);
 
   if(t.verdict === "unknown"){
-    items.push(`<li class="blocked"><b>No git state.</b> Point the console at a tool checkout with <code>--root</code>.</li>`);
+    item("blocked", `<b>No git state.</b> Point the console at a tool checkout with <code>--root</code>.`);
   } else if(!t.stale){
-    items.push(`<li class="ok">Checkout is in sync with GitHub main${t.ahead_exact ? " — the undeployed count is live" : ""}.</li>`);
+    item("ok", `Checkout is in sync with GitHub main${t.ahead_exact ? " — the undeployed count is live" : ""}.`);
   } else if(t.stale_direction === "local_ahead"){
-    items.push(`<li class="blocked"><b>${esc(plural(t.ahead_of_origin, "commit"))} are not on GitHub main.</b>
-      Verify needs HEAD on GitHub main with green CI.<span class="grow"></span>
-      ${btn("Push to GitHub", {action:"git_push", root:t.root}, "git push origin main", "gh")}</li>`);
+    item("blocked", `<b>${esc(plural(t.ahead_of_origin, "commit"))} are not on GitHub main.</b>
+      The engine requires HEAD to equal github main, and verify needs green CI on it.`,
+      btn("Push to GitHub", {action:"git_push", root:t.root}, "git push origin main", "gh"));
   } else if(t.stale_direction === "forked"){
-    items.push(`<li class="blocked"><b>Checkout and GitHub main have forked.</b> Reconcile before releasing.<span class="grow"></span>
-      ${btn("Rebase onto main", {action:"git_rebase", root:t.root}, "git pull --rebase origin main", "any")}</li>`);
+    item("blocked", `<b>Checkout and GitHub main have forked.</b> Reconcile before releasing.`,
+      btn("Rebase onto main", {action:"git_rebase", root:t.root}, "git pull --rebase origin main", "any"));
   } else {
-    items.push(`<li class="blocked"><b>GitHub main has moved.</b> ${esc(staleReadHtml(t))}<span class="grow"></span>
-      ${btn("Pull from GitHub", {action:"git_pull", root:t.root}, "git pull --ff-only origin main", "any")}</li>`);
+    item("blocked", `<b>GitHub main has moved.</b> ${esc(staleReadHtml(t))}`,
+      btn("Pull from GitHub", {action:"git_pull", root:t.root}, "git pull --ff-only origin main", "any"));
   }
 
   const ready = postureReady("both");
-  items.push(`<li class="${ready === true ? "ok" : "manual"}">Start on <b>both-vpns</b> if you can — the guided release
-    then needs exactly one more switch, to firewall-off for tag-github. It will pause and ask at every
-    boundary either way, and posture changes stay manual. ${readinessHtml("both")}</li>`);
+  item(ready === true ? "ok" : "manual",
+    `Start on <b>both-vpns</b> if you can — the guided release then needs exactly one more switch,
+     to firewall-off for tag-github. It pauses and asks at every boundary either way, and posture
+     changes stay manual. ${readinessHtml("both")}`);
 
   const node = (t.nodes && t.nodes[0]) || null;
   if(node){
-    items.push(`<li>Optional: confirm the node answers before trusting it.<span class="grow"></span>
-      ${btn(`Preflight ${node}`, {action:"preflight", root:t.root, node}, `py -m edge_deploy preflight --node ${node}`, "edge")}</li>`);
-    items.push(`<li>Optional: exercise the Paramiko transport end to end.<span class="grow"></span>
-      ${btn(`Smoke ${node}`, {action:"transport_smoke", root:t.root, node}, `py -m edge_deploy transport-smoke --node ${node}`, "edge")}</li>`);
+    item("", `Optional: confirm the node answers before trusting it.`,
+      btn(`Preflight ${node}`, {action:"preflight", root:t.root, node},
+          `py -m edge_deploy preflight --node ${node}`, "edge"));
+    item("", `Optional: exercise the Paramiko transport end to end.`,
+      btn(`Smoke ${node}`, {action:"transport_smoke", root:t.root, node},
+          `py -m edge_deploy transport-smoke --node ${node}`, "edge"));
   }
   return `<ol class="checklist">${items.join("")}</ol>`;
 }
