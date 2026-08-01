@@ -335,8 +335,10 @@ disable exactly the commands they would stop: a run created by a different
 engine build, a run lock another process holds, a missing or unreadable
 operator config, `BB_TOKEN` absent from the environment the console was started
 in, a checkout that is not on `main` or not clean or has drifted off the run's
-reviewed commit, and nodes in the ledger that are no longer in the operator
-config. `status` is never blocked — it reads local ledgers only, and is the one
+reviewed commit or whose remotes do not match its `edge_deploy.yaml`, a missing
+`tools/dev/local_check.ps1` or no PowerShell to run it, an unset `audit_repo`
+or audit records still queued, and nodes in the ledger that are no longer in
+the operator config. `status` is never blocked — it reads local ledgers only, and is the one
 command that still answers when the rest refuse. What the console cannot know
 cheaply, above all GitHub CI state, is left to the engine to report as it runs.
 

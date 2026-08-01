@@ -109,8 +109,11 @@ engine says while they run.** It gains no release logic of its own.
    (Engine Identity, ADR-0008), another process holds the run lock, the
    operator config is missing or unreadable, `BB_TOKEN` is absent from the
    environment the child will inherit, the checkout is not on `main`, is not
-   clean, or has drifted off the run's reviewed commit, or a node in the
-   ledger is no longer in the operator config. Each of those is stated before
+   clean, has drifted off the run's reviewed commit, points a remote somewhere
+   the tool profile does not name, or has no committed gate script; a node in
+   the ledger is no longer in the operator config; no PowerShell is on PATH to
+   run that gate; `audit_repo` is unset or audit records are still queued.
+   Each of those is stated before
    the button is pressed and disables exactly the actions it would refuse —
    never `status`, which reads local ledgers only and is the one command that
    still works when everything else does not. This matters most in a guided

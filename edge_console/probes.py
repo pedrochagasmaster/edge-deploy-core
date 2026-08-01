@@ -25,7 +25,11 @@ from pathlib import Path
 
 from edge_console.demo import demo_git
 from edge_console.ledger import collect_runs, runs_root_for
-from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, load_operator_config
+from edge_deploy.config import (
+    DEFAULT_OPERATOR_CONFIG_PATH,
+    load_operator_config,
+    load_tool_profile,
+)
 from edge_deploy.preflight import endpoint_from_node
 
 PROBE_TIMEOUT = 1.5
@@ -357,6 +361,39 @@ def _checkout_state(root: Path, git=_git) -> dict:
     return {"branch": branch, "on_main": (not detached) and name == "main", "dirty": dirty}
 
 
+def _normalize_remote(value: str) -> str:
+    """Same comparison ``repository._normalize_url`` makes."""
+    return value.strip().removesuffix("/").removesuffix(".git").lower()
+
+
+def _release_source_state(root: Path, git=_git) -> dict:
+    """The rest of the engine's release gate that is not about commits.
+
+    ``inspect_repository`` also requires both remotes to match the tool's
+    committed profile, and verify then runs the committed gate script
+    (ADR-0016). Both refuse before anything is published, and both are a file
+    read away.
+    """
+    state: dict = {"remotes": None, "local_check": None}
+    try:
+        profile = load_tool_profile(root)
+    except Exception:
+        return state  # no profile, nothing to compare against
+    if profile.github_url or profile.bitbucket_url:
+        wrong = []
+        for remote, expected in (("origin", profile.github_url), ("bitbucket", profile.bitbucket_url)):
+            if not expected:
+                continue
+            actual = git(root, "remote", "get-url", remote, timeout=5.0)
+            if actual is None:
+                wrong.append(f"{remote} is not configured")
+            elif _normalize_remote(actual) != _normalize_remote(expected):
+                wrong.append(f"{remote} points at {actual}")
+        state["remotes"] = {"ok": not wrong, "detail": "; ".join(wrong)}
+    state["local_check"] = (root / "tools" / "dev" / "local_check.ps1").is_file()
+    return state
+
+
 def _last_deployed(runs: list[dict]) -> dict | None:
     """The newest complete run: what the Edge Nodes are believed to hold.
 
@@ -439,6 +476,7 @@ def probe_divergence(root: Path, runs: list[dict], *, git=_git) -> dict:
         "head": head,
         "origin_main": origin_main,
         **_checkout_state(root, git=git),
+        **_release_source_state(root, git=git),
         "ahead": ahead,
         "ahead_exact": ahead_exact,
         "stale": stale,

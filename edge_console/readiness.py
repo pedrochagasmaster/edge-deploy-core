@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import threading
 import time
 from pathlib import Path
 
+from edge_deploy.audit import default_outbox
 from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, load_operator_config
 
 READINESS_CACHE_SECONDS = 30.0
@@ -91,7 +93,35 @@ def probe_operator_config(path: Path | None = None) -> dict:
             "detail": f"{type(exc).__name__}: {exc}",
             "nodes": [],
         }
-    return {"status": "ok", "path": str(config_path), "nodes": sorted(operator.nodes)}
+    return {
+        "status": "ok",
+        "path": str(config_path),
+        "nodes": sorted(operator.nodes),
+        "audit_repo": operator.audit_repo,
+    }
+
+
+def probe_powershell() -> dict:
+    """Verify runs the tool's committed ``local_check.ps1`` through PowerShell.
+
+    Without one, verify fails with a message that cannot distinguish this from
+    a missing script, and with an empty diagnostic artifact.
+    """
+    for candidate in ("pwsh", "powershell"):
+        found = shutil.which(candidate)
+        if found:
+            return {"present": True, "path": found}
+    return {"present": False, "path": None}
+
+
+def probe_audit(audit_repo: str, outbox: Path | None = None) -> dict:
+    """Publish refuses without an audit checkout, or with unsent records queued."""
+    pending = Path(outbox) if outbox else default_outbox()
+    try:
+        queued = pending.is_dir() and any(pending.iterdir())
+    except OSError:
+        queued = False
+    return {"repo": audit_repo or None, "outbox": str(pending), "queued": bool(queued)}
 
 
 def probe_bb_token() -> dict:
@@ -135,15 +165,20 @@ class ReadinessProber:
                 },
                 "operator_config": {"status": "ok", "path": "(demo)", "nodes": ["node03", "node04", "node05"]},
                 "bb_token": {"present": True},
+                "powershell": {"present": True, "path": "(demo)"},
+                "audit": {"repo": "(demo)", "outbox": "(demo)", "queued": False},
                 "engine_python": "(demo simulator)",
             }
         with self._lock:
             if self._cached and time.monotonic() - self._cached_at < READINESS_CACHE_SECONDS:
                 return self._cached
+        config = probe_operator_config()
         result = {
             "engine": probe_engine_identity(self._engine_python, cwd=self._probe_root),
-            "operator_config": probe_operator_config(),
+            "operator_config": config,
             "bb_token": probe_bb_token(),
+            "powershell": probe_powershell(),
+            "audit": probe_audit(config.get("audit_repo") or ""),
             "engine_python": self._engine_python,
         }
         with self._lock:

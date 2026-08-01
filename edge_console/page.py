@@ -544,6 +544,22 @@ function toolFor(root){
   return ((toolsData && toolsData.tools) || []).find(t => t.root === root) || null;
 }
 
+// The parts of the release gate that come from the checkout itself rather than
+// from its commits: both remotes must match the tool's committed profile, and
+// the committed verification gate has to be there to run (ADR-0016).
+function sourceGateBlockers(t){
+  const out = [];
+  if(t.remotes && t.remotes.ok === false)
+    out.push({blocks: ["release","verify"], short: "wrong remote",
+      text: `<b>A git remote does not match this tool's <code>edge_deploy.yaml</code>:</b>
+        ${esc(t.remotes.detail)}. Verify refuses rather than publish somewhere unexpected.`});
+  if(t.local_check === false)
+    out.push({blocks: ["release","verify"], short: "no local_check.ps1",
+      text: `<b>This checkout has no <code>tools/dev/local_check.ps1</code>.</b> Verify runs the tool's own
+        committed gate and blocks the release when it is missing.`});
+  return out;
+}
+
 function runBlockers(run, env, tool){
   const st = run.state, out = [];
   if(run.lock)
@@ -575,6 +591,22 @@ function runBlockers(run, env, tool){
         every command inherits. Publish and tag-bitbucket refuse. Setting it in another shell will not help —
         restart the console from a shell that has it.`});
 
+  const audit = env && env.audit;
+  if(config && config.status === "ok" && audit && !audit.repo)
+    out.push({blocks: ["release","publish"], short: "no audit_repo",
+      text: `<b>The operator config does not define <code>audit_repo</code>.</b> Publish appends a redacted
+        record to the audit branch and refuses without it.`});
+  else if(audit && audit.queued)
+    out.push({blocks: ["release","publish"], short: "audit records queued",
+      text: `<b>Unsynchronized audit records are waiting in <code>${esc(audit.outbox)}</code>.</b>
+        Publish refuses until they reach the audit branch.`});
+
+  if(env && env.powershell && env.powershell.present === false)
+    out.push({blocks: ["release","verify"], short: "no powershell",
+      text: `<b>Neither <code>pwsh</code> nor <code>powershell</code> is on this machine's PATH.</b>
+        Verify runs the tool's committed <code>local_check.ps1</code> through it and blocks the release
+        without one.`});
+
   // The checkout gates only bite while verify is still unsatisfied; after that
   // the engine reuses the ledger's evidence instead of re-inspecting.
   if(tool && !phasePassed(run, "verify")){
@@ -589,6 +621,7 @@ function runBlockers(run, env, tool){
         text: `<b>The checkout has moved off this run's source.</b> The run expects
           <code>${esc(st.source_sha.slice(0,7))}</code> and the checkout is at <code>${esc(tool.head.slice(0,7))}</code>.
           Switch the checkout back to the reviewed commit, or abandon the run.`});
+    for(const item of sourceGateBlockers(tool)) out.push(item);
   }
 
   const configured = config && config.nodes;
@@ -1063,6 +1096,16 @@ function releaseBlocker(t, env){
     return "The operator config cannot be read, so no engine command can run.";
   if(env && env.bb_token && env.bb_token.present === false)
     return "BB_TOKEN is not in this console's environment, so the release would refuse at publish.";
+  if(env && env.powershell && env.powershell.present === false)
+    return "Neither pwsh nor powershell is on PATH, so verify cannot run this tool's committed gate.";
+  if(config && config.status === "ok" && env.audit && !env.audit.repo)
+    return "The operator config does not define audit_repo, so the release would refuse at publish.";
+  if(env && env.audit && env.audit.queued)
+    return `Unsynchronized audit records are waiting in ${env.audit.outbox}; publish refuses until they are sent.`;
+  const gate = sourceGateBlockers(t)[0];
+  if(gate) return gate.short === "wrong remote"
+    ? `A git remote does not match this tool's edge_deploy.yaml: ${t.remotes.detail}.`
+    : "This checkout has no tools/dev/local_check.ps1, which verify runs as the tool's own gate.";
   if(t.verdict === "unknown") return "This checkout has no readable git state.";
   // inspect_repository checks the branch and the working tree before it looks
   // at any SHA, so a feature branch sitting exactly on origin/main compares as

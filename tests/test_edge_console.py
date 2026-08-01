@@ -46,9 +46,11 @@ from edge_console.demo import DEMO_ENGINE_PATH  # noqa: E402
 from edge_console.probes import _tool_name  # noqa: E402
 from edge_console.readiness import (  # noqa: E402
     ReadinessProber,
+    probe_audit,
     probe_bb_token,
     probe_engine_identity,
     probe_operator_config,
+    probe_powershell,
 )
 
 _SCHEMA = SCHEMA
@@ -1059,13 +1061,86 @@ def test_checkout_state_matches_the_engine_gate_on_a_real_repository(tmp_path) -
         )
 
 
+def test_remote_and_gate_checks_match_the_engine_on_a_real_repository(tmp_path) -> None:
+    """The last two parts of inspect_repository that are not about commits: both
+    remotes must match the tool's committed profile, and verify then needs the
+    tool's own gate script to exist."""
+    from edge_deploy.repository import RepositoryError, inspect_repository
+
+    root = tmp_path / "autobench"
+    root.mkdir()
+    origin = tmp_path / "origin.git"
+    bitbucket = tmp_path / "bitbucket.git"
+    for bare in (origin, bitbucket):
+        subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True, capture_output=True)
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "operator@example.com")
+    git("config", "user.name", "operator")
+    (root / "edge_deploy.yaml").write_text(
+        f"tool: autobench\ngithub_url: {origin}\nbitbucket_url: {bitbucket}\n", encoding="utf-8"
+    )
+    git("add", "-A")
+    git("commit", "-qm", "one")
+    git("remote", "add", "origin", str(origin))
+    git("remote", "add", "bitbucket", str(bitbucket))
+    git("push", "-q", "-u", "origin", "main")
+
+    def inspect() -> None:
+        inspect_repository(
+            root, tool="autobench", expected_origin=str(origin), expected_bitbucket=str(bitbucket)
+        )
+
+    state = probe_divergence(root, [])
+    assert state["remotes"] == {"ok": True, "detail": ""}
+    assert state["local_check"] is False, "the gate script is not committed yet"
+    inspect()  # the engine agrees the remotes are right
+
+    (root / "tools" / "dev").mkdir(parents=True)
+    (root / "tools" / "dev" / "local_check.ps1").write_text("exit 0\n", encoding="utf-8")
+    assert probe_divergence(root, [])["local_check"] is True
+    git("add", "-A")
+    git("commit", "-qm", "gate")
+    git("push", "-q", "origin", "main")
+
+    # Point origin at a real repository that is not the one the profile names,
+    # so the engine's fetch succeeds and the URL comparison is what refuses.
+    git("push", "-q", "bitbucket", "main")
+    git("remote", "set-url", "origin", str(bitbucket))
+    drifted = probe_divergence(root, [])
+    assert drifted["remotes"]["ok"] is False
+    assert "origin points at" in drifted["remotes"]["detail"]
+    with pytest.raises(RepositoryError, match="origin points to unexpected repository"):
+        inspect()
+
+
+def test_powershell_and_audit_prerequisites_are_reported(tmp_path, monkeypatch) -> None:
+    shell = probe_powershell()
+    assert shell["present"] is (shell["path"] is not None)
+
+    empty = tmp_path / "outbox"
+    assert probe_audit("/core", outbox=empty)["queued"] is False
+    empty.mkdir()
+    assert probe_audit("/core", outbox=empty)["queued"] is False
+    (empty / "pending").write_text("x", encoding="utf-8")
+    queued = probe_audit("", outbox=empty)
+    assert queued["queued"] is True
+    assert queued["repo"] is None
+
+
 def test_release_cta_is_blocked_whenever_the_checkout_is_not_github_main() -> None:
     """inspect_repository refuses unless HEAD == origin/main, before a run is
     even created — so every stale direction blocks, not only the two that also
     lack CI."""
     script = PAGE.split("<script>", 1)[1].split("</script>", 1)[0]
     body = script.split("function releaseBlocker(t, env){", 1)[1].split("\n}\n", 1)[0]
+    gate = script.split("function sourceGateBlockers(t){", 1)[1].split("\n}\n", 1)[0]
     with tempfile.NamedTemporaryFile("w", suffix=".mjs", encoding="utf-8", delete=False) as fh:
+        fh.write("function esc(s){return String(s);}\n")
+        fh.write(f"function sourceGateBlockers(t){{{gate}\n}}\n")
         fh.write(f"function releaseBlocker(t, env){{{body}\n}}\n")
         fh.write(
             "const cases = ["
@@ -1082,12 +1157,18 @@ def test_release_cta_is_blocked_whenever_the_checkout_is_not_github_main() -> No
             "];\n"
             "const open = {verdict:'diverged', stale:false, stale_direction:null,"
         " on_main:true, dirty:false};\n"
-        "const env = {operator_config:{status:'ok'}, bb_token:{present:true}};\n"
+        "const env = {operator_config:{status:'ok'}, bb_token:{present:true},"
+        " powershell:{present:true}, audit:{repo:'/core', queued:false}};\n"
         "process.stdout.write(JSON.stringify({"
             "blocked: cases.map(c => releaseBlocker(c, env) !== null),"
             "open: releaseBlocker(open, env),"
-            "noConfig: releaseBlocker(open, {operator_config:{status:'missing'}, bb_token:{present:true}}),"
-            "noToken: releaseBlocker(open, {operator_config:{status:'ok'}, bb_token:{present:false}})}));\n"
+            "noConfig: releaseBlocker(open, {...env, operator_config:{status:'missing'}}),"
+            "noToken: releaseBlocker(open, {...env, bb_token:{present:false}}),"
+            "noShell: releaseBlocker(open, {...env, powershell:{present:false}}),"
+            "noAudit: releaseBlocker(open, {...env, audit:{repo:null, queued:false}}),"
+            "queued: releaseBlocker(open, {...env, audit:{repo:'/c', queued:true, outbox:'/out'}}),"
+            "badRemote: releaseBlocker({...open, remotes:{ok:false, detail:'origin points at x'}}, env),"
+            "noGate: releaseBlocker({...open, local_check:false}, env)}));\n"
         )
         path = Path(fh.name)
     try:
@@ -1099,9 +1180,14 @@ def test_release_cta_is_blocked_whenever_the_checkout_is_not_github_main() -> No
     assert all(result["blocked"]), result["blocked"]
     # A clean checkout that is genuinely ahead of the nodes must still release.
     assert result["open"] is None
-    # …unless the environment itself cannot run a release at all.
+    # …unless something the console can already see would refuse it anyway.
     assert "operator config" in result["noConfig"]
     assert "BB_TOKEN" in result["noToken"]
+    assert "powershell" in result["noShell"]
+    assert "audit_repo" in result["noAudit"]
+    assert "/out" in result["queued"]
+    assert "origin points at x" in result["badRemote"]
+    assert "local_check.ps1" in result["noGate"]
 
 
 def _run_blockers(run: dict, env: dict | None, tool: dict | None) -> list[dict]:
@@ -1282,12 +1368,21 @@ def test_console_never_writes_a_ledger_or_bypasses_the_engine() -> None:
                         assert "write" not in line and "open(" not in line, (
                             f"{source_file.name} looks like it writes {forbidden}: {line.strip()}"
                         )
-        engine_imports.update(re.findall(r"from (edge_deploy[.\w]*) import", source))
+        for module, names in re.findall(r"from (edge_deploy[.\w]*) import ([^\n(]+|\([^)]*\))", source):
+            for name in names.strip("()").replace("\n", " ").split(","):
+                bare = name.strip().split(" as ")[0].strip()
+                if bare:
+                    engine_imports.add(f"{module}.{bare}")
         engine_imports.update(re.findall(r"^import (edge_deploy[.\w]*)", source, re.M))
+    # Read-only helpers only: config/profile loading, probe endpoints, and the
+    # audit outbox path. Nothing that publishes, deploys, tags, or writes.
     assert engine_imports <= {
-        "edge_deploy",
-        "edge_deploy.config",
-        "edge_deploy.preflight",
+        "edge_deploy.__version__",
+        "edge_deploy.audit.default_outbox",
+        "edge_deploy.config.DEFAULT_OPERATOR_CONFIG_PATH",
+        "edge_deploy.config.load_operator_config",
+        "edge_deploy.config.load_tool_profile",
+        "edge_deploy.preflight.endpoint_from_node",
     }, engine_imports
 
 

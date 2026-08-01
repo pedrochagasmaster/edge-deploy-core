@@ -381,7 +381,10 @@ class ActionRunner:
             self.finished_at = time.time()
             self._append(f"[console] {self.error}\n")
             if self._on_finish:
-                self._on_finish(self)
+                try:
+                    self._on_finish(self)
+                except Exception:  # a cache hook must not break the response
+                    pass
             return
         self.status = "running"
         self._append(f"[console] {self.command}\n[console] cwd {self.cwd}\n\n")
@@ -398,6 +401,9 @@ class ActionRunner:
                 if not chunk:
                     break
                 self._append(self._decoder.decode(chunk))
+            # Flush any partial character left at end of stream rather than
+            # dropping it.
+            self._append(self._decoder.decode(b"", final=True))
         except (OSError, ValueError):
             pass
         code = self._proc.wait() if self._proc else -1
