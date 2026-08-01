@@ -86,10 +86,11 @@ isolated under `%APPDATA%\edge-deploy\training\<tool>\` with both
 same `onboard` command to resume; completed runs refresh the report without
 re-practicing.
 
-Edge Console launches against the training roots (`--root`) for ledger
-rendering and against the selected real tool checkouts
+Edge Console launches `--read-only` against the training roots (`--root`) for
+ledger rendering and against the selected real tool checkouts
 (`--github-write-root`) for GitHub write probes. It shows a **simulated**
-posture rail — do not switch workstation posture for it. Training roots may
+posture rail — do not switch workstation posture for it — and no command
+buttons. Training roots may
 lack git; divergence against them is intentionally soft. The console GitHub
 write indicator is green only when every write-root's authenticated, empty
 `git-receive-pack` POST passes. The probe sends no update commands and changes
@@ -146,6 +147,54 @@ see per-phase state and the exact next command.
 py -m edge_deploy rollback --tag release-<UTC>-<short-sha>
 ```
 
+## Edge Console
+
+A local web console over the same commands
+([ADR-0018](docs/adr/0018-console-orchestrated-release.md)). Launch it from
+this checkout, watching the tool checkouts you release from:
+
+```powershell
+py -m edge_console --root D:\autobench --root D:\robocop
+```
+
+It opens `http://127.0.0.1:7643/` and shows:
+
+- **whatever is open or live**, spotlighted: the run's rail through the five
+  postures, per-node deploy state, live transfer progress, and one button per
+  remaining command — `release --guided`, the next phase on its own, `status`,
+  `abandon`;
+- **a release decision card** for every checkout with no run in flight: the
+  verdict, the deployed / checkout / GitHub-main commits it rests on, a
+  precondition checklist with `git pull` / `git push` / `preflight` /
+  `transport-smoke` buttons, and one "Start guided release" call to action;
+- **closed runs**, in a collapsed history section.
+
+Buttons run the exact command shown beside them, in that checkout, and stream
+the engine's output. When the engine stops for the operator — the RSA passcode,
+a Kerberos password, the guided posture acknowledgement — the console shows the
+prompt and relays your answer. Secrets go straight to the running process and
+are masked in the transcript; they are never stored.
+
+Changing the workstation firewall posture stays manual. The console names the
+posture a phase needs and waits for you to confirm the switch; it never makes
+one.
+
+| Flag | Behavior |
+|------|----------|
+| `--root` | Tool checkout to watch; repeat for several (default: cwd) |
+| `--github-write-root` | Checkout(s) used for GitHub write probes (default: same as `--root`) |
+| `--read-only` | Serve the dashboard with every command button disabled |
+| `--demo` | Fabricated checkouts driven by an offline simulator; no network |
+| `--engine-python` | Interpreter for `python -m edge_deploy` (default: the console's own) |
+| `--port`, `--no-browser` | Listen port (default 7643); skip opening a browser |
+
+`--demo` needs no operator config, network, or credentials, and walks the whole
+guided release including the RSA prompts and the firewall-off boundary:
+
+```powershell
+py -m edge_console --demo
+```
+
 Successful tool releases receive an immutable `release-<UTC>-<short-sha>` tag on
 GitHub and Bitbucket. Redacted release bundles are appended to the Bitbucket-only
 `release-log` branch of this repository.
@@ -163,4 +212,5 @@ ledger and phases), [ADR-0009](docs/adr/0009-on-node-runner-file-evidence.md)
 (five-posture capability model), [ADR-0014](docs/adr/0014-paramiko-release-transport.md)
 (Paramiko as the default release transport),
 [ADR-0017](docs/adr/0017-release-operator-onboarding.md) (Release Operator
-onboarding).
+onboarding), [ADR-0018](docs/adr/0018-console-orchestrated-release.md)
+(console-orchestrated release).

@@ -61,6 +61,11 @@ orphans open Runs, which must be abandoned and recreated.
 walks the Release Operator through every posture switch and RSA prompt instead
 of exiting at each posture boundary.
 
+**Edge Console** is the local web UI over the Run Ledgers of the watched Tool
+checkouts. It runs the engine's own commands on the operator's behalf, streams
+their output, and relays the prompts the engine blocks on — but it holds no
+release logic, never writes a Ledger, and never switches Posture (ADR-0018).
+
 **Authenticated Pane** is the local tmux/psmux session holding an authenticated
 SSH connection to one Edge Node. The pane is a lossy, screen-scraped text
 channel — not a byte pipe — so everything crossing it must be pane-safe.

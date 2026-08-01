@@ -53,9 +53,9 @@ Paths under `%APPDATA%\edge-deploy\`:
 - `config.yaml` — installed operator config (never commit)
 
 Training is not a release: production commands reject training ledgers, and the
-console training rail is labeled simulated. Onboarding launches the console with
-training ledgers on `--root` and selected real tool checkouts on
-`--github-write-root` for write probes. GitHub write aggregate green requires
+console training rail is labeled simulated. Onboarding launches the console
+`--read-only`, with training ledgers on `--root` and selected real tool
+checkouts on `--github-write-root` for write probes. GitHub write aggregate green requires
 every write-root's authenticated, empty `git-receive-pack` POST to pass. The
 probe sends no update commands and changes no refs; **red in `both-vpns` is
 expected and does not fail onboarding**. After onboard completes, the first
@@ -102,8 +102,8 @@ rollout commands, and drift checks. Matching dependency archives already
 present on the node are reused by digest without transferring any bytes; new
 archives stream over SFTP (falling back to a binary exec-channel stream if
 the SFTP subsystem is unavailable) and report live byte progress — MiB sent,
-percent complete, and MiB/s — both on the console and in
-`release-progress.json`, which `edge_console.py` renders as a progress bar.
+percent complete, and MiB/s — both on the terminal and in
+`release-progress.json`, which the Edge Console renders as a progress bar.
 
 `transport: pane` remains an explicit per-node override for recovery when SSH
 access to a node regresses (ADR-0011); selecting it restores the psmux pane
@@ -289,6 +289,40 @@ During deploy, enter the RSA passcode at the interactive prompt when asked (the
 keyboard-interactive SSH prompt for `transport: ssh` nodes, or the controller
 tmux pane for `transport: pane` nodes). The progress heartbeat shows
 `>>> WAITING FOR OPERATOR - …` while waiting.
+
+### Running the release from the Edge Console
+
+Everything above can be driven from the console instead of a terminal
+([ADR-0018](adr/0018-console-orchestrated-release.md)). Launch it from the core
+checkout, pointing at the tool checkouts you want to watch:
+
+```powershell
+py -m edge_console --root D:\autobench --root D:\robocop
+```
+
+Each command in this document is a button that runs that exact command in that
+checkout. The console shows the command next to the button before it runs,
+streams the engine's output live, and surfaces the two moments the engine stops
+for you:
+
+- the **RSA passcode** prompt, as a masked field whose value is written
+  straight to the running process and never stored or logged;
+- the **guided posture boundary**, as the posture name the phase needs plus a
+  single "I have switched" button.
+
+The console cannot change your firewall posture — that stays a manual
+workstation change, exactly as above. It only names the posture the next phase
+needs, shows whether that posture looks held, and forwards your confirmation.
+
+Checkouts with no run in flight get a release decision card: the verdict, the
+three commits it compares (what the nodes hold, what the checkout holds, what
+GitHub main holds), a precondition checklist whose fixable items have their own
+buttons (`git pull`, `git push`, `preflight`, `transport-smoke`), and one
+"Start guided release" button that is disabled with a stated reason when a
+release would fail.
+
+Start it with `--read-only` to get the dashboard with every button disabled;
+the commands stay visible and copyable. Onboarding always launches it that way.
 
 ### 4. Complete
 
