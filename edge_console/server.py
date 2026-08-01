@@ -12,16 +12,18 @@ import argparse
 import json
 import os
 import secrets
+import sys
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from edge_console.actions import ACTION_SPECS, ActionError, ActionRegistry, catalog
-from edge_console.demo import build_demo_checkouts, demo_argv_builder
+from edge_console.demo import DEMO_ENGINE_SHA, build_demo_checkouts, demo_argv_builder
 from edge_console.ledger import collect_runs_multi
 from edge_console.page import PAGE
 from edge_console.probes import PostureProber, ToolsProber
+from edge_console.readiness import ReadinessProber
 
 DEFAULT_PORT = 7643
 MAX_BODY_BYTES = 64 * 1024
@@ -39,6 +41,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
     roots: list[Path]
     prober: PostureProber
     tools_prober: ToolsProber
+    readiness: ReadinessProber
     registry: ActionRegistry | None
     demo: bool
     read_only: bool
@@ -114,7 +117,13 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 }
             )
         elif path == "/api/tools":
-            self._send_json({"demo": self.demo, **self.tools_prober.snapshot()})
+            self._send_json(
+                {
+                    "demo": self.demo,
+                    "environment": self.readiness.snapshot(),
+                    **self.tools_prober.snapshot(),
+                }
+            )
         elif path == "/api/posture":
             self._send_json(self.prober.snapshot())
         elif path == "/api/actions":
@@ -272,6 +281,14 @@ def main(argv: list[str] | None = None) -> int:
     ConsoleHandler.roots = roots
     ConsoleHandler.prober = PostureProber(demo=args.demo, roots=write_roots)
     ConsoleHandler.tools_prober = tools_prober
+    ConsoleHandler.readiness = ReadinessProber(
+        engine_python=args.engine_python or sys.executable,
+        # Actions run inside a watched checkout, so that is where the engine
+        # identity has to be asked for the answer to be the one they will get.
+        probe_root=roots[0] if roots else None,
+        demo=args.demo,
+        demo_engine_sha=DEMO_ENGINE_SHA,
+    )
     ConsoleHandler.registry = registry
     ConsoleHandler.demo = args.demo
     ConsoleHandler.read_only = args.read_only

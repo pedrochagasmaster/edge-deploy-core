@@ -330,6 +330,16 @@ buttons (`git pull`, `git push`, `preflight`, `transport-smoke`), and one
 "Start guided release" button that is disabled with a stated reason when a
 release would fail.
 
+Refusals the console can see coming are stated before you press anything, and
+disable exactly the commands they would stop: a run created by a different
+engine build, a run lock another process holds, a missing or unreadable
+operator config, `BB_TOKEN` absent from the environment the console was started
+in, a checkout that is not on `main` or not clean or has drifted off the run's
+reviewed commit, and nodes in the ledger that are no longer in the operator
+config. `status` is never blocked — it reads local ledgers only, and is the one
+command that still answers when the rest refuse. What the console cannot know
+cheaply, above all GitHub CI state, is left to the engine to report as it runs.
+
 Start it with `--read-only` to get the dashboard with every button disabled;
 the commands stay visible and copyable. Onboarding always launches it that way.
 

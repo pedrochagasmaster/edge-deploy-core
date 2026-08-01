@@ -18,6 +18,9 @@ from edge_console.demo_engine import __file__ as _DEMO_ENGINE_FILE
 from edge_console.ledger import SCHEMA
 
 DEMO_ENGINE_PATH = Path(_DEMO_ENGINE_FILE).resolve()
+# The fabricated engine fingerprint every demo ledger carries, so the console's
+# engine-identity check sees the simulator agreeing with itself.
+DEMO_ENGINE_SHA = "d3m0" + "0" * 60
 
 
 def demo_git(root: Path, *args: str, timeout: float | None = None) -> str | None:
@@ -53,7 +56,7 @@ def build_demo_checkouts() -> list[Path]:
         from edge_deploy import __version__ as engine_version
     except Exception:
         engine_version = "unknown"
-    engine = {"version": engine_version, "package_dir": "(demo)", "content_sha256": "d3m0" + "0" * 60}
+    engine = {"version": engine_version, "package_dir": "(demo)", "content_sha256": DEMO_ENGINE_SHA}
 
     checkouts: dict[str, Path] = {}
     for tool in ("autobench", "robocop"):

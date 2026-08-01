@@ -1,0 +1,152 @@
+"""What will refuse a command before the operator presses the button.
+
+The engine turns a release away for several reasons that are knowable from
+local state: the run was created by a different engine build, another process
+holds the run lock, ``BB_TOKEN`` is not in the environment the console will
+hand to the child, the operator config is missing, or a node in the ledger is
+no longer configured. Every one of those is a refusal the console can show
+instead of letting the operator discover it — sometimes several minutes and a
+posture switch into a guided release.
+
+Nothing here runs a release command or writes anything. The engine identity is
+read by asking the interpreter the console would actually spawn, which is the
+only answer that is true when ``--engine-python`` points somewhere else.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import threading
+import time
+from pathlib import Path
+
+from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, load_operator_config
+
+READINESS_CACHE_SECONDS = 30.0
+IDENTITY_TIMEOUT = 20.0
+BB_TOKEN_ENV = "BB_TOKEN"
+
+# Run *by the child*, so the hash is whatever that interpreter's edge_deploy
+# really is — not whatever the console happens to have imported. Reached
+# through importlib so this stays a string handed to another process rather
+# than an import of engine internals into the console.
+_IDENTITY_SNIPPET = (
+    "import json,importlib;"
+    "print(json.dumps(importlib.import_module('edge_deploy.ledger').engine_identity()))"
+)
+
+
+def probe_engine_identity(engine_python: str, cwd: Path | None = None) -> dict:
+    """The engine a console button would run: version and content hash.
+
+    ``cwd`` matters: ``python -c`` puts the working directory first on the
+    path, and console actions run inside a tool checkout, so that is where the
+    question has to be asked.
+    """
+    try:
+        completed = subprocess.run(
+            [engine_python, "-c", _IDENTITY_SNIPPET],
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            timeout=IDENTITY_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"status": "unknown", "detail": f"could not run {engine_python}: {exc}"}
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip().splitlines()
+        return {
+            "status": "unknown",
+            "detail": detail[-1] if detail else f"exit {completed.returncode}",
+        }
+    try:
+        identity = json.loads(completed.stdout)
+    except ValueError:
+        return {"status": "unknown", "detail": "engine identity was not valid JSON"}
+    return {
+        "status": "ok",
+        "version": identity.get("version"),
+        "content_sha256": identity.get("content_sha256"),
+        "package_dir": identity.get("package_dir"),
+    }
+
+
+def probe_operator_config(path: Path | None = None) -> dict:
+    """Whether the config every engine command needs is there and loadable.
+
+    Only ``status`` and the git actions survive without it; everything else
+    exits 2, and a malformed file is an uncaught traceback.
+    """
+    config_path = Path(path or DEFAULT_OPERATOR_CONFIG_PATH)
+    if not config_path.is_file():
+        return {"status": "missing", "path": str(config_path), "nodes": []}
+    try:
+        operator = load_operator_config(config_path)
+    except Exception as exc:
+        return {
+            "status": "invalid",
+            "path": str(config_path),
+            "detail": f"{type(exc).__name__}: {exc}",
+            "nodes": [],
+        }
+    return {"status": "ok", "path": str(config_path), "nodes": sorted(operator.nodes)}
+
+
+def probe_bb_token() -> dict:
+    """``BB_TOKEN`` is read from the environment the child inherits — ours.
+
+    An operator who exported it in some other shell does not help here, which
+    is exactly why this is worth saying out loud before publish refuses.
+    """
+    return {"present": bool(os.environ.get(BB_TOKEN_ENV))}
+
+
+class ReadinessProber:
+    """Cached view of the preconditions that apply to every watched checkout."""
+
+    def __init__(
+        self,
+        *,
+        engine_python: str,
+        probe_root: Path | None = None,
+        demo: bool = False,
+        demo_engine_sha: str | None = None,
+    ) -> None:
+        self._engine_python = engine_python
+        self._probe_root = probe_root
+        self._demo = demo
+        self._demo_engine_sha = demo_engine_sha
+        self._lock = threading.Lock()
+        self._cached: dict | None = None
+        self._cached_at = 0.0
+
+    def snapshot(self) -> dict:
+        if self._demo:
+            # --demo drives the simulator, not edge_deploy: reporting the real
+            # engine's hash here would mark every fabricated run as orphaned.
+            return {
+                "engine": {
+                    "status": "ok",
+                    "version": "demo",
+                    "content_sha256": self._demo_engine_sha,
+                    "package_dir": "(demo)",
+                },
+                "operator_config": {"status": "ok", "path": "(demo)", "nodes": ["node03", "node04", "node05"]},
+                "bb_token": {"present": True},
+                "engine_python": "(demo simulator)",
+            }
+        with self._lock:
+            if self._cached and time.monotonic() - self._cached_at < READINESS_CACHE_SECONDS:
+                return self._cached
+        result = {
+            "engine": probe_engine_identity(self._engine_python, cwd=self._probe_root),
+            "operator_config": probe_operator_config(),
+            "bb_token": probe_bb_token(),
+            "engine_python": self._engine_python,
+        }
+        with self._lock:
+            self._cached = result
+            self._cached_at = time.monotonic()
+        return result

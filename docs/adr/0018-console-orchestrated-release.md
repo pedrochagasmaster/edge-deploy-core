@@ -103,7 +103,26 @@ engine says while they run.** It gains no release logic of its own.
    stated reason when a release would fail. Closed runs move to a collapsed
    history section.
 
-9. **`--demo` drives an offline simulator.** `edge_console.demo_engine`
+9. **A refusal the console can predict is shown, not discovered.** The engine
+   turns commands away for several reasons that are already on disk or in the
+   console's own environment: the run was created by a different engine build
+   (Engine Identity, ADR-0008), another process holds the run lock, the
+   operator config is missing or unreadable, `BB_TOKEN` is absent from the
+   environment the child will inherit, the checkout is not on `main`, is not
+   clean, or has drifted off the run's reviewed commit, or a node in the
+   ledger is no longer in the operator config. Each of those is stated before
+   the button is pressed and disables exactly the actions it would refuse —
+   never `status`, which reads local ledgers only and is the one command that
+   still works when everything else does not. This matters most in a guided
+   release, where a refusal the console could have predicted otherwise arrives
+   several phases and a manual posture switch later.
+
+   What the console cannot predict cheaply and honestly is left to the
+   streamed refusal: GitHub CI state (needs `gh` and the network, and goes
+   stale between the probe and the click), Bitbucket remote state, and
+   anything the phase exists to attempt.
+
+10. **`--demo` drives an offline simulator.** `edge_console.demo_engine`
    produces the same output shapes and the same operator gates as the real
    engine against fabricated checkouts, so the orchestration path is
    exercisable — and reviewable — with no Bitbucket, Edge, SSH, Kerberos, or
@@ -139,6 +158,22 @@ engine says while they run.** It gains no release logic of its own.
   action, and `transport: pane` nodes take their RSA passcode in the attached
   pane rather than on the engine's stdout, so the console can only show that
   it is waiting.
+- The console will not steal a run lock: `--force-lock` is deliberately not in
+  the allowlist, because a lock held by a live process should take a
+  deliberate decision and a typed command. To keep that from being a trap,
+  stopping a command closes the child's stdin and waits before terminating, so
+  the engine takes its own unwind path and releases the lock. A lock left by a
+  process that died some other way still needs a terminal, and the console
+  says so.
+- The child inherits the console process's environment, so `BB_TOKEN` has to
+  be set in the shell that starts the console — exporting it later, or in
+  another window, does not reach the buttons. The console reports its absence
+  rather than letting publish discover it.
+- Which engine a button runs is `--engine-python` (default: the console's own
+  interpreter), resolved in the watched checkout. If that is not the engine the
+  operator would get in their own terminal, runs created from one side are
+  refused by the other on Engine Identity. The console reads the identity from
+  the interpreter it will actually spawn and compares it to every open run.
 
 ## Considered options
 

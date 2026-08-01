@@ -65,6 +65,12 @@ from edge_console.probes import (
     probe_github_write,
     probe_tool,
 )
+from edge_console.readiness import (
+    ReadinessProber,
+    probe_bb_token,
+    probe_engine_identity,
+    probe_operator_config,
+)
 from edge_console.server import (
     ConsoleHandler,
     build_arg_parser,
@@ -82,6 +88,7 @@ __all__ = [
     "GITHUB_WRITE_STATUSES",
     "PAGE",
     "PostureProber",
+    "ReadinessProber",
     "SCHEMA",
     "ThreadingHTTPServer",
     "ToolsProber",
@@ -97,8 +104,11 @@ __all__ = [
     "find_run_state",
     "is_training_state",
     "main",
+    "probe_bb_token",
     "probe_divergence",
+    "probe_engine_identity",
     "probe_github_write",
+    "probe_operator_config",
     "probe_tool",
     "resolve_console_roots",
 ]

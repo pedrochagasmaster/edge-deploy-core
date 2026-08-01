@@ -178,7 +178,19 @@ are masked in the transcript; they are never stored.
 Two cases still need a terminal: a deep-smoke release (`--smoke deep`, the only
 thing that asks for a Kerberos password) has no console action, and a node
 configured `transport: pane` takes its RSA passcode in the attached tmux pane,
-so the console can only show that it is waiting.
+so the console can only show that it is waiting. Releasing a run whose lock was
+left behind by a dead process also needs a terminal — the console will not
+steal a lock.
+
+**Start the console from a shell that has `BB_TOKEN` set.** Every command
+inherits the console process's environment, so exporting it later, or in
+another window, does not reach the buttons; the console says so rather than
+letting publish discover it. The same applies to the interpreter: buttons run
+`--engine-python` (default: the console's own), and if that is not the engine
+you would get in your own terminal, runs created from one side are refused by
+the other on Engine Identity ([ADR-0008](docs/adr/0008-run-ledger-and-posture-phases.md)).
+The console reads the identity from the interpreter it will actually spawn and
+flags any open run that does not match.
 
 Changing the workstation firewall posture stays manual. The console names the
 posture a phase needs and waits for you to confirm the switch; it never makes

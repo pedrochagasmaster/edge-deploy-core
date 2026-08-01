@@ -44,6 +44,12 @@ from edge_console.actions import (  # noqa: E402
 )
 from edge_console.demo import DEMO_ENGINE_PATH  # noqa: E402
 from edge_console.probes import _tool_name  # noqa: E402
+from edge_console.readiness import (  # noqa: E402
+    ReadinessProber,
+    probe_bb_token,
+    probe_engine_identity,
+    probe_operator_config,
+)
 
 _SCHEMA = SCHEMA
 _SPEC_PARAMS = {
@@ -128,6 +134,10 @@ def _serve(
     handler.roots = roots
     handler.prober = PostureProber(demo=False, roots=write_roots or roots)
     handler.tools_prober = ToolsProber(roots, demo=False)
+    # demo=True keeps the readiness probe from shelling out during tests.
+    handler.readiness = ReadinessProber(
+        engine_python=sys.executable, demo=True, demo_engine_sha="d" * 64
+    )
     handler.registry = registry
     handler.demo = False
     handler.read_only = read_only
@@ -608,7 +618,7 @@ def test_run_action_payloads_carry_the_runs_own_checkout() -> None:
     any root it does not watch, so a multi-root console can never run one
     tool's command inside another tool's checkout."""
     script = _page_script_through_run_html()
-    body = script.split("function runActions(run){", 1)[1].split("\n}\n", 1)[0]
+    body = script.split("function runActions(run, blockers){", 1)[1].split("\n}\n", 1)[0]
     assert "const id = st.run_id, root = run.root" in body
     for payload in ("action:\"release\", root, run_id:id", "action:\"abandon\", root, run_id:id"):
         assert payload in body, payload
@@ -1054,9 +1064,9 @@ def test_release_cta_is_blocked_whenever_the_checkout_is_not_github_main() -> No
     even created — so every stale direction blocks, not only the two that also
     lack CI."""
     script = PAGE.split("<script>", 1)[1].split("</script>", 1)[0]
-    body = script.split("function releaseBlocker(t){", 1)[1].split("\n}\n", 1)[0]
+    body = script.split("function releaseBlocker(t, env){", 1)[1].split("\n}\n", 1)[0]
     with tempfile.NamedTemporaryFile("w", suffix=".mjs", encoding="utf-8", delete=False) as fh:
-        fh.write(f"function releaseBlocker(t){{{body}\n}}\n")
+        fh.write(f"function releaseBlocker(t, env){{{body}\n}}\n")
         fh.write(
             "const cases = ["
             '  {verdict:"diverged", stale:false, on_main:false, branch:"feature/x"},'
@@ -1072,9 +1082,12 @@ def test_release_cta_is_blocked_whenever_the_checkout_is_not_github_main() -> No
             "];\n"
             "const open = {verdict:'diverged', stale:false, stale_direction:null,"
         " on_main:true, dirty:false};\n"
-            "process.stdout.write(JSON.stringify({"
-            "blocked: cases.map(c => releaseBlocker(c) !== null),"
-            "open: releaseBlocker(open)}));\n"
+        "const env = {operator_config:{status:'ok'}, bb_token:{present:true}};\n"
+        "process.stdout.write(JSON.stringify({"
+            "blocked: cases.map(c => releaseBlocker(c, env) !== null),"
+            "open: releaseBlocker(open, env),"
+            "noConfig: releaseBlocker(open, {operator_config:{status:'missing'}, bb_token:{present:true}}),"
+            "noToken: releaseBlocker(open, {operator_config:{status:'ok'}, bb_token:{present:false}})}));\n"
         )
         path = Path(fh.name)
     try:
@@ -1086,6 +1099,169 @@ def test_release_cta_is_blocked_whenever_the_checkout_is_not_github_main() -> No
     assert all(result["blocked"]), result["blocked"]
     # A clean checkout that is genuinely ahead of the nodes must still release.
     assert result["open"] is None
+    # …unless the environment itself cannot run a release at all.
+    assert "operator config" in result["noConfig"]
+    assert "BB_TOKEN" in result["noToken"]
+
+
+def _run_blockers(run: dict, env: dict | None, tool: dict | None) -> list[dict]:
+    """Evaluate the page's runBlockers() in Node against explicit inputs."""
+    script = _page_script_through_run_html()
+    with tempfile.NamedTemporaryFile("w", suffix=".mjs", encoding="utf-8", delete=False) as fh:
+        fh.write(script)
+        fh.write("\nprocess.stdout.write(JSON.stringify(runBlockers(")
+        fh.write(f"{json.dumps(run)},{json.dumps(env)},{json.dumps(tool)}")
+        fh.write(")));\n")
+        path = Path(fh.name)
+    try:
+        completed = subprocess.run(["node", str(path)], check=False, capture_output=True, text=True)
+    finally:
+        path.unlink(missing_ok=True)
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout)
+
+
+_OK_ENV = {
+    "engine": {"status": "ok", "content_sha256": "e" * 64, "version": "1.5.4"},
+    "operator_config": {"status": "ok", "path": "/cfg.yaml", "nodes": ["node03"]},
+    "bb_token": {"present": True},
+}
+
+
+def _open_run(**engine) -> dict:
+    run = _sample_run(kind="release", training=None, status="open", phases=_pending_phases())
+    run["state"]["engine"] = {"version": "1.5.4", "package_dir": "(t)", "content_sha256": "e" * 64, **engine}
+    return run
+
+
+def test_run_blockers_catch_the_refusals_the_engine_would_produce() -> None:
+    """Each of these makes a button a guaranteed failure, and in a guided
+    release the refusal can arrive several phases and a posture switch later."""
+    clean = _run_blockers(_open_run(), _OK_ENV, {"root": "/tmp/training/autobench", "on_main": True,
+                                                 "dirty": False, "head": "a" * 40})
+    assert clean == [], clean
+
+    # Engine identity: the run belongs to a different engine build.
+    mismatch = _run_blockers(_open_run(content_sha256="f" * 64), _OK_ENV, None)
+    assert len(mismatch) == 1
+    assert "different engine build" in mismatch[0]["text"]
+    assert mismatch[0]["short"] == "engine mismatch"
+    # Abandon is the documented escape hatch and does not check engine identity.
+    assert "abandon" not in mismatch[0]["blocks"]
+
+    # A held lock stops everything, abandon included.
+    locked = _open_run()
+    locked["lock"] = {"pid": 4242, "hostname": "OTHERHOST", "acquired_at": "2026-07-10T00:00:00+00:00"}
+    held = _run_blockers(locked, _OK_ENV, None)
+    assert held[0]["blocks"] == [
+        "release", "verify", "publish", "deploy", "tag_bitbucket", "tag_github", "abandon"
+    ]
+    assert "--force-lock" in held[0]["text"]
+
+    no_config = {**_OK_ENV, "operator_config": {"status": "missing", "path": "/x"}}
+    missing_config = _run_blockers(_open_run(), no_config, None)
+    assert "No operator config" in missing_config[0]["text"]
+
+    no_token = _run_blockers(_open_run(), {**_OK_ENV, "bb_token": {"present": False}}, None)
+    assert no_token[0]["blocks"] == ["release", "publish", "tag_bitbucket"]
+    assert "restart the console" in no_token[0]["text"]
+
+    unknown_node = _run_blockers(
+        _open_run(), {**_OK_ENV, "operator_config": {"status": "ok", "path": "/c", "nodes": ["node99"]}}, None
+    )
+    assert "node03" in unknown_node[0]["text"]
+    assert unknown_node[0]["blocks"] == ["release", "deploy"]
+
+
+def test_run_blockers_carry_the_checkout_gate_onto_open_runs() -> None:
+    """The decision card is hidden while a run is open, so the branch, tree and
+    source-drift gates have to reach the run card too — verify re-inspects the
+    repository until it has passed."""
+    run = _open_run()
+    source = run["state"]["source_sha"]
+
+    for tool, expected in (
+        ({"on_main": False, "branch": "feature/x", "dirty": False, "head": source}, "not on main"),
+        ({"on_main": True, "branch": "main", "dirty": True, "head": source}, "tree not clean"),
+        ({"on_main": True, "branch": "main", "dirty": False, "head": "b" * 40}, "checkout drift"),
+    ):
+        blockers = _run_blockers(run, _OK_ENV, tool)
+        assert [b["short"] for b in blockers] == [expected], (tool, blockers)
+        assert blockers[0]["blocks"] == ["release", "verify"]
+
+    # Once verify has passed the engine reuses its evidence, so these stop applying.
+    passed = _open_run()
+    passed["state"]["phases"]["verify"] = {"state": "passed", "updated_at": None, "evidence": {}}
+    drifted = {"on_main": False, "branch": "feature/x", "dirty": True, "head": "b" * 40}
+    assert _run_blockers(passed, _OK_ENV, drifted) == []
+
+
+def test_engine_identity_is_read_from_the_interpreter_that_will_run_the_command() -> None:
+    """--engine-python can point at another interpreter, so importing the hash
+    in this process would answer a question nobody asked."""
+    identity = probe_engine_identity(sys.executable)
+    assert identity["status"] == "ok"
+    assert len(identity["content_sha256"]) == 64
+    from edge_deploy.ledger import engine_identity
+
+    assert identity["content_sha256"] == engine_identity()["content_sha256"]
+
+    broken = probe_engine_identity("/nonexistent/python")
+    assert broken["status"] == "unknown"
+    assert "detail" in broken
+
+
+def test_operator_config_and_bb_token_are_reported_honestly(tmp_path, monkeypatch) -> None:
+    missing = probe_operator_config(tmp_path / "nope.yaml")
+    assert missing["status"] == "missing" and missing["nodes"] == []
+
+    broken = tmp_path / "bad.yaml"
+    broken.write_text("- just\n- a list\n", encoding="utf-8")
+    invalid = probe_operator_config(broken)
+    assert invalid["status"] == "invalid"
+    assert invalid["detail"]
+
+    good = tmp_path / "config.yaml"
+    good.write_text(
+        "operator_email: op@example.com\n"
+        "audit_repo: /tmp/core\n"
+        "nodes:\n"
+        "  node03:\n"
+        "    host: op@edge-03.example\n"
+        "    session: edge-node03\n",
+        encoding="utf-8",
+    )
+    loaded = probe_operator_config(good)
+    assert loaded["status"] == "ok"
+    assert loaded["nodes"] == ["node03"]
+
+    monkeypatch.delenv("BB_TOKEN", raising=False)
+    assert probe_bb_token() == {"present": False}
+    monkeypatch.setenv("BB_TOKEN", "x")
+    assert probe_bb_token() == {"present": True}
+
+
+def test_stopping_a_command_lets_the_engine_unwind_before_it_is_terminated(tmp_path) -> None:
+    """Terminating outright strands the run lock, and no console action can
+    pass --force-lock. Closing stdin turns a pending prompt into the EOF the
+    engine already unwinds cleanly."""
+    root = _checkout(tmp_path)
+    script = (
+        "import sys\n"
+        "try:\n"
+        "    input('Switch firewall posture to [firewall-off], then press Enter to continue...')\n"
+        "except EOFError:\n"
+        "    print('Paused at posture boundary.')\n"
+        "    raise SystemExit(0)\n"
+    )
+    registry = _registry([root], script=script)
+    runner = registry.start({"action": "status", "root": str(root)})
+    _await(lambda: runner.snapshot()["prompt"], what="the posture prompt")
+    runner.cancel()
+    _await(lambda: runner.snapshot()["status"] == "exited", what="the command to stop")
+    payload = runner.output(0)
+    assert "Paused at posture boundary." in payload["text"]
+    assert payload["exit_code"] == 0, "a graceful stop must not look like a crash"
 
 
 def test_console_never_writes_a_ledger_or_bypasses_the_engine() -> None:

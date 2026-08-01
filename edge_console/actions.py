@@ -50,6 +50,9 @@ _TRAILING_QUESTION_RE = re.compile(r"(?P<question>[^\n]{1,200}[:?])\s*$")
 # recognised immediately; this is the safety net so an unrecognised prompt can
 # never silently hang the run.
 IDLE_PROMPT_SECONDS = 2.5
+# How long a stopped command gets to unwind on its own before it is terminated,
+# and again before it is killed.
+GRACEFUL_STOP_SECONDS = 5.0
 OUTPUT_LIMIT_CHARS = 400_000
 RETAINED_FINISHED_ACTIONS = 30
 
@@ -420,6 +423,14 @@ class ActionRunner:
                 pass
 
     def cancel(self) -> None:
+        """Stop the command, giving the engine a chance to unwind first.
+
+        Terminating outright leaves the run lock behind, and no console action
+        can pass ``--force-lock`` — so a stopped run would need a terminal to
+        rescue. Closing stdin first turns a pending prompt into the EOF the
+        engine already handles: the guided loop prints its resume command and
+        releases the lock on the way out.
+        """
         proc = self._proc
         if proc is None:
             # Still inside Popen; start() terminates it as soon as it exists.
@@ -427,9 +438,30 @@ class ActionRunner:
             return
         if proc.poll() is not None:
             return
-        self._append("\n[console] cancelled by operator\n")
+        self._append("\n[console] stopping — letting the engine unwind\n")
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except OSError:
+            pass
+        threading.Thread(target=self._escalate, args=(proc,), daemon=True).start()
+
+    def _escalate(self, proc: subprocess.Popen) -> None:
+        try:
+            proc.wait(timeout=GRACEFUL_STOP_SECONDS)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        self._append("[console] cancelled by operator\n")
         try:
             proc.terminate()
+            proc.wait(timeout=GRACEFUL_STOP_SECONDS)
+        except subprocess.TimeoutExpired:
+            self._append("[console] the command ignored terminate; killing it\n")
+            try:
+                proc.kill()
+            except OSError:
+                pass
         except OSError:
             pass
 

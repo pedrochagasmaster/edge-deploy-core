@@ -160,6 +160,14 @@ header{border-bottom:1px solid var(--line);background:var(--panel);position:stic
 .transfer-fill{height:100%;background:var(--edge);transition:width .3s linear}
 .transfer-stats{flex:none;color:var(--faint)}
 
+/* ---------- refusals the console can see coming ---------- */
+.blockers{list-style:none;margin:0;padding:10px 16px 4px;border-top:1px solid var(--line);background:rgba(226,104,92,.05)}
+.blockers li{display:flex;gap:9px;align-items:flex-start;padding:4px 0;font-size:12.5px;color:var(--dim)}
+.blockers li::before{content:"!";color:var(--fail);font-weight:700;flex:none;width:12px;text-align:center}
+.blockers li b{color:var(--ink);font-weight:600}
+.blockers li code{font-family:var(--mono);font-size:11px;color:var(--faint)}
+.actside .blocked-why{font-size:10px;color:var(--fail);max-width:22ch;text-align:right;line-height:1.35}
+
 /* ---------- action rows: every command is a button ---------- */
 .actions{border-top:1px solid var(--line)}
 .act{display:flex;gap:12px;align-items:flex-start;padding:11px 16px;border-bottom:1px solid rgba(42,52,64,.55)}
@@ -403,6 +411,8 @@ const RAIL = [
 let tcpCaps = null;        // latest bitbucket/edge TCP inference
 let githubWriteAgg = null; // github write aggregate from /api/posture
 let readOnly = false;      // --read-only, from /api/runs
+let runsData = null;       // /api/runs
+let toolsData = null;      // /api/tools, including the environment block
 
 function esc(s){
   return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -496,7 +506,7 @@ function actionRow(a){
   const cap = a.cap || "any";
   const needText = cap === "any" ? "any posture" : `needs ${REQ_POSTURE[cap]}`;
   const cls = ["act", a.primary ? "primary" : "", a.danger ? "danger" : ""].filter(Boolean).join(" ");
-  const disabled = readOnly || a.disabled;
+  const disabled = readOnly || a.disabled || !!a.blockedBy;
   const btnCls = ["run", a.primary ? "primary" : "", a.primary ? "big" : "", a.danger ? "danger" : ""].filter(Boolean).join(" ");
   const why = a.why ? `<div class="ctawhy">${a.why}</div>` : "";
   return `<div class="${cls}">
@@ -511,15 +521,98 @@ function actionRow(a){
     </div>
     <div class="actside">
       <span class="need ${cap}">${esc(needText)}</span>
-      ${readinessHtml(cap)}
+      ${a.blockedBy ? `<span class="blocked-why">${esc(a.blockedBy)}</span>` : readinessHtml(cap)}
     </div>
   </div>`;
 }
 
-function runActions(run){
+/* ---------- refusals the console can see coming ---------- */
+// The engine turns a command away for several reasons that are already on
+// disk or in this process's environment. Showing them here costs nothing and
+// saves the operator a refusal that, in a guided release, can arrive several
+// phases and a posture switch later.
+const ALL_RUN_ACTIONS = ["release","verify","publish","deploy","tag_bitbucket","tag_github","abandon"];
+const PHASE_ACTION_IDS = ["release","verify","publish","deploy","tag_bitbucket","tag_github"];
+
+function environment(){
+  return (toolsData && toolsData.environment) || null;
+}
+function toolFor(root){
+  return ((toolsData && toolsData.tools) || []).find(t => t.root === root) || null;
+}
+
+function runBlockers(run, env, tool){
+  const st = run.state, out = [];
+  if(run.lock)
+    out.push({blocks: ALL_RUN_ACTIONS, short: "run is locked",
+      text: `<b>Another process holds this run's lock</b> (pid ${esc(run.lock.pid)} on ${esc(run.lock.hostname)}).
+        Every phase refuses, and so does abandon. If that process is gone, release it from a terminal with
+        <code>--force-lock</code> — the console deliberately cannot steal a lock.`});
+
+  const runSha = st.engine && st.engine.content_sha256;
+  const live = env && env.engine;
+  if(runSha && live && live.status === "ok" && live.content_sha256 && runSha !== live.content_sha256)
+    out.push({blocks: PHASE_ACTION_IDS, short: "engine mismatch",
+      text: `<b>This run belongs to a different engine build.</b> It was created by
+        <code>${esc(runSha.slice(0,8))}</code> and the console would run <code>${esc(live.content_sha256.slice(0,8))}</code>.
+        Every phase refuses on Engine Identity: finish it with the engine that created it, or abandon it.`});
+
+  const config = env && env.operator_config;
+  if(config && config.status === "missing")
+    out.push({blocks: ALL_RUN_ACTIONS, short: "no operator config",
+      text: `<b>No operator config at <code>${esc(config.path)}</code>.</b> Every engine command exits
+        immediately without it.`});
+  else if(config && config.status === "invalid")
+    out.push({blocks: ALL_RUN_ACTIONS, short: "operator config invalid",
+      text: `<b>The operator config could not be read.</b> ${esc(config.detail || "")}`});
+
+  if(env && env.bb_token && env.bb_token.present === false)
+    out.push({blocks: ["release","publish","tag_bitbucket"], short: "no BB_TOKEN",
+      text: `<b><code>BB_TOKEN</code> is not set in this console's environment</b>, which is the environment
+        every command inherits. Publish and tag-bitbucket refuse. Setting it in another shell will not help —
+        restart the console from a shell that has it.`});
+
+  // The checkout gates only bite while verify is still unsatisfied; after that
+  // the engine reuses the ledger's evidence instead of re-inspecting.
+  if(tool && !phasePassed(run, "verify")){
+    if(tool.on_main === false)
+      out.push({blocks: ["release","verify"], short: "not on main",
+        text: `<b>The checkout is on ${esc(tool.branch)}, not main.</b> Verify re-inspects the repository and refuses.`});
+    else if(tool.dirty === true)
+      out.push({blocks: ["release","verify"], short: "tree not clean",
+        text: `<b>The checkout has uncommitted changes.</b> Verify requires a clean working tree.`});
+    else if(tool.head && st.kind === "release" && tool.head !== st.source_sha)
+      out.push({blocks: ["release","verify"], short: "checkout drift",
+        text: `<b>The checkout has moved off this run's source.</b> The run expects
+          <code>${esc(st.source_sha.slice(0,7))}</code> and the checkout is at <code>${esc(tool.head.slice(0,7))}</code>.
+          Switch the checkout back to the reviewed commit, or abandon the run.`});
+  }
+
+  const configured = config && config.nodes;
+  if(configured && configured.length){
+    const missing = Object.keys(st.phases.deploy || {}).filter(n => !configured.includes(n));
+    if(missing.length)
+      out.push({blocks: ["release","deploy"], short: "unknown node",
+        text: `<b>${esc(missing.join(", "))} ${missing.length === 1 ? "is" : "are"} no longer in the operator config.</b>
+          Deploy resolves node names against it and stops on the first one it does not know.`});
+  }
+  return out;
+}
+
+function blockersHtml(blockers){
+  if(!blockers.length) return "";
+  return `<ul class="blockers" role="status">` +
+    blockers.map(b => `<li>${b.text}</li>`).join("") + `</ul>`;
+}
+
+function runActions(run, blockers){
   const st = run.state;
   if(isTrainingRun(st) || st.status !== "open") return [];
   const id = st.run_id, root = run.root, next = nextPhase(run);
+  const blocked = action => {
+    const hit = (blockers || []).filter(b => b.blocks.includes(action));
+    return hit.length ? hit.map(b => b.short).join(" · ") : null;
+  };
   const rows = [];
   rows.push({
     label: "▶ Resume guided release",
@@ -528,6 +621,7 @@ function runActions(run){
     text: "Run every remaining phase in one go. It stops here for each RSA passcode and each posture boundary, and you answer without leaving this page.",
     cmd: `py -m edge_deploy release --guided --run ${id}`,
     payload: {action:"release", root, run_id:id},
+    blockedBy: blocked("release"),
   });
   if(next){
     const cap = PHASE_REQ[next];
@@ -539,8 +633,11 @@ function runActions(run){
       payload: next === "deploy"
         ? {action:"deploy", root, run_id:id, nodes:pendingNodes(run)}
         : {action:PHASE_ACTION[next], root, run_id:id},
+      blockedBy: blocked(PHASE_ACTION[next]),
     });
   }
+  // status reads local ledgers only: no config, no lock, no engine identity.
+  // It is the one command that still works when everything else refuses.
   rows.push({
     label: "Engine status",
     cap: "any",
@@ -556,6 +653,7 @@ function runActions(run){
     cmd: `py -m edge_deploy abandon --run ${id} --reason "<why>"`,
     payload: {action:"abandon", root, run_id:id},
     confirm: "reason",
+    blockedBy: blocked("abandon"),
   });
   return rows;
 }
@@ -739,8 +837,10 @@ function runHtml(run, opts){
       <code>${esc(guidance)}</code>
     </div>`;
   } else if(st.status === "open"){
-    const rows = runActions(run);
-    tail = rows.length ? `<div class="actions">${rows.map(actionRow).join("")}</div>` : "";
+    const blockers = runBlockers(run, environment(), toolFor(run.root));
+    const rows = runActions(run, blockers);
+    tail = blockersHtml(blockers) +
+      (rows.length ? `<div class="actions">${rows.map(actionRow).join("")}</div>` : "");
   } else if(st.status === "abandoned"){
     tail = `<div class="done-line abandoned">abandoned — ${esc(st.abandon_reason || "no reason recorded")}</div>`;
   } else if(training){
@@ -952,7 +1052,14 @@ function checklistHtml(t, blocker){
 // The engine's own gate is exact equality: inspect_repository refuses unless
 // HEAD == origin/main, before a run is even created. So every kind of stale
 // checkout blocks, not just the two that also lack CI.
-function releaseBlocker(t){
+function releaseBlocker(t, env){
+  const config = env && env.operator_config;
+  if(config && config.status === "missing")
+    return "There is no operator config, so no engine command can run.";
+  if(config && config.status === "invalid")
+    return "The operator config cannot be read, so no engine command can run.";
+  if(env && env.bb_token && env.bb_token.present === false)
+    return "BB_TOKEN is not in this console's environment, so the release would refuse at publish.";
   if(t.verdict === "unknown") return "This checkout has no readable git state.";
   // inspect_repository checks the branch and the working tree before it looks
   // at any SHA, so a feature branch sitting exactly on origin/main compares as
@@ -990,7 +1097,7 @@ function decisionHtml(t){
 
   const suggest = ["diverged", "checkout_stale", "never_released"].includes(t.verdict);
   const headline = headlineFor(t);
-  const blocker = releaseBlocker(t);
+  const blocker = releaseBlocker(t, environment());
   // aria-describedby, not just proximity: a disabled button announces nothing
   // about why it is disabled unless the reason is wired to it.
   const whyId = `why-${t.tool.replace(/[^a-z0-9_-]/gi, "")}`;
@@ -1307,8 +1414,6 @@ function filterBarHtml(allRuns){
 }
 
 /* ---------- render ---------- */
-let runsData = null, toolsData = null;
-
 function renderBanners(){
   const parts = [];
   if(runsData && runsData.demo)
@@ -1317,6 +1422,24 @@ function renderBanners(){
   if(readOnly)
     parts.push(`<div class="banner readonly"><b>READ-ONLY</b> — this console was started with
       <code>--read-only</code>, so every command button is disabled. Copy the commands and run them in a terminal.</div>`);
+
+  // Conditions that refuse every command, whichever checkout it runs in.
+  const env = environment();
+  const config = env && env.operator_config;
+  if(config && config.status === "missing")
+    parts.push(`<div class="banner offline"><b>No operator config</b> at <code>${esc(config.path)}</code> —
+      every engine command exits immediately. Only <code>status</code> and the git buttons work without it.</div>`);
+  else if(config && config.status === "invalid")
+    parts.push(`<div class="banner offline"><b>The operator config could not be read</b>
+      (<code>${esc(config.path)}</code>): ${esc(config.detail || "")}</div>`);
+  if(env && env.bb_token && env.bb_token.present === false)
+    parts.push(`<div class="banner demo"><b><code>BB_TOKEN</code> is not set</b> in the environment this console
+      was started from, and that is the environment every command inherits. Publish and tag-bitbucket will refuse.
+      Exporting it elsewhere will not reach these buttons — restart the console from a shell that has it.</div>`);
+  if(env && env.engine && env.engine.status === "unknown")
+    parts.push(`<div class="banner offline"><b>The release engine could not be identified</b>
+      (${esc(env.engine.detail || "")}). Commands may not run at all; check
+      <code>--engine-python</code>.</div>`);
   document.getElementById("banners").innerHTML = parts.join("");
 }
 
@@ -1405,7 +1528,8 @@ async function pollTools(){
     const data = await res.json();
     const raw = JSON.stringify(data);
     toolsData = data;
-    if(raw !== lastTools){ lastTools = raw; renderStage(); }
+    // The environment block rides along here, and the banners depend on it.
+    if(raw !== lastTools){ lastTools = raw; renderBanners(); renderStage(); renderHistory(); }
   }catch(_e){ /* keep last render */ }
 }
 
