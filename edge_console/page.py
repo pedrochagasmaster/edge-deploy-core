@@ -234,7 +234,11 @@ button.copy:focus-visible{outline:2px solid var(--gh);outline-offset:2px}
 /* ---------- prompt dock ---------- */
 .prompt{border-top:1px solid var(--line);padding:13px 16px 15px;background:rgba(216,163,90,.06)}
 .prompt.secret{background:rgba(126,224,165,.06)}
-.prompt.posture{background:repeating-linear-gradient(135deg,rgba(67,55,31,.5) 0 8px,rgba(27,23,18,.5) 8px 16px)}
+/* The hazard stripes mark the one hard posture wall, but they must not cost
+   the operator any legibility: they sit as a low-alpha layer over the panel. */
+.prompt.posture{background-color:var(--sunk);background-image:repeating-linear-gradient(135deg,rgba(216,163,90,.11) 0 8px,rgba(216,163,90,0) 8px 16px)}
+.prompt.posture .pdetail{color:var(--ink)}
+.prompt.posture .psafe{color:var(--dim)}
 .ptitle{font-size:14px;font-weight:600;color:var(--ink);display:flex;gap:9px;align-items:center;flex-wrap:wrap}
 .ptitle .bell{font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--warn);border:1px solid var(--warn);border-radius:3px;padding:1px 6px;font-weight:600}
 .prompt.secret .ptitle .bell{color:var(--go);border-color:var(--go)}
@@ -243,8 +247,8 @@ button.copy:focus-visible{outline:2px solid var(--gh);outline-offset:2px}
 .pform{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-top:10px}
 .pform input{font-family:var(--mono);font-size:14px;letter-spacing:.18em;background:var(--void);border:1px solid var(--faint);border-radius:6px;color:var(--ink);padding:8px 12px;flex:0 1 260px}
 .pform input:focus{outline:2px solid var(--go);outline-offset:1px;border-color:var(--go)}
-.psafe{font-size:11px;color:var(--faint);margin-top:8px}
-.psafe b{color:var(--dim)}
+.psafe{font-size:11px;color:var(--dim);margin-top:8px}
+.psafe b{color:var(--ink);font-weight:600}
 
 /* ---------- history ---------- */
 details.history{margin-top:30px;border:1px solid var(--line);border-radius:9px;background:rgba(26,34,43,.5)}
