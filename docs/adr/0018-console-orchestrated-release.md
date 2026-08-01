@@ -126,8 +126,40 @@ engine says while they run.** It gains no release logic of its own.
   supported path — nothing about the engine, the ledger, or the phase
   contracts changed.
 - The console can hold a secret in flight. It is written to one child process
-  and dropped; it is not stored, and Plan 010's transient-secret redaction
-  registry now has a second caller to cover.
+  and dropped, and masked in the transcript by a private list of submitted
+  values. That list is a local mechanism, not the shared redaction registry
+  Plan 010 still proposes; when Plan 010 lands it should absorb it.
+- `edge_deploy/onboarding/runner.py` had to change, because it launched the
+  console by path. Any edit under `edge_deploy/` changes the Engine Identity
+  hash, so open Runs created by the previous engine must be finished with it
+  or abandoned before upgrading. This is the standing rule for engine
+  changes (ADR-0008), not a new exception.
+- Two operator paths still need a terminal: a deep-smoke release
+  (`--smoke deep`, which is what triggers the Kerberos prompt) has no console
+  action, and `transport: pane` nodes take their RSA passcode in the attached
+  pane rather than on the engine's stdout, so the console can only show that
+  it is waiting.
+
+## Considered options
+
+**Server-sent events or a WebSocket instead of long polling.** Both are a
+better fit for a stream, and both are more code than the stdlib
+`ThreadingHTTPServer` wants to carry. A byte cursor over plain GET gave the
+one property that mattered more than elegance: a reload, or a second tab, can
+re-attach to a running command and its pending prompt by asking for everything
+after byte N. That is the same reconnect story an SSE `Last-Event-ID` would
+have bought, without a framing layer.
+
+**Importing the engine and calling the phase functions in-process.** Rejected
+twice over. It would put console code in the same process as the run — the
+thing Engine Identity exists to keep separate — and it would make the console
+a second implementation of the phase sequencing that `cli.py` already owns.
+Spawning the documented command keeps exactly one implementation, and keeps
+what the console shows identical to what it runs.
+
+**A free-form command box.** Rejected: the value here is that the operator
+cannot ask for anything the procedure does not already sanction. A closed
+allowlist is what lets the console accept input from a browser at all.
 
 ## Relationship to prior decisions
 

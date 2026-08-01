@@ -171,9 +171,14 @@ It opens `http://127.0.0.1:7643/` and shows:
 
 Buttons run the exact command shown beside them, in that checkout, and stream
 the engine's output. When the engine stops for the operator — the RSA passcode,
-a Kerberos password, the guided posture acknowledgement — the console shows the
+the guided posture acknowledgement, a `[y/N]` gate — the console shows the
 prompt and relays your answer. Secrets go straight to the running process and
 are masked in the transcript; they are never stored.
+
+Two cases still need a terminal: a deep-smoke release (`--smoke deep`, the only
+thing that asks for a Kerberos password) has no console action, and a node
+configured `transport: pane` takes its RSA passcode in the attached tmux pane,
+so the console can only show that it is waiting.
 
 Changing the workstation firewall posture stays manual. The console names the
 posture a phase needs and waits for you to confirm the switch; it never makes

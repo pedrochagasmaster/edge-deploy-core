@@ -113,14 +113,26 @@ def _progress(run_id: str, active: dict | None) -> None:
 
 
 def _lock(run_id: str, held: bool) -> None:
+    """Take or release the run lock, refusing a run another process holds."""
     path = _runs_root() / run_id / "run.lock"
-    if held:
-        path.write_text(
-            json.dumps({"pid": 4242, "hostname": "DEMO-CONSOLE", "acquired_at": _now()}),
-            encoding="utf-8",
-        )
-    else:
+    if not held:
         path.unlink(missing_ok=True)
+        return
+    if path.is_file():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            existing = {}
+        _say(
+            f"run {run_id} is locked by PID {existing.get('pid')} on "
+            f"{existing.get('hostname')} (acquired {existing.get('acquired_at')}); "
+            "if that process is dead, re-run with --force-lock"
+        )
+        raise SystemExit(2)
+    path.write_text(
+        json.dumps({"pid": 4242, "hostname": "DEMO-CONSOLE", "acquired_at": _now()}),
+        encoding="utf-8",
+    )
 
 
 def _tool() -> str:
@@ -391,10 +403,20 @@ def _cmd_release(args: dict) -> int:
     else:
         existing = _open_run()
         if existing is not None:
-            state = existing
-            _say(f"release: continuing the open run {state['run_id']}")
-        else:
-            state = _create_run(_tool())
+            # The real engine refuses rather than adopting an open run.
+            sha7 = existing["source_sha"][:7]
+            _say(
+                f"release refused: unresolved run {existing['run_id']} for {existing['tool']} "
+                f"(source {sha7}, created {existing['created_at']}) exists."
+            )
+            _say("Choose one:")
+            _say(f"  1. continue it:   py -m edge_deploy release --run {existing['run_id']}")
+            _say(
+                f'  2. abandon it:    py -m edge_deploy abandon --run {existing["run_id"]} '
+                '--reason "<why>"'
+            )
+            return 2
+        state = _create_run(_tool())
     _lock(state["run_id"], True)
     try:
         held = "both-vpns"
@@ -455,6 +477,38 @@ def _cmd_abandon(args: dict) -> int:
     return 0
 
 
+def _phase_line(label: str, content: str) -> str:
+    """Column layout copied from edge_deploy.phases.status._phase_line."""
+    prefix = f"  {label}:"
+    return prefix + " " * (17 - len(prefix)) + content
+
+
+def _next_line(state: dict) -> str:
+    """The engine's `next:` line — the whole point of the status cross-check."""
+    if state["status"] == "complete":
+        return "next: none (complete)"
+    if state["status"] == "abandoned":
+        return "next: none (abandoned)"
+    run_id = state["run_id"]
+    for phase in PHASE_ORDER:
+        if _phase_done(state, phase):
+            continue
+        if phase == "deploy":
+            pending = ",".join(
+                node for node, info in sorted(state["phases"]["deploy"].items())
+                if info["state"] != "passed"
+            )
+            command = f"py -m edge_deploy deploy --run {run_id} --nodes {pending}"
+        elif phase == "publish":
+            command = f"py -m edge_deploy publish-phase --run {run_id}"
+        elif phase == "verify":
+            command = f"py -m edge_deploy verify --run {run_id}"
+        else:
+            command = f"py -m edge_deploy {phase.replace('_', '-')} --run {run_id}"
+        return f"next: {command}   [posture: {PHASE_POSTURE[phase]}]"
+    return "next: none (complete)"
+
+
 def _cmd_status() -> int:
     root = _runs_root()
     found = False
@@ -466,18 +520,24 @@ def _cmd_status() -> int:
         found = True
         _say(
             f"run {state['run_id']}  tool={state['tool']}  kind={state['kind']}  "
-            f"source={state['source_sha'][:7]}  status={state['status']}"
+            f"source={state['source_sha'][:7]}  created={state['created_at']}"
         )
         for phase in PHASE_ORDER:
+            info = state["phases"][phase]
             if phase == "deploy":
-                nodes = " ".join(
-                    f"{name}={info['state']}" for name, info in sorted(state["phases"]["deploy"].items())
+                content = " ".join(
+                    f"{name}={node['state']}"
+                    for name, node in sorted(state["phases"]["deploy"].items())
                 )
-                _say(f"  deploy:        {nodes}")
+            elif phase == "publish" and info["state"] == "passed":
+                snapshot = (info["evidence"].get("snapshot_sha") or "???????")[:7]
+                content = f"passed (snapshot {snapshot})"
             else:
-                _say(f"  {phase + ':':<15}{state['phases'][phase]['state']}")
+                content = info["state"]
+            _say(_phase_line(phase, content))
+        _say(_next_line(state))
     if not found:
-        _say("no runs under this checkout")
+        _say("no open runs under " + str(root))
     return 0
 
 

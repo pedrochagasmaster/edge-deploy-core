@@ -24,7 +24,9 @@ PAGE = r"""<!doctype html>
   --line:#2a3440;
   --ink:#dde4ec;
   --dim:#8b96a3;
-  --faint:#5b6672;
+  /* Commands, paths and timestamps live at --faint; it has to clear WCAG AA
+     small-text contrast on --void, not just look quiet. */
+  --faint:#7c8794;
   --gh:#7fb4e0;        /* github write (firewall-off) */
   --gh-band:#152535;
   --bb:#e8933f;        /* bitbucket vpn */
@@ -76,6 +78,7 @@ header{border-bottom:1px solid var(--line);background:var(--panel);position:stic
 .banner b{color:var(--ink)}
 .banner.demo{border-color:var(--warn);color:var(--warn)}
 .banner.readonly{border-color:var(--gh);color:var(--gh)}
+.banner.offline{border-color:var(--fail);color:var(--fail)}
 .rootline{font-family:var(--mono);font-size:11px;color:var(--faint);padding:14px 0 0}
 
 /* ---------- section headings ---------- */
@@ -146,7 +149,10 @@ header{border-bottom:1px solid var(--line);background:var(--panel);position:stic
 .activeop.stalled .op-note{color:var(--fail)}
 .activeop .op-when{margin-left:auto;color:var(--faint)}
 @keyframes oppulse{0%,100%{opacity:1}50%{opacity:.35}}
-@media (prefers-reduced-motion: reduce){.activeop .op-dot{animation:none}}
+@media (prefers-reduced-motion: reduce){
+  .activeop .op-dot,.term .tdot{animation:none}
+  .transfer-fill{transition:none}
+}
 .transfer{display:flex;gap:10px;align-items:center;padding:9px 16px;border-top:1px solid var(--line);flex-wrap:wrap;font-family:var(--mono);font-size:11px;color:var(--dim)}
 .transfer-artifact{flex:none}
 .transfer-bar{flex:1 1 160px;height:6px;background:var(--void);border:1px solid var(--line);border-radius:3px;overflow:hidden}
@@ -166,7 +172,7 @@ header{border-bottom:1px solid var(--line);background:var(--panel);position:stic
 .actcmd code{font-family:var(--mono);font-size:11px;color:var(--faint);background:var(--sunk);border:1px solid var(--line);border-radius:5px;padding:4px 8px;overflow-x:auto;white-space:nowrap;scrollbar-width:thin;flex:1 1 auto}
 .actside{flex:0 0 auto;display:flex;flex-direction:column;gap:5px;align-items:flex-end;padding-top:2px}
 .need{font-size:9.5px;letter-spacing:.12em;text-transform:uppercase;font-weight:600;white-space:nowrap}
-.need.gh{color:var(--gh)}.need.bb,.need.both{color:var(--bb)}.need.any{color:var(--faint)}
+.need.gh{color:var(--gh)}.need.bb,.need.both{color:var(--bb)}.need.edge{color:var(--edge)}.need.any{color:var(--faint)}
 .readiness{font-family:var(--mono);font-size:10px;color:var(--faint);white-space:nowrap}
 .readiness.ok{color:var(--pass)}.readiness.blocked{color:var(--fail)}
 button{font-family:inherit}
@@ -315,6 +321,7 @@ footer code{font-family:var(--mono)}
 </header>
 
 <main class="wrap">
+  <div class="banner offline" id="health" role="status" hidden></div>
   <div id="banners"></div>
   <div class="rootline" id="rootline"></div>
 
@@ -358,6 +365,7 @@ const REQ_TAG = {
 const REQ_POSTURE = {
   any:  "any posture",
   bb:   "bitbucket-vpn or both-vpns",
+  edge: "edge-vpn or both-vpns",
   both: "both-vpns",
   gh:   "firewall-off",
 };
@@ -448,23 +456,27 @@ function nextCommand(run, phase){
 // Honesty marker next to a command: TCP for VPN phases, the write aggregate
 // for github-write. TCP cannot see github write, and neither can tell
 // baseline from firewall-off.
+function tcpReady(req){
+  if(req === "bb")   return tcpCaps.bb;
+  if(req === "edge") return tcpCaps.edge;
+  return tcpCaps.bb && tcpCaps.edge;
+}
 function readinessHtml(req){
   if(!tcpCaps) return "";
-  if(req === "any" || req === "local") return `<span class="readiness ok">runs in any posture</span>`;
+  if(req === "any") return `<span class="readiness ok">runs in any posture</span>`;
   if(req === "gh"){
     if(githubWriteAgg === "ok")   return `<span class="readiness ok">github write ok</span>`;
     if(githubWriteAgg === "fail") return `<span class="readiness blocked">github write unavailable</span>`;
     return `<span class="readiness">github write unknown</span>`;
   }
-  const ok = req === "bb" ? tcpCaps.bb : (tcpCaps.bb && tcpCaps.edge);
-  return ok ? `<span class="readiness ok">posture ok (tcp)</span>`
-            : `<span class="readiness blocked">switch needed</span>`;
+  return tcpReady(req) ? `<span class="readiness ok">posture ok (tcp)</span>`
+                       : `<span class="readiness blocked">switch needed</span>`;
 }
 function postureReady(req){
-  if(req === "any" || req === "local") return true;
+  if(req === "any") return true;
   if(!tcpCaps) return null;
   if(req === "gh") return githubWriteAgg === "ok" ? true : (githubWriteAgg === "fail" ? false : null);
-  return req === "bb" ? tcpCaps.bb : (tcpCaps.bb && tcpCaps.edge);
+  return tcpReady(req);
 }
 
 /* ---------- action rows ---------- */
@@ -475,7 +487,7 @@ function postureReady(req){
 // than one that warns.
 function actionRow(a){
   const cap = a.cap || "any";
-  const needText = cap === "any" || cap === "local" ? "any posture" : `needs ${REQ_POSTURE[cap]}`;
+  const needText = cap === "any" ? "any posture" : `needs ${REQ_POSTURE[cap]}`;
   const cls = ["act", a.primary ? "primary" : "", a.danger ? "danger" : ""].filter(Boolean).join(" ");
   const disabled = readOnly || a.disabled;
   const btnCls = ["run", a.primary ? "primary" : "", a.primary ? "big" : "", a.danger ? "danger" : ""].filter(Boolean).join(" ");
@@ -543,8 +555,10 @@ function runActions(run){
 
 /* ---------- rail ---------- */
 function stateChip(s){
+  // shortTs returns its input unchanged when the timestamp is not the shape it
+  // expects, and everything here comes off disk — so it still needs escaping.
   return `<span class="state ${esc(s.state)}"><span class="dot"></span>${esc(s.state)}</span>` +
-         (s.updated_at ? `<span class="when">${shortTs(s.updated_at)}</span>` : "");
+         (s.updated_at ? `<span class="when">${esc(shortTs(s.updated_at))}</span>` : "");
 }
 
 function stationHtml(run, phase, next, live){
@@ -585,13 +599,14 @@ function stationHtml(run, phase, next, live){
 }
 
 // Which station the engine is standing on right now, from release-progress.json.
+// Only the deploy phase builds a progress tracker, so every value it writes —
+// including "verify", which is the per-node drift/smoke gate run after each
+// rollout — belongs to the deploy station.
 function livePhase(run){
   const a = run.progress && run.progress.active;
   if(!a || run.state.status !== "open") return null;
   const p = String(a.phase || "");
-  if(p === "rollout" || p === "auth" || p === "deploy") return "deploy";
-  if(PHASE_ORDER.includes(p)) return p;
-  return null;
+  return ["rollout", "auth", "deploy", "verify", "publish"].includes(p) ? "deploy" : null;
 }
 
 function railHtml(run){
@@ -733,7 +748,7 @@ function runHtml(run, opts){
     <div class="runhead">
       <span class="runid">${esc(st.run_id)}</span>
       <span class="chip tool">${esc(st.tool)}</span>${trainingChip}${kindChip}${statusChip}${lockChip}${rollback}
-      <span class="runmeta">source ${esc(st.source_sha.slice(0,7))} · ${esc(st.operator)} · engine ${esc(st.engine && st.engine.version || "?")} · ${esc(shortDate(st.created_at))}</span>
+      <span class="runmeta">source ${esc(st.source_sha.slice(0,7))} · ${esc(st.operator)} · engine ${esc(st.engine && st.engine.version || "?")} · ${esc(shortDate(st.created_at))}${run.root ? ` · ${esc(run.root)}` : ""}</span>
     </div>
     ${railHtml(run)}
     ${progressHtml(run)}
@@ -750,7 +765,7 @@ function githubWriteHtml(g){
   const agg = g.aggregate || "unknown";
   const rows = (g.tools || []).map(t => {
     const st = t.status || "unknown";
-    return `<div class="endpoint ${st}"><span class="dot"></span>${esc(t.tool)} · ${esc(st)}${t.detail ? ` · ${esc(t.detail)}` : ""}</div>`;
+    return `<div class="endpoint ${esc(st)}"><span class="dot"></span>${esc(t.tool)} · ${esc(st)}${t.detail ? ` · ${esc(t.detail)}` : ""}</div>`;
   }).join("") || `<div class="endpoint unknown"><span class="dot"></span>no watched tools</div>`;
   return `<div class="pgroup gh"><h3>github write · ${esc(agg)}</h3>${rows}</div>`;
 }
@@ -859,9 +874,16 @@ function evidenceHtml(t){
 // Preconditions, each with the button that fixes it where one exists.
 function checklistHtml(t, blocker){
   const items = [];
-  const btn = (label, payload, cmd) =>
+  // Every checklist button carries the posture it needs, for the same reason
+  // the action rows do: git push wants firewall-off, the node probes want the
+  // Edge VPN, and finding that out from a failure is a bad way to find out.
+  const btn = (label, payload, cmd, cap) =>
     `<button class="run" data-payload="${esc(JSON.stringify(payload))}" ${readOnly ? "disabled" : ""}
-      title="${esc(cmd)}">${esc(label)}</button><code style="font-family:var(--mono);font-size:10.5px;color:var(--faint)">${esc(cmd)}</code>`;
+      title="${esc(cmd)}">${esc(label)}</button>` +
+    `<code style="font-family:var(--mono);font-size:10.5px;color:var(--faint)">${esc(cmd)}</code>` +
+    (cap && cap !== "any"
+      ? `<span class="need ${cap}">needs ${esc(REQ_POSTURE[cap])}</span>${readinessHtml(cap)}`
+      : "");
 
   if(t.verdict === "unknown"){
     items.push(`<li class="blocked"><b>No git state.</b> Point the console at a tool checkout with <code>--root</code>.</li>`);
@@ -870,13 +892,13 @@ function checklistHtml(t, blocker){
   } else if(t.stale_direction === "local_ahead"){
     items.push(`<li class="blocked"><b>${esc(plural(t.ahead_of_origin, "commit"))} are not on GitHub main.</b>
       Verify needs HEAD on GitHub main with green CI.<span class="grow"></span>
-      ${btn("Push to GitHub", {action:"git_push", root:t.root}, "git push origin main")}</li>`);
+      ${btn("Push to GitHub", {action:"git_push", root:t.root}, "git push origin main", "gh")}</li>`);
   } else if(t.stale_direction === "forked"){
     items.push(`<li class="blocked"><b>Checkout and GitHub main have forked.</b> Reconcile before releasing.<span class="grow"></span>
-      ${btn("Rebase onto main", {action:"git_rebase", root:t.root}, "git pull --rebase origin main")}</li>`);
+      ${btn("Rebase onto main", {action:"git_rebase", root:t.root}, "git pull --rebase origin main", "any")}</li>`);
   } else {
     items.push(`<li class="blocked"><b>GitHub main has moved.</b> ${esc(staleReadHtml(t))}<span class="grow"></span>
-      ${btn("Pull from GitHub", {action:"git_pull", root:t.root}, "git pull --ff-only origin main")}</li>`);
+      ${btn("Pull from GitHub", {action:"git_pull", root:t.root}, "git pull --ff-only origin main", "any")}</li>`);
   }
 
   const ready = postureReady("both");
@@ -887,20 +909,25 @@ function checklistHtml(t, blocker){
   const node = (t.nodes && t.nodes[0]) || null;
   if(node){
     items.push(`<li>Optional: confirm the node answers before trusting it.<span class="grow"></span>
-      ${btn(`Preflight ${node}`, {action:"preflight", root:t.root, node}, `py -m edge_deploy preflight --node ${node}`)}</li>`);
+      ${btn(`Preflight ${node}`, {action:"preflight", root:t.root, node}, `py -m edge_deploy preflight --node ${node}`, "edge")}</li>`);
     items.push(`<li>Optional: exercise the Paramiko transport end to end.<span class="grow"></span>
-      ${btn(`Smoke ${node}`, {action:"transport_smoke", root:t.root, node}, `py -m edge_deploy transport-smoke --node ${node}`)}</li>`);
+      ${btn(`Smoke ${node}`, {action:"transport_smoke", root:t.root, node}, `py -m edge_deploy transport-smoke --node ${node}`, "edge")}</li>`);
   }
   return `<ol class="checklist">${items.join("")}</ol>`;
 }
 
 // What stops a release outright, as opposed to what merely needs attention.
+// The engine's own gate is exact equality: inspect_repository refuses unless
+// HEAD == origin/main, before a run is even created. So every kind of stale
+// checkout blocks, not just the two that also lack CI.
 function releaseBlocker(t){
   if(t.verdict === "unknown") return "This checkout has no readable git state.";
   if(t.stale && t.stale_direction === "local_ahead")
-    return "Verify would fail: HEAD is not on GitHub main, so there is no CI result for it.";
+    return "The engine requires HEAD to equal github main, and these commits are not pushed yet — verify would also find no CI result for them.";
   if(t.stale && t.stale_direction === "forked")
-    return "Verify would fail: the checkout has forked from GitHub main.";
+    return "The engine requires HEAD to equal github main, and the checkout has forked from it.";
+  if(t.stale)
+    return "The engine requires HEAD to equal github main, and github main has moved ahead — pull first.";
   if(t.verdict === "up_to_date")
     return "Deployed, checkout, and GitHub main are the same commit — there is nothing to ship.";
   return null;
@@ -925,12 +952,16 @@ function decisionHtml(t){
   const suggest = ["diverged", "checkout_stale", "never_released"].includes(t.verdict);
   const headline = headlineFor(t);
   const blocker = releaseBlocker(t);
+  // aria-describedby, not just proximity: a disabled button announces nothing
+  // about why it is disabled unless the reason is wired to it.
+  const whyId = `why-${t.tool.replace(/[^a-z0-9_-]/gi, "")}`;
   const cta = `<div class="cta">
       <button class="run primary big" data-payload="${esc(JSON.stringify({action:"release", root:t.root, tool:t.tool}))}"
-        ${readOnly || blocker ? "disabled" : ""} title="py -m edge_deploy release --guided">▶ Start guided release</button>
+        ${readOnly || blocker ? "disabled" : ""} aria-describedby="${esc(whyId)}"
+        title="py -m edge_deploy release --guided">▶ Start guided release</button>
       <code>py -m edge_deploy release --guided</code>
       <button class="copy" data-cmd="py -m edge_deploy release --guided">copy</button>
-      <div class="ctawhy">${blocker
+      <div class="ctawhy" id="${esc(whyId)}">${blocker
         ? esc(blocker)
         : "Walks verify → publish → deploy → tag-bitbucket → tag-github, pausing here for every RSA passcode and posture switch."}</div>
     </div>`;
@@ -962,7 +993,10 @@ function termEl(id){
     <pre class="termout" tabindex="0"></pre>
     <div class="promptdock"></div>`;
   const out = el.querySelector(".termout");
-  t = {el, out, cursor: 0, pinned: true, hydrated: false};
+  // seenPrompt tells the server which question we have already drawn, so a
+  // pending prompt does not satisfy every long poll. answered remembers what
+  // we have replied to, so an in-flight response cannot redraw a dead prompt.
+  t = {el, out, cursor: 0, pinned: true, hydrated: false, seenPrompt: null, answered: new Set()};
   out.addEventListener("scroll", () => {
     t.pinned = out.scrollHeight - out.scrollTop - out.clientHeight < 24;
   });
@@ -983,14 +1017,22 @@ function elapsed(a){
   return `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`;
 }
 
-function promptHtml(a){
-  const p = a.prompt;
+// The prompt the operator should be looking at: what the server says is
+// pending, minus anything this tab has already answered.
+function activePrompt(a, t){
+  const p = a && a.prompt;
+  if(!p || (t && t.answered.has(p.id))) return null;
+  return p;
+}
+
+function promptHtml(a, t){
+  const p = activePrompt(a, t);
   if(!p) return "";
   const raw = p.raw ? `<code class="praw">${esc(p.raw)}</code>` : "";
   const head = `<div class="ptitle"><span class="bell">engine is waiting</span>${esc(p.title)}</div>
     <div class="pdetail">${esc(p.detail)}</div>${raw}`;
   if(p.kind === "secret"){
-    return `<div class="prompt secret" data-prompt="${esc(p.id)}" data-action="${esc(a.id)}">
+    return `<div class="prompt secret" role="alert" data-prompt="${esc(p.id)}" data-action="${esc(a.id)}">
       ${head}
       <div class="pform">
         <input type="password" class="secretbox" autocomplete="off" autocapitalize="off"
@@ -1001,7 +1043,7 @@ function promptHtml(a){
     </div>`;
   }
   if(p.kind === "ack"){
-    return `<div class="prompt posture" data-prompt="${esc(p.id)}" data-action="${esc(a.id)}">
+    return `<div class="prompt posture" role="alert" data-prompt="${esc(p.id)}" data-action="${esc(a.id)}">
       ${head}
       <div class="pform">
         <button class="run primary" data-answer="ack">I have switched — continue</button>
@@ -1011,7 +1053,7 @@ function promptHtml(a){
     </div>`;
   }
   if(p.kind === "choice"){
-    return `<div class="prompt" data-prompt="${esc(p.id)}" data-action="${esc(a.id)}">
+    return `<div class="prompt" role="alert" data-prompt="${esc(p.id)}" data-action="${esc(a.id)}">
       ${head}
       <div class="pform">
         <button class="run primary" data-answer="value" data-value="y">Yes</button>
@@ -1019,7 +1061,7 @@ function promptHtml(a){
       </div>
     </div>`;
   }
-  return `<div class="prompt" data-prompt="${esc(p.id)}" data-action="${esc(a.id)}">
+  return `<div class="prompt" role="alert" data-prompt="${esc(p.id)}" data-action="${esc(a.id)}">
     ${head}
     <div class="pform">
       <input type="text" class="textbox" autocomplete="off" aria-label="${esc(p.title)}">
@@ -1032,13 +1074,14 @@ function renderTerm(id){
   const t = terms.get(id);
   const a = actionsById.get(id);
   if(!t || !a) return;
+  const prompt = activePrompt(a, t);
   const running = a.status === "running" || a.status === "starting";
   const bad = !running && (a.exit_code !== 0 || a.status === "failed");
-  t.el.className = "term" + (running ? (a.prompt ? " waiting" : "") : (bad ? " bad" : " done"));
+  t.el.className = "term" + (running ? (prompt ? " waiting" : "") : (bad ? " bad" : " done"));
   t.el.querySelector(".termtitle").textContent = a.label + (a.run_id ? ` · ${a.run_id}` : "");
   t.el.querySelector(".termhead code").textContent = a.command;
   t.el.querySelector(".termstatus").textContent = running
-    ? (a.prompt ? `waiting for you · ${elapsed(a)}` : `running · ${elapsed(a)}`)
+    ? (prompt ? `waiting for you · ${elapsed(a)}` : `running · ${elapsed(a)}`)
     : (a.status === "failed" ? "could not start" : `exit ${a.exit_code} · ${elapsed(a)}`);
   const cancel = t.el.querySelector(".term-cancel");
   cancel.style.display = running ? "" : "none";
@@ -1046,11 +1089,13 @@ function renderTerm(id){
 
   const dock = t.el.querySelector(".promptdock");
   const shownPrompt = dock.firstElementChild && dock.firstElementChild.dataset.prompt;
-  const wantPrompt = a.prompt && a.prompt.id;
+  const wantPrompt = prompt && prompt.id;
   if(shownPrompt !== wantPrompt){
-    dock.innerHTML = promptHtml(a);
-    const box = dock.querySelector("input");
-    if(box) box.focus();
+    dock.innerHTML = promptHtml(a, t);
+    // Land the caret (or the acknowledgement button) where the answer goes,
+    // so the keyboard is already in the right place.
+    const focusTarget = dock.querySelector("input") || dock.querySelector("[data-answer]");
+    if(focusTarget) focusTarget.focus();
   }
 }
 
@@ -1096,6 +1141,14 @@ function toast(message){
   setTimeout(() => el.remove(), 7000);
 }
 
+// A stale token or a dead console must not look like a working page: both put
+// a sticky banner up, because a toast that has already faded is no help at 2am.
+function setHealth(message){
+  const el = document.getElementById("health");
+  el.hidden = !message;
+  el.innerHTML = message || "";
+}
+
 async function post(url, body){
   const res = await fetch(url, {
     method: "POST",
@@ -1103,7 +1156,12 @@ async function post(url, body){
     body: JSON.stringify(body || {}),
   });
   const data = await res.json().catch(() => ({}));
-  if(!res.ok) throw new Error(data.error || `request failed (${res.status})`);
+  if(!res.ok){
+    if(res.status === 403 && /token/.test(data.error || ""))
+      setHealth(`<b>This page is out of date</b> — the console has been restarted, so its
+        commands are refused. Reload the page to reconnect.`);
+    throw new Error(data.error || `request failed (${res.status})`);
+  }
   return data;
 }
 
@@ -1125,11 +1183,13 @@ async function pump(id, follow){
   try{
     for(;;){
       const t = termEl(id);
-      const res = await fetch(`/api/actions/${id}/output?cursor=${t.cursor}&wait=${follow ? 20 : 0}`);
+      const seen = t.seenPrompt ? `&seen=${encodeURIComponent(t.seenPrompt)}` : "";
+      const res = await fetch(`/api/actions/${id}/output?cursor=${t.cursor}&wait=${follow ? 20 : 0}${seen}`);
       if(!res.ok) break;
       const data = await res.json();
       t.cursor = data.cursor;
       t.hydrated = true;
+      t.seenPrompt = data.prompt ? data.prompt.id : null;
       actionsById.set(id, data);
       appendOutput(id, data.text, data.reset);
       renderTerm(id);
@@ -1270,17 +1330,26 @@ function renderRoots(){
 /* ---------- polling ---------- */
 let lastRuns = "", lastTools = "";
 
+let pollFailures = 0;
 async function pollRuns(){
   try{
     const res = await fetch("/api/runs");
     const data = await res.json();
+    pollFailures = 0;
+    if(document.getElementById("health").textContent.startsWith("Console unreachable")) setHealth("");
     const raw = JSON.stringify(data);
     runsData = data;
     readOnly = !!data.read_only;
     if(raw === lastRuns) return;
     lastRuns = raw;
     renderBanners(); renderRoots(); renderStage(); renderHistory();
-  }catch(_e){ /* server briefly gone; keep last render */ }
+  }catch(_e){
+    // Everything on screen is now a snapshot of an unknown age; say so rather
+    // than letting a dead console look like a live one.
+    if(++pollFailures >= 3)
+      setHealth(`Console unreachable — nothing on this page is live. Check the terminal
+        that started it, then reload.`);
+  }
 }
 
 async function pollTools(){
@@ -1318,7 +1387,9 @@ async function pollActions(){
     const data = await res.json();
     readOnly = !!data.read_only;
     let changed = false;
+    const live = new Set();
     for(const a of data.actions){
+      live.add(a.id);
       const before = actionsById.get(a.id);
       actionsById.set(a.id, Object.assign({}, before, a));
       if(!before) changed = true;
@@ -1326,6 +1397,17 @@ async function pollActions(){
       if(running) pump(a.id, true);
       else if(!termEl(a.id).hydrated) pump(a.id, false);
       renderTerm(a.id);
+    }
+    // The server retains a bounded history; anything it has dropped (or that a
+    // restart forgot) must not linger here still claiming to be running. The
+    // age check keeps a command started between this request and its response.
+    const cutoff = Date.now() / 1000 - 10;
+    for(const id of [...actionsById.keys()]){
+      const a = actionsById.get(id);
+      if(live.has(id) || (a.started_at || 0) > cutoff) continue;
+      actionsById.delete(id);
+      terms.delete(id);
+      changed = true;
     }
     if(changed) placeTerminals();
   }catch(_e){ /* ignore */ }
@@ -1380,13 +1462,14 @@ document.addEventListener("click", async ev => {
     } else if(mode === "value"){
       value = answerBtn.dataset.value;
     }
-    const id = dock.dataset.action;
+    const id = dock.dataset.action, promptId = dock.dataset.prompt;
     answerBtn.disabled = true;
     try{
-      // Adopt the answered snapshot straight away, or the next render tick
-      // would redraw the prompt from stale state before the poll catches up.
-      const answered = await post(`/api/actions/${id}/answer`,
-                                  {prompt_id: dock.dataset.prompt, value});
+      // Adopt the answered snapshot straight away, and remember the prompt id:
+      // a long poll already in flight still carries the old prompt, and must
+      // not redraw a question the operator has answered.
+      const answered = await post(`/api/actions/${id}/answer`, {prompt_id: promptId, value});
+      termEl(id).answered.add(promptId);
       actionsById.set(id, Object.assign({}, actionsById.get(id), answered));
       dock.remove();
       renderTerm(id);

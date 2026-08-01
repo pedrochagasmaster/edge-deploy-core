@@ -308,7 +308,16 @@ for you:
 - the **RSA passcode** prompt, as a masked field whose value is written
   straight to the running process and never stored or logged;
 - the **guided posture boundary**, as the posture name the phase needs plus a
-  single "I have switched" button.
+  single "I have switched" button;
+- any `[y/N]` gate, and — as a safety net — any other question the engine
+  prints and then waits on, so an unrecognised prompt cannot hang a run
+  silently.
+
+Two prompts stay in the terminal. A Kerberos password is only asked during a
+deep-smoke release (`--smoke deep`), which no console button runs; and a node
+configured `transport: pane` takes its RSA passcode in the attached tmux pane,
+where the console cannot see or answer it — it shows "waiting for operator"
+and nothing more.
 
 The console cannot change your firewall posture — that stays a manual
 workstation change, exactly as above. It only names the posture the next phase

@@ -36,8 +36,10 @@ from edge_console import (  # noqa: E402
 )
 from edge_console.actions import (  # noqa: E402
     ACTION_SPECS,
+    CAPABILITIES,
     ActionError,
     ActionRegistry,
+    ActionRunner,
     display_command,
 )
 from edge_console.demo import DEMO_ENGINE_PATH  # noqa: E402
@@ -938,6 +940,55 @@ def test_real_release_card_unchanged_without_training_markers() -> None:
     assert "release-tagged on GitHub and Bitbucket" in complete
 
 
+def test_phase_timestamps_are_escaped_like_everything_else_off_disk() -> None:
+    """Regression: shortTs returns its input unchanged when the timestamp is
+    not the shape it expects, so an unescaped phase updated_at was a script
+    injection into a page that holds the console's action token."""
+    nasty = "<img src=x onerror=alert(1)>"
+    phases = _pending_phases()
+    phases["verify"] = {"state": "passed", "updated_at": nasty, "evidence": {}}
+    html = _render_run_html(
+        _sample_run(kind="release", training=None, status="open", phases=phases)
+    )
+    assert "<img src=x" not in html
+    assert "&lt;img src=x onerror=alert(1)&gt;" in html
+
+
+def test_release_cta_is_blocked_whenever_the_checkout_is_not_github_main() -> None:
+    """inspect_repository refuses unless HEAD == origin/main, before a run is
+    even created — so every stale direction blocks, not only the two that also
+    lack CI."""
+    script = PAGE.split("<script>", 1)[1].split("</script>", 1)[0]
+    body = script.split("function releaseBlocker(t){", 1)[1].split("\n}\n", 1)[0]
+    with tempfile.NamedTemporaryFile("w", suffix=".mjs", encoding="utf-8", delete=False) as fh:
+        fh.write(f"function releaseBlocker(t){{{body}\n}}\n")
+        fh.write(
+            "const cases = ["
+            '  {verdict:"diverged", stale:true, stale_direction:"local_behind"},'
+            '  {verdict:"checkout_stale", stale:true, stale_direction:"local_behind"},'
+            '  {verdict:"diverged", stale:true, stale_direction:"local_ahead", ahead_of_origin:2},'
+            '  {verdict:"diverged", stale:true, stale_direction:"forked"},'
+            '  {verdict:"checkout_stale", stale:true, stale_direction:null},'
+            '  {verdict:"up_to_date", stale:false},'
+            '  {verdict:"unknown", stale:false},'
+            "];\n"
+            "const open = {verdict:'diverged', stale:false, stale_direction:null};\n"
+            "process.stdout.write(JSON.stringify({"
+            "blocked: cases.map(c => releaseBlocker(c) !== null),"
+            "open: releaseBlocker(open)}));\n"
+        )
+        path = Path(fh.name)
+    try:
+        completed = subprocess.run(["node", str(path)], check=False, capture_output=True, text=True)
+    finally:
+        path.unlink(missing_ok=True)
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout)
+    assert all(result["blocked"]), result["blocked"]
+    # A clean checkout that is genuinely ahead of the nodes must still release.
+    assert result["open"] is None
+
+
 def test_console_never_writes_a_ledger_or_bypasses_the_engine() -> None:
     """ADR-0018: the console orchestrates by running engine commands. It must
     never edit a ledger itself, and must never reach into edge_deploy's release
@@ -996,7 +1047,46 @@ def test_every_console_action_is_an_allowlisted_engine_or_git_command() -> None:
                 "preflight",
                 "transport-smoke",
             }
-        assert spec.cap in {"any", "bb", "both", "gh", "local"}
+        assert spec.cap in CAPABILITIES
+
+
+def test_page_and_allowlist_do_not_drift_apart() -> None:
+    """The buttons are written in the page and the commands in ACTION_SPECS.
+    Nothing else stops a renamed action from shipping with a dead button, or a
+    button from POSTing an id the server refuses."""
+    posted = set(re.findall(r'action:"([a-z_]+)"', PAGE))
+    posted.update(re.findall(r'\{action:"([a-z_]+)"', PAGE))
+    assert posted, "no action payloads found in the page"
+    assert posted <= set(ACTION_SPECS), posted - set(ACTION_SPECS)
+    # Every capability an action declares must have page wording for it.
+    postures = set(re.findall(r"^\s*(\w+):\s*\"[^\"]+\",?$", PAGE.split("const REQ_POSTURE = {", 1)[1]
+                              .split("};", 1)[0], re.M))
+    assert {spec.cap for spec in ACTION_SPECS.values()} <= postures
+
+
+def test_action_capabilities_match_the_engines_phase_posture_map() -> None:
+    """A console that mislabels the posture a command needs sends the operator
+    to change the firewall for no reason, or lets them think they are ready."""
+    from edge_deploy.posture import PHASE_CAPABILITIES
+
+    cap_for = {
+        frozenset({"github-read"}): "any",
+        frozenset({"bitbucket"}): "bb",
+        frozenset({"bitbucket", "edge"}): "both",
+        frozenset({"github-write"}): "gh",
+    }
+    for phase, action in (
+        ("verify", "verify"),
+        ("publish", "publish"),
+        ("deploy", "deploy"),
+        ("tag_bitbucket", "tag_bitbucket"),
+        ("tag_github", "tag_github"),
+    ):
+        assert ACTION_SPECS[action].cap == cap_for[PHASE_CAPABILITIES[phase]], action
+    # preflight/transport-smoke are not posture-gated by the engine and only
+    # talk to the node, so they need the Edge VPN — not Bitbucket as well.
+    assert ACTION_SPECS["preflight"].cap == "edge"
+    assert ACTION_SPECS["transport_smoke"].cap == "edge"
 
 
 def test_no_action_can_switch_the_workstation_posture() -> None:
@@ -1404,6 +1494,142 @@ def test_page_keeps_a_half_typed_answer_focused_across_re_renders() -> None:
     assert "scrollTop" in body
 
 
+def test_a_pending_prompt_does_not_satisfy_every_long_poll(tmp_path) -> None:
+    """Regression: the poll used to return instantly for as long as a prompt
+    was open, so the page spun through the whole time the operator spent
+    finding their RSA token. A prompt the caller has already seen must not wake
+    the poll; one it has not seen still must."""
+    root = _checkout(tmp_path)
+    script = (
+        "import sys\n"
+        "sys.stdout.write('[node05] Enter RSA PASSCODE: '); sys.stdout.flush()\n"
+        "sys.stdin.readline()\n"
+    )
+    registry = _registry([root], script=script)
+    runner = registry.start({"action": "status", "root": str(root)})
+    prompt = _await(lambda: runner.snapshot()["prompt"], what="the RSA prompt")
+    cursor = runner.output(0)["cursor"]
+
+    unseen = time.monotonic()
+    runner.output(cursor, wait=5.0)
+    assert time.monotonic() - unseen < 1.0, "an unseen prompt must return at once"
+
+    seen = time.monotonic()
+    runner.output(cursor, wait=1.0, seen_prompt=prompt["id"])
+    assert time.monotonic() - seen >= 0.9, "a seen prompt must not wake the poll"
+    runner.cancel()
+
+
+def test_an_unrecognised_prompts_answer_is_masked_like_a_secret(tmp_path) -> None:
+    """The generic answer box exists because the console cannot know every
+    prompt — which means it cannot know the answer is not a password."""
+    root = _checkout(tmp_path)
+    script = "import sys; sys.stdout.write('vault passphrase: '); sys.stdout.flush(); sys.stdin.readline()"
+    registry = _registry([root], script=script)
+    runner = registry.start({"action": "status", "root": str(root)})
+
+    def poll():
+        runner.tick()
+        return runner.snapshot()["prompt"]
+
+    prompt = _await(poll, timeout=25.0, what="the generic prompt")
+    assert prompt["kind"] == "text"
+    runner.answer(prompt["id"], "correct-horse-battery")
+    _await(lambda: runner.snapshot()["status"] == "exited", what="the command to exit")
+    assert "correct-horse-battery" not in runner.output(0)["text"]
+
+
+def test_short_secrets_are_masked_too(tmp_path) -> None:
+    root = _checkout(tmp_path)
+    script = (
+        "import sys\n"
+        "sys.stdout.write('[node03] Enter RSA PASSCODE: '); sys.stdout.flush()\n"
+        "code = sys.stdin.readline().strip()\n"
+        "print('sshd echoed ' + code)\n"
+    )
+    registry = _registry([root], script=script)
+    runner = registry.start({"action": "status", "root": str(root)})
+    prompt = _await(lambda: runner.snapshot()["prompt"], what="the RSA prompt")
+    runner.answer(prompt["id"], "42")
+    _await(lambda: runner.snapshot()["status"] == "exited", what="the command to exit")
+    transcript = runner.output(0)["text"]
+    assert "sshd echoed ********" in transcript
+    assert "sshd echoed 42" not in transcript
+
+
+def test_an_answer_cannot_smuggle_extra_stdin_lines(tmp_path) -> None:
+    """One answer is one line: a newline would pre-answer the next question."""
+    root = _checkout(tmp_path)
+    script = "import sys; sys.stdout.write('[node03] Enter RSA PASSCODE: '); sys.stdout.flush(); sys.stdin.readline()"
+    registry = _registry([root], script=script)
+    runner = registry.start({"action": "status", "root": str(root)})
+    prompt = _await(lambda: runner.snapshot()["prompt"], what="the RSA prompt")
+    with pytest.raises(ActionError):
+        runner.answer(prompt["id"], "1234\ny")
+    runner.cancel()
+
+
+def test_kerberos_and_yes_no_prompts_are_recognised(tmp_path) -> None:
+    root = _checkout(tmp_path)
+    for script, kind, name in (
+        (
+            "import sys; sys.stdout.write('[node03] Kerberos password: '); "
+            "sys.stdout.flush(); sys.stdin.readline()",
+            "secret",
+            "kerberos",
+        ),
+        (
+            "import sys; sys.stdout.write('Discard onboarding evidence only? [y/N] '); "
+            "sys.stdout.flush(); sys.stdin.readline()",
+            "choice",
+            "confirm",
+        ),
+    ):
+        registry = _registry([root], script=script)
+        runner = registry.start({"action": "status", "root": str(root)})
+        prompt = _await(lambda: runner.snapshot()["prompt"], what=f"the {name} prompt")
+        assert (prompt["kind"], prompt["name"]) == (kind, name)
+        runner.answer(prompt["id"], "y" if kind == "choice" else "secret")
+        _await(lambda: runner.snapshot()["status"] == "exited", what="the command to exit")
+
+
+def test_a_second_command_is_refused_while_the_first_is_still_spawning(tmp_path) -> None:
+    """The runner is registered before Popen returns; that window must still
+    count as busy or the one-command-per-checkout rule has a hole in it."""
+    root = _checkout(tmp_path)
+    registry = _registry([root], script="import time; time.sleep(5)")
+    first = registry.start({"action": "status", "root": str(root)})
+    try:
+        first.status = "starting"  # re-enter the spawn window deterministically
+        with pytest.raises(ActionError) as busy:
+            registry.start({"action": "status", "root": str(root)})
+        assert busy.value.status == 409
+    finally:
+        first.status = "running"
+        first.cancel()
+
+
+def test_cancel_before_the_process_exists_is_not_lost(tmp_path) -> None:
+    """Stop is clickable as soon as the action is listed, which is before Popen
+    has returned. Dropping that cancel would leave the operator believing they
+    stopped a command that is in fact still running."""
+    root = _checkout(tmp_path)
+    runner = ActionRunner(
+        action_id="cancel-window",
+        spec=ACTION_SPECS["status"],
+        argv=[sys.executable, "-u", "-c", "import time; time.sleep(30)"],
+        cwd=root,
+        command="py -m edge_deploy status",
+        root=str(root),
+        run_id=None,
+        tool=None,
+    )
+    runner.cancel()
+    runner.start()
+    _await(lambda: runner.snapshot()["status"] == "exited", what="the command to stop")
+    assert "cancelled by operator" in runner.output(0)["text"]
+
+
 def test_answering_a_stale_prompt_is_refused(tmp_path) -> None:
     root = _checkout(tmp_path)
     registry = _registry([root], script="print('done')")
@@ -1468,6 +1694,86 @@ def test_read_only_console_refuses_every_action(tmp_path) -> None:
         )
         assert status == 403
         assert "read-only" in body["error"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_answer_and_cancel_also_require_the_page_token(tmp_path) -> None:
+    root = _checkout(tmp_path)
+    server, port = _serve([root], registry=_registry([root], script="import time; time.sleep(5)"))
+    auth = {"X-Edge-Console-Token": "test-token"}
+    try:
+        _, started = _request(
+            port, "POST", "/api/actions", {"action": "status", "root": str(root)}, **auth
+        )
+        for path, body in (
+            (f"/api/actions/{started['id']}/answer", {"prompt_id": "x", "value": "y"}),
+            (f"/api/actions/{started['id']}/cancel", {}),
+        ):
+            status, payload = _request(port, "POST", path, body)
+            assert status == 403, path
+            assert "token" in payload["error"]
+        status, _ = _request(port, "POST", f"/api/actions/{started['id']}/cancel", {}, **auth)
+        assert status == 200
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_non_loopback_host_is_refused(tmp_path) -> None:
+    """The DNS-rebinding guard: a valid token from a foreign origin is not enough."""
+    root = _checkout(tmp_path)
+    server, port = _serve([root], registry=_registry([root], script="print('ok')"))
+    try:
+        status, payload = _request(
+            port,
+            "POST",
+            "/api/actions",
+            {"action": "status", "root": str(root)},
+            **{"X-Edge-Console-Token": "test-token", "Host": "attacker.example.com"},
+        )
+        assert status == 403
+        assert "Host" in payload["error"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_a_rejected_post_does_not_desync_the_connection(tmp_path) -> None:
+    """Regression: an unread request body was parsed as the next request line,
+    so the poll right after a stale-token click got a nonsense response."""
+    root = _checkout(tmp_path)
+    server, port = _serve([root], registry=_registry([root], script="print('ok')"))
+    try:
+        conn = HTTPConnection("127.0.0.1", port, timeout=10)
+        body = json.dumps({"action": "status", "root": str(root)}).encode()
+        conn.request("POST", "/api/actions", body=body, headers={"Content-Type": "application/json"})
+        rejected = conn.getresponse()
+        assert rejected.status == 403
+        rejected.read()
+        conn.request("GET", "/api/runs")
+        response = conn.getresponse()
+        assert response.status == 200, "the next request on the same connection must be understood"
+        assert json.loads(response.read().decode())["runs"] == []
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_oversized_action_bodies_are_refused(tmp_path) -> None:
+    root = _checkout(tmp_path)
+    server, port = _serve([root], registry=_registry([root], script="print('ok')"))
+    try:
+        status, payload = _request(
+            port,
+            "POST",
+            "/api/actions",
+            {"action": "status", "root": str(root), "reason": "x" * 70_000},
+            **{"X-Edge-Console-Token": "test-token"},
+        )
+        assert status == 413
+        assert "too large" in payload["error"]
     finally:
         server.shutdown()
         server.server_close()

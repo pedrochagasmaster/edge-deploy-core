@@ -282,8 +282,8 @@ def _launch_console(
     except OSError as exc:
         raise RuntimeError(
             redact(
-                f"failed to launch edge console ({type(exc).__name__}); "
-                f"start manually from {core_root}: {sys.executable} -m edge_console --no-browser"
+                f"failed to launch edge console ({type(exc).__name__}); start manually from "
+                f"{core_root}: {sys.executable} -m edge_console --no-browser --read-only"
             )
         ) from exc
 

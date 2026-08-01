@@ -74,6 +74,9 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             raise ActionError("bad Content-Length") from exc
         if length > MAX_BODY_BYTES:
+            # The body is left unread, so this connection can no longer be
+            # reused: the next request would be parsed out of these bytes.
+            self.close_connection = True
             raise ActionError("request body too large", status=413)
         if length <= 0:
             return {}
@@ -134,23 +137,29 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         except ValueError:
             self._error(400, "cursor and wait must be numbers")
             return
+        seen = (query.get("seen") or [""])[0] or None
         try:
             runner = self.registry.get(action_id)
         except ActionError as exc:
             self._error(exc.status, str(exc))
             return
         runner.tick()
-        self._send_json(runner.output(max(0, cursor), wait=max(0.0, wait)))
+        self._send_json(
+            runner.output(max(0, cursor), wait=max(0.0, wait), seen_prompt=seen)
+        )
 
     # -- actions -----------------------------------------------------------
 
     def do_POST(self) -> None:  # noqa: N802 (stdlib API)
         path = urlsplit(self.path).path
         try:
+            # Read the body before deciding anything: a rejected request that
+            # leaves its body in the socket desynchronises the next keep-alive
+            # request on the same connection.
+            body = self._read_body()
             self._authorize()
             if self.read_only or self.registry is None:
                 raise ActionError("this console was started read-only", status=403)
-            body = self._read_body()
             if path == "/api/actions":
                 self._start_action(body)
             elif path.startswith("/api/actions/") and path.endswith("/answer"):

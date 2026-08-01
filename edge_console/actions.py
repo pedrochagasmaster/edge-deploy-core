@@ -53,8 +53,15 @@ IDLE_PROMPT_SECONDS = 2.5
 OUTPUT_LIMIT_CHARS = 400_000
 RETAINED_FINISHED_ACTIONS = 30
 
-_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
-_NODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# Matched with fullmatch: Python's ``$`` also matches before a trailing
+# newline, which would let a control character through the charset these
+# patterns exist to guarantee.
+# The posture capability an action needs, in the page's vocabulary. Advisory
+# only: the console warns, the engine's own git-protocol probe decides.
+CAPABILITIES = frozenset({"any", "bb", "edge", "both", "gh"})
+
+_RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
+_NODE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -73,7 +80,7 @@ class ActionSpec:
     id: str
     label: str
     kind: str  # "engine" (py -m edge_deploy ...) or "git"
-    cap: str  # any | bb | both | gh | local — the posture capability it needs
+    cap: str  # one of CAPABILITIES
     args: Callable[[dict], list[str]]
     params: tuple[str, ...] = ()
     needs_run: bool = False
@@ -177,11 +184,13 @@ ACTION_SPECS: dict[str, ActionSpec] = {
             args=lambda p: ["status"],
             summary="Print the engine's own view of every run under this checkout.",
         ),
+        # Both talk only to the node, and neither is posture-gated by the
+        # engine — so they need the Edge VPN, not the Bitbucket one too.
         ActionSpec(
             id="preflight",
             label="Preflight node",
             kind="engine",
-            cap="both",
+            cap="edge",
             args=lambda p: ["preflight", "--node", p["node"]],
             params=("node",),
             summary="Check DNS and TCP reachability for one Edge Node.",
@@ -190,7 +199,7 @@ ACTION_SPECS: dict[str, ActionSpec] = {
             id="transport_smoke",
             label="Smoke transport",
             kind="engine",
-            cap="both",
+            cap="edge",
             args=lambda p: ["transport-smoke", "--node", p["node"]],
             params=("node",),
             summary="Authenticate once and exercise command, transfer, PTY, and keepalive.",
@@ -240,7 +249,7 @@ def _quote(arg: str) -> str:
 
 def _clean_run_id(raw: object) -> str:
     value = str(raw or "")
-    if not _RUN_ID_RE.match(value):
+    if not _RUN_ID_RE.fullmatch(value):
         raise ActionError(f"invalid run id: {value!r}")
     return value
 
@@ -256,14 +265,14 @@ def _clean_nodes(raw: object) -> list[str]:
         raise ActionError("nodes must be a list or comma-separated string")
     nodes = [node for node in candidates if node]
     for node in nodes:
-        if not _NODE_RE.match(node):
+        if not _NODE_RE.fullmatch(node):
             raise ActionError(f"invalid node name: {node!r}")
     return nodes
 
 
 def _clean_node(raw: object) -> str:
     value = str(raw or "")
-    if not _NODE_RE.match(value):
+    if not _NODE_RE.fullmatch(value):
         raise ActionError(f"invalid node name: {value!r}")
     return value
 
@@ -338,6 +347,7 @@ class ActionRunner:
         self._last_output = time.monotonic()
         self._prompt: _Prompt | None = None
         self._prompt_seq = 0
+        self._cancel_requested = False
         self._secrets: list[str] = []
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
@@ -373,6 +383,9 @@ class ActionRunner:
         self.status = "running"
         self._append(f"[console] {self.command}\n[console] cwd {self.cwd}\n\n")
         threading.Thread(target=self._pump, name=f"action-{self.id}", daemon=True).start()
+        if self._cancel_requested:
+            # Stop was pressed while the process was still being spawned.
+            self.cancel()
 
     def _pump(self) -> None:
         stream = self._proc.stdout if self._proc else None
@@ -396,14 +409,23 @@ class ActionRunner:
             self.status = "exited"
             self.finished_at = time.time()
             self._prompt = None
+            # Masking only ever protects future output, and there is none now.
+            self._secrets.clear()
             self._text += f"\n[console] exit code {code}\n"
             self._cond.notify_all()
         if self._on_finish:
-            self._on_finish(self)
+            try:
+                self._on_finish(self)
+            except Exception:  # a cache-invalidation hook must not kill the reader
+                pass
 
     def cancel(self) -> None:
         proc = self._proc
-        if proc is None or proc.poll() is not None:
+        if proc is None:
+            # Still inside Popen; start() terminates it as soon as it exists.
+            self._cancel_requested = True
+            return
+        if proc.poll() is not None:
             return
         self._append("\n[console] cancelled by operator\n")
         try:
@@ -517,23 +539,32 @@ class ActionRunner:
             self._cond.notify_all()
 
     def answer(self, prompt_id: str, value: str) -> None:
+        if _CONTROL_RE.search(value):
+            # One answer is one line: a newline here would pre-answer whatever
+            # the engine asks next.
+            raise ActionError("an answer cannot contain control characters")
         with self._cond:
             prompt = self._prompt
             if prompt is None or prompt.id != prompt_id:
                 raise ActionError("that prompt is no longer waiting", status=409)
-            if prompt.kind == "secret":
+            # A question the console did not recognise may well be asking for a
+            # secret, so it is masked like one — the safety net fails closed.
+            if prompt.kind in ("secret", "text"):
                 # An empty answer is a real thing the operator can send (the
                 # engine reads it as "no code"), so the transcript must not
                 # claim a secret was typed when none was.
                 echo = "********\n" if value else "\n"
-                if len(value) >= 4:
+                if value:
                     self._secrets.append(value)
             else:
                 echo = f"{value}\n"
             self._prompt = None
         proc = self._proc
         if proc is None or proc.stdin is None or proc.poll() is not None:
+            self._restore_prompt(prompt)
             raise ActionError("the command is no longer running", status=409)
+        # Echo first: the engine's reply to this answer must not appear above it.
+        self._append(echo)
         payload = (value + "\n").encode("utf-8")
         try:
             written = 0
@@ -543,8 +574,16 @@ class ActionRunner:
                 written = len(payload) if sent is None else written + sent
             proc.stdin.flush()
         except (OSError, ValueError) as exc:
+            self._append("[console] that answer could not be delivered\n")
+            self._restore_prompt(prompt)
             raise ActionError(f"could not reach the command: {exc}", status=409) from exc
-        self._append(echo)
+
+    def _restore_prompt(self, prompt: _Prompt) -> None:
+        """Put an undelivered question back: the engine is still waiting on it."""
+        with self._cond:
+            if self._prompt is None and self.status == "running":
+                self._prompt = prompt
+            self._cond.notify_all()
 
     # -- views -------------------------------------------------------------
 
@@ -568,7 +607,14 @@ class ActionRunner:
                 "cursor": self._dropped + len(self._text),
             }
 
-    def output(self, cursor: int, wait: float = 0.0) -> dict:
+    def output(self, cursor: int, wait: float = 0.0, seen_prompt: str | None = None) -> dict:
+        """Everything after ``cursor``, waiting up to ``wait`` seconds for more.
+
+        ``seen_prompt`` is the prompt the caller has already rendered. Without
+        it a pending question would satisfy every poll instantly, and the
+        client would spin for the whole time the operator takes to answer —
+        which is precisely the longest wait in a release.
+        """
         deadline = time.monotonic() + max(0.0, wait)
         end = cursor
         text = ""
@@ -583,7 +629,9 @@ class ActionRunner:
                     start = min(len(self._text), cursor - self._dropped)
                     reset = False
                 text = self._text[start:]
-                if text or reset or self.status != "running" or self._prompt is not None:
+                pending = self._prompt.id if self._prompt else None
+                unseen = pending is not None and pending != seen_prompt
+                if text or reset or unseen or self.status != "running":
                     break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -670,7 +718,10 @@ class ActionRegistry:
 
         with self._lock:
             for runner in self._runners.values():
-                if runner.status == "running" and runner.root == str(root):
+                # "starting" counts as busy: the runner is registered before
+                # Popen returns, and a second request in that window would
+                # otherwise slip past the one-command-per-checkout rule.
+                if runner.status in ("starting", "running") and runner.root == str(root):
                     raise ActionError(
                         f"{runner.command} is still running in this checkout", status=409
                     )
@@ -695,7 +746,7 @@ class ActionRegistry:
     def _evict_locked(self) -> None:
         while len(self._order) > RETAINED_FINISHED_ACTIONS:
             for index, action_id in enumerate(self._order):
-                if self._runners[action_id].status != "running":
+                if self._runners[action_id].status not in ("starting", "running"):
                     self._order.pop(index)
                     self._runners.pop(action_id, None)
                     break

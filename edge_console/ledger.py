@@ -49,10 +49,14 @@ def is_training_state(state: dict) -> bool:
 
 
 def collect_runs(runs_root: Path) -> list[dict]:
-    if not runs_root.is_dir():
+    try:
+        # A watched checkout can be moved or deleted between polls; that is a
+        # console with nothing to show, not an error.
+        entries = sorted(runs_root.iterdir()) if runs_root.is_dir() else []
+    except OSError:
         return []
     runs: list[dict] = []
-    for entry in sorted(runs_root.iterdir()):
+    for entry in entries:
         if not entry.is_dir():
             continue
         state = read_json(entry / "state.json")
