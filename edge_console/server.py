@@ -50,12 +50,17 @@ class ConsoleHandler(BaseHTTPRequestHandler):
     # -- plumbing ----------------------------------------------------------
 
     def _send(self, status: int, content_type: str, body: bytes) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # A reload or a closed tab drops a long poll mid-flight; that is
+            # routine, not something to spill a traceback over.
+            self.close_connection = True
 
     def _send_json(self, payload: dict, status: int = 200) -> None:
         self._send(status, "application/json; charset=utf-8", json.dumps(payload).encode("utf-8"))

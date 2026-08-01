@@ -348,9 +348,10 @@ class ActionRunner:
         # Unbuffered so a prompt written without a newline reaches the browser
         # the instant the engine flushes it.
         env["PYTHONUNBUFFERED"] = "1"
+        # There is no terminal to answer a credential helper on: fail fast
+        # instead of blocking on a prompt nothing can see.
         env["GIT_TERMINAL_PROMPT"] = "0"
         env["GCM_INTERACTIVE"] = "never"
-        env["EDGE_CONSOLE_DRIVEN"] = "1"
         try:
             self._proc = subprocess.Popen(  # noqa: S603 - argv list, shell=False, allowlisted
                 self.argv,
@@ -366,6 +367,8 @@ class ActionRunner:
             self.error = f"could not start {self.argv[0]}: {exc}"
             self.finished_at = time.time()
             self._append(f"[console] {self.error}\n")
+            if self._on_finish:
+                self._on_finish(self)
             return
         self.status = "running"
         self._append(f"[console] {self.command}\n[console] cwd {self.cwd}\n\n")
@@ -382,6 +385,12 @@ class ActionRunner:
         except (OSError, ValueError):
             pass
         code = self._proc.wait() if self._proc else -1
+        for pipe in (getattr(self._proc, "stdin", None), stream):
+            try:
+                if pipe is not None:
+                    pipe.close()
+            except OSError:
+                pass
         with self._cond:
             self.exit_code = code
             self.status = "exited"
@@ -529,7 +538,9 @@ class ActionRunner:
         try:
             written = 0
             while written < len(payload):
-                written += proc.stdin.write(payload[written:])
+                # Unbuffered pipes can short-write; None means "wrote it all".
+                sent = proc.stdin.write(payload[written:])
+                written = len(payload) if sent is None else written + sent
             proc.stdin.flush()
         except (OSError, ValueError) as exc:
             raise ActionError(f"could not reach the command: {exc}", status=409) from exc
