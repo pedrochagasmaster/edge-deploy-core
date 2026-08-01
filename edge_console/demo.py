@@ -18,6 +18,16 @@ from edge_console.demo_engine import __file__ as _DEMO_ENGINE_FILE
 from edge_console.ledger import SCHEMA
 
 DEMO_ENGINE_PATH = Path(_DEMO_ENGINE_FILE).resolve()
+# The remotes the fabricated profiles name, so the demo checkouts look like the
+# healthy ones they are meant to represent rather than tripping the console's
+# own "wrong remote" check.
+DEMO_REMOTES = {
+    tool: {
+        "github_url": f"https://github.com/mastercard/{tool}.git",
+        "bitbucket_url": f"https://scm.mastercard.int/edge/{tool}.git",
+    }
+    for tool in ("autobench", "robocop")
+}
 # The fabricated engine fingerprint every demo ledger carries, so the console's
 # engine-identity check sees the simulator agreeing with itself.
 DEMO_ENGINE_SHA = "d3m0" + "0" * 60
@@ -36,6 +46,10 @@ def demo_git(root: Path, *args: str, timeout: float | None = None) -> str | None
         return DEMO_AHEAD_BY_TOOL.get(root.name)
     if args[0] == "status":
         return "## main...origin/main"  # on main, clean tree
+    if args[:3] == ("remote", "get-url", "origin"):
+        return DEMO_REMOTES[root.name]["github_url"]
+    if args[:3] == ("remote", "get-url", "bitbucket"):
+        return DEMO_REMOTES[root.name]["bitbucket_url"]
     return None
 
 
@@ -66,7 +80,17 @@ def build_demo_checkouts() -> list[Path]:
         # checkout, and the demo has to look like one. Git itself is never run
         # against these — demo divergence facts come from demo_git.
         (checkout / ".git").mkdir()
-        (checkout / "edge_deploy.yaml").write_text(f"tool: {tool}\n", encoding="utf-8")
+        remotes = DEMO_REMOTES[tool]
+        (checkout / "edge_deploy.yaml").write_text(
+            f"tool: {tool}\n"
+            f"github_url: {remotes['github_url']}\n"
+            f"bitbucket_url: {remotes['bitbucket_url']}\n",
+            encoding="utf-8",
+        )
+        # The committed gate verify runs (ADR-0016); a real checkout has one.
+        gate = checkout / "tools" / "dev"
+        gate.mkdir(parents=True)
+        (gate / "local_check.ps1").write_text("exit 0\n", encoding="utf-8")
         checkouts[tool] = checkout
 
     def write(run: dict, events: list[dict]) -> None:
