@@ -962,7 +962,7 @@ function termEl(id){
     <pre class="termout" tabindex="0"></pre>
     <div class="promptdock"></div>`;
   const out = el.querySelector(".termout");
-  t = {el, out, cursor: 0, pinned: true, data: null};
+  t = {el, out, cursor: 0, pinned: true, hydrated: false};
   out.addEventListener("scroll", () => {
     t.pinned = out.scrollHeight - out.scrollTop - out.clientHeight < 24;
   });
@@ -1112,31 +1112,33 @@ async function startAction(payload){
   actionsById.set(started.id, started);
   termEl(started.id);
   placeTerminals();
-  pump(started.id);
+  pump(started.id, true);
   pollRuns();
 }
 
+// Follow a running command, or (follow=false) pull a finished one's transcript
+// once — that is what makes a reload, or a second tab, show the whole thing.
 const pumping = new Set();
-async function pump(id){
+async function pump(id, follow){
   if(pumping.has(id)) return;
   pumping.add(id);
   try{
     for(;;){
       const t = termEl(id);
-      const res = await fetch(`/api/actions/${id}/output?cursor=${t.cursor}&wait=20`);
+      const res = await fetch(`/api/actions/${id}/output?cursor=${t.cursor}&wait=${follow ? 20 : 0}`);
       if(!res.ok) break;
       const data = await res.json();
       t.cursor = data.cursor;
+      t.hydrated = true;
       actionsById.set(id, data);
       appendOutput(id, data.text, data.reset);
       renderTerm(id);
-      if(data.status !== "running" && data.status !== "starting") break;
+      if(!follow || (data.status !== "running" && data.status !== "starting")) break;
     }
   }catch(_e){ /* server briefly gone; the action list will re-attach */ }
   finally{
     pumping.delete(id);
-    pollRuns();
-    pollTools();
+    if(follow){ pollRuns(); pollTools(); }
   }
 }
 
@@ -1320,7 +1322,9 @@ async function pollActions(){
       const before = actionsById.get(a.id);
       actionsById.set(a.id, Object.assign({}, before, a));
       if(!before) changed = true;
-      if(a.status === "running" || a.status === "starting") pump(a.id);
+      const running = a.status === "running" || a.status === "starting";
+      if(running) pump(a.id, true);
+      else if(!termEl(a.id).hydrated) pump(a.id, false);
       renderTerm(a.id);
     }
     if(changed) placeTerminals();

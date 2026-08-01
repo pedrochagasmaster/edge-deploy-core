@@ -1538,6 +1538,12 @@ def test_http_action_round_trip_streams_output_and_relays_a_secret(tmp_path) -> 
         _, listing = _request(port, "GET", "/api/actions")
         assert [a["id"] for a in listing["actions"]] == [action_id]
         assert {entry["id"] for entry in listing["catalog"]} == set(ACTION_SPECS)
+
+        # A reload re-reads the whole transcript from cursor 0 without waiting,
+        # which is how a second tab (or a refreshed one) catches up.
+        _, replayed = _request(port, "GET", f"/api/actions/{action_id}/output?cursor=0&wait=0")
+        assert replayed["text"] == done["text"]
+        assert "pump(a.id, false)" in PAGE  # the page takes that path when not following
     finally:
         server.shutdown()
         server.server_close()
