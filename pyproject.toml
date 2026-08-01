@@ -36,4 +36,5 @@ select = ["E", "F", "W", "I"]
 
 [tool.ruff.lint.per-file-ignores]
 # The console embeds its whole page (CSS/JS) in one string; long lines are the page's.
-"edge_console.py" = ["E501"]
+"edge_console/page.py" = ["E501"]
+"edge_console/demo.py" = ["E501"]
