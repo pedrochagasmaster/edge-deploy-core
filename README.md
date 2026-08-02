@@ -161,13 +161,15 @@ It opens `http://127.0.0.1:7643/` and shows:
 
 - **whatever is open or live**, spotlighted: the run's rail through the five
   postures, per-node deploy state, live transfer progress, and one button per
-  remaining command — `release --guided`, the next phase on its own, `status`,
-  `abandon`;
+  remaining command — `release --guided`, the next phase on its own (with a
+  deep-smoke variant where the tool declares one), `status`, `abandon`, and a
+  lock-stealing resume when another process holds the run;
 - **a release decision card** for every checkout with no run in flight: the
   verdict, the deployed / checkout / GitHub-main commits it rests on, a
   precondition checklist with `git pull` / `git push` / `preflight` /
   `transport-smoke` buttons, and one "Start guided release" call to action;
-- **closed runs**, in a collapsed history section.
+- **closed runs**, in a collapsed history section — each completed release
+  offering a rollback to its own tag.
 
 Buttons run the exact command shown beside them, in that checkout, and stream
 the engine's output. When the engine stops for the operator — the RSA passcode,
@@ -175,12 +177,15 @@ the guided posture acknowledgement, a `[y/N]` gate — the console shows the
 prompt and relays your answer. Secrets go straight to the running process and
 are masked in the transcript; they are never stored.
 
-Two cases still need a terminal: a deep-smoke release (`--smoke deep`, the only
-thing that asks for a Kerberos password) has no console action, and a node
-configured `transport: pane` takes its RSA passcode in the attached tmux pane,
-so the console can only show that it is waiting. Releasing a run whose lock was
-left behind by a dead process also needs a terminal — the console will not
-steal a lock.
+The console drives **Paramiko nodes only**. A node configured `transport: pane`
+takes its RSA passcode in the attached tmux pane, which the console can neither
+see nor answer, so it refuses `deploy`, `release`, `rollback` and
+`transport-smoke` for that node and tells you to use a terminal; `preflight` is
+TCP-only and still works. Pane stays the documented per-node recovery override
+([ADR-0011](docs/adr/0011-pane-safe-remote-transport.md)) — just not from here.
+
+Taking a run lock from a process you believe is dead is offered on the blocked
+run itself, behind a dialog naming the pid and host that hold it.
 
 **Start the console from a shell that has `BB_TOKEN` set.** Every command
 inherits the console process's environment, so exporting it later, or in

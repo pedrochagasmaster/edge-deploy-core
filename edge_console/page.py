@@ -516,6 +516,7 @@ function actionRow(a){
   return `<div class="${cls}">
     <button class="${btnCls}" data-payload="${esc(JSON.stringify(a.payload))}"
       ${disabled ? "disabled" : ""} ${a.confirm ? `data-confirm="${esc(a.confirm)}"` : ""}
+      ${a.confirmText ? `data-confirm-text="${esc(a.confirmText)}"` : ""}
       title="${esc(a.cmd)}">${esc(a.label)}</button>
     <div class="actmain">
       <div class="acttext">${a.text}</div>
@@ -619,7 +620,22 @@ function sourceProblems(t){
       cta: "This checkout has no tools/dev/local_check.ps1, which verify runs as the tool's own gate.",
       text: `<b>This checkout has no <code>tools/dev/local_check.ps1</code>.</b> Verify runs the tool's own
         committed gate and blocks the release when it is missing.`});
+  // CI is reported, not predicted: an unknown never blocks, because it needs
+  // the network and can change between this answer and the click.
+  const ci = t.ci;
+  if(ci && (ci.status === "failed" || ci.status === "pending" || ci.status === "missing"))
+    out.push({phases: ["verify"], short: `ci ${ci.status}`,
+      cta: `GitHub CI is not green for this commit: ${ci.detail}.`,
+      text: `<b>GitHub CI is not green for this commit:</b> ${esc(ci.detail)}. Verify requires a successful
+        post-merge run for the exact SHA${ci.status === "pending" ? " — waiting may be all this needs" : ""}.`});
   return out;
+}
+
+// The console drives Paramiko nodes only (ADR-0018): a pane node's passcode is
+// typed in the tmux pane, which the console can neither see nor answer.
+function paneNodes(nodes, env){
+  const transports = (env && env.operator_config && env.operator_config.nodes) || {};
+  return (nodes || []).filter(node => transports[node] === "pane").sort();
 }
 
 // Turn a condition into the buttons it stops for THIS run. A condition that
@@ -651,7 +667,12 @@ function runBlockers(run, env, tool, consoleHoldsLock){
 
   const runSha = st.engine && st.engine.content_sha256;
   const live = env && env.engine;
-  if(runSha && live && live.status === "ok" && live.content_sha256 && runSha !== live.content_sha256)
+  if(!runSha)
+    // enter_phase indexes engine.content_sha256 directly and dies on a KeyError.
+    out.push({blocks: PHASE_ACTION_IDS, short: "no engine identity",
+      text: `<b>This run's ledger records no engine identity.</b> Every phase reads it on entry and stops
+        without it; the run has to be abandoned and recreated.`});
+  else if(live && live.status === "ok" && live.content_sha256 && runSha !== live.content_sha256)
     out.push({blocks: PHASE_ACTION_IDS, short: "engine mismatch",
       text: `<b>This run belongs to a different engine build.</b> It was created by
         <code>${esc(runSha.slice(0,8))}</code> and the console would run <code>${esc(live.content_sha256.slice(0,8))}</code>.
@@ -680,12 +701,19 @@ function runBlockers(run, env, tool, consoleHoldsLock){
 
   const config = env && env.operator_config;
   const configured = config && config.nodes;
-  if(configured && configured.length && !phasePassed(run, "deploy")){
-    const missing = Object.keys(st.phases.deploy || {}).filter(n => !configured.includes(n));
+  const runNodes = Object.keys(st.phases.deploy || {});
+  if(configured && Object.keys(configured).length && !phasePassed(run, "deploy")){
+    const missing = runNodes.filter(n => !(n in configured));
     if(missing.length)
       out.push({blocks: ["deploy","release"], short: "unknown node",
         text: `<b>${esc(missing.join(", "))} ${missing.length === 1 ? "is" : "are"} no longer in the operator config.</b>
           Deploy resolves node names against it and stops on the first one it does not know.`});
+    const pane = paneNodes(runNodes, env);
+    if(pane.length)
+      out.push({blocks: ["deploy","release"], short: "pane transport",
+        text: `<b>${esc(pane.join(", "))} ${pane.length === 1 ? "uses" : "use"} the tmux pane transport.</b>
+          Its RSA passcode is typed in the pane, which the console cannot see or answer — run this deploy
+          from a terminal.`});
   }
   return out;
 }
@@ -696,14 +724,16 @@ function blockersHtml(blockers){
     blockers.map(b => `<li><span>${b.text}</span></li>`).join("") + `</ul>`;
 }
 
-function runActions(run, blockers){
+function runActions(run, blockers, tool, consoleHoldsLock){
   const st = run.state;
   if(isTrainingRun(st) || st.status !== "open") return [];
   const id = st.run_id, root = run.root, next = nextPhase(run);
-  const blocked = action => {
-    const hit = (blockers || []).filter(b => b.blocks.includes(action));
+  const reasons = (action, ignoreLock) => {
+    const hit = (blockers || []).filter(b =>
+      b.blocks.includes(action) && !(ignoreLock && b.short === "run is locked"));
     return hit.length ? hit.map(b => b.short).join(" · ") : null;
   };
+  const blocked = action => reasons(action, false);
   const rows = [];
   rows.push({
     label: "▶ Resume guided release",
@@ -727,6 +757,33 @@ function runActions(run, blockers){
       blockedBy: blocked(PHASE_ACTION[next]),
     });
   }
+  // Deep smoke is the only thing that asks for a Kerberos password, so it is
+  // offered only where the tool profile declares one.
+  if(next === "deploy" && tool && tool.deep_smoke)
+    rows.push({
+      label: "Run deploy with deep smoke",
+      cap: PHASE_REQ.deploy,
+      text: "Adds this tool's deep smoke checks, which need a Kerberos ticket — the console relays that prompt too.",
+      cmd: `${nextCommand(run, "deploy")} --smoke deep`,
+      payload: {action:"deploy", root, run_id:id, nodes:pendingNodes(run), smoke:"deep"},
+      blockedBy: blocked("deploy"),
+    });
+  // The one way past a lock the console otherwise refuses to touch.
+  if(run.lock && !consoleHoldsLock)
+    rows.push({
+      label: "Take the lock and resume",
+      danger: true,
+      cap: "any",
+      text: `Steals the run lock held by pid ${run.lock.pid} on ${run.lock.hostname} and resumes the guided
+             release. Only do this once you know that process is gone — two engines in one run corrupt it.`,
+      cmd: `py -m edge_deploy release --guided --run ${id} --force-lock`,
+      payload: {action:"release", root, run_id:id, force_lock:true},
+      confirm: "yes-no",
+      confirmText: `The lock on ${id} is held by pid ${run.lock.pid} on ${run.lock.hostname}. `
+                 + `Take it anyway? Two engines in one run corrupt it.`,
+      // Every other reason still applies — this row only ignores the lock.
+      blockedBy: reasons("release", true),
+    });
   // status reads local ledgers only: no config, no lock, no engine identity.
   // It is the one command that still works when everything else refuses.
   rows.push({
@@ -896,6 +953,33 @@ function progressHtml(run){
   return html;
 }
 
+// A completed release is the thing you roll back *to*, so the offer belongs on
+// its own card — the history is exactly the list of tags worth restoring.
+function releaseTagOf(st){
+  for(const phase of ["tag_github", "tag_bitbucket"]){
+    const tag = st.phases[phase] && st.phases[phase].evidence && st.phases[phase].evidence.tag;
+    if(tag) return tag;
+  }
+  return null;
+}
+
+function rollbackHtml(run, opts){
+  const st = run.state;
+  const tag = releaseTagOf(st);
+  if(!tag || opts.rootHasOpenRun) return "";
+  return `<div class="actions">${actionRow({
+    label: "Roll back to this release",
+    danger: true,
+    cap: "any",
+    text: `Creates a rollback run that restores <code>${esc(tag)}</code> across the Edge Nodes. Nothing is
+           rewound on Bitbucket; a rollback is a forward deployment of an older reviewed commit (ADR-0003).`,
+    cmd: `py -m edge_deploy rollback --tag ${tag}`,
+    payload: {action: "rollback", root: run.root, tag},
+    confirm: "yes-no",
+    confirmText: `Roll the Edge Nodes back to ${tag}? This starts a new run.`,
+  })}</div>`;
+}
+
 function runHtml(run, opts){
   opts = opts || {};
   const st = run.state;
@@ -928,8 +1012,9 @@ function runHtml(run, opts){
       <code>${esc(guidance)}</code>
     </div>`;
   } else if(st.status === "open"){
-    const blockers = runBlockers(run, environment(), toolFor(run.root), consoleIsBusyIn(run.root));
-    const rows = runActions(run, blockers);
+    const tool = toolFor(run.root), busy = consoleIsBusyIn(run.root);
+    const blockers = runBlockers(run, environment(), tool, busy);
+    const rows = runActions(run, blockers, tool, busy);
     tail = blockersHtml(blockers) +
       (rows.length ? `<div class="actions">${rows.map(actionRow).join("")}</div>` : "");
   } else if(st.status === "abandoned"){
@@ -937,7 +1022,8 @@ function runHtml(run, opts){
   } else if(training){
     tail = `<div class="done-line">complete — TRAINING ONLY practice finished (not a production release)</div>`;
   } else {
-    tail = `<div class="done-line">complete — release-tagged on GitHub and Bitbucket</div>`;
+    tail = `<div class="done-line">complete — release-tagged on GitHub and Bitbucket</div>`
+         + rollbackHtml(run, opts);
   }
 
   const slot = opts.spotlight ? `<div class="term-slot" data-root="${esc(run.root || "")}"></div>` : "";
@@ -1135,6 +1221,12 @@ function checklistHtml(t){
     item("", `Optional: exercise the Paramiko transport end to end.`,
       btn(`Smoke ${node}`, {action:"transport_smoke", root:t.root, node},
           `py -m edge_deploy transport-smoke --node ${node}`, "edge"));
+    if(t.deployed && t.deployed.sha)
+      item("", `Optional: check the node still matches what was last deployed.`,
+        btn(`Drift ${node}`,
+            {action:"drift", root:t.root, tool:t.tool, node, commit:t.deployed.sha},
+            `py -m edge_deploy drift --tool ${t.tool} --node ${node} --commit ${sha7(t.deployed.sha)}`,
+            "both"));
   }
   return `<ol class="checklist">${items.join("")}</ol>`;
 }
@@ -1569,7 +1661,11 @@ function renderHistory(){
       <button class="fchip clear" id="filter-clear-empty">clear filter</button></div>`;
     return;
   }
-  el.innerHTML = filtered.map(r => runHtml(r)).join("");
+  // A rollback creates a run, which the engine refuses while one is open.
+  const busyRoots = new Set(all.filter(r => r.state.status === "open").map(r => r.root));
+  el.innerHTML = filtered
+    .map(r => runHtml(r, {rootHasOpenRun: busyRoots.has(r.root)}))
+    .join("");
   for(const d of el.querySelectorAll("details.log")) if(openLogs.has(d.dataset.key)) d.open = true;
 }
 
@@ -1738,6 +1834,8 @@ document.addEventListener("click", async ev => {
       const reason = window.prompt("Why is this run being abandoned? The reason is recorded in the ledger.");
       if(!reason) return;
       payload.reason = reason;
+    } else if(runBtn.dataset.confirm === "yes-no"){
+      if(!window.confirm(runBtn.dataset.confirmText || "Are you sure?")) return;
     }
     runBtn.disabled = true;
     try{ await startAction(payload); }

@@ -313,11 +313,12 @@ for you:
   prints and then waits on, so an unrecognised prompt cannot hang a run
   silently.
 
-Two prompts stay in the terminal. A Kerberos password is only asked during a
-deep-smoke release (`--smoke deep`), which no console button runs; and a node
-configured `transport: pane` takes its RSA passcode in the attached tmux pane,
-where the console cannot see or answer it — it shows "waiting for operator"
-and nothing more.
+The console drives **Paramiko nodes only**. A node configured `transport: pane`
+takes its RSA passcode in the attached tmux pane, where the console can neither
+see nor answer it, so `deploy`, `release`, `rollback` and `transport-smoke` are
+refused for that node with a pointer to the terminal. `preflight` is TCP-only
+and still works. Pane remains the documented per-node recovery override
+(ADR-0011); it is just not driven from here.
 
 The console cannot change your firewall posture — that stays a manual
 workstation change, exactly as above. It only names the posture the next phase
@@ -340,9 +341,13 @@ in, a checkout that is not on `main` or not clean or has drifted off the run's
 reviewed commit or whose remotes do not match its `edge_deploy.yaml`, a missing
 `tools/dev/local_check.ps1` or no PowerShell to run it, an unset `audit_repo`
 or audit records still queued, and nodes in the ledger that are no longer in
-the operator config. `status` is never blocked — it reads local ledgers only, and is the one
-command that still answers when the rest refuse. What the console cannot know
-cheaply, above all GitHub CI state, is left to the engine to report as it runs.
+the operator config, and GitHub CI that is not green for the commit being released.
+`status` is never blocked — it reads local ledgers only, and is the one command
+that still answers when the rest refuse. A CI answer the console cannot get
+(no `gh`, no network) never blocks anything; it is reported, not enforced.
+
+Rollbacks are offered from the completed run they would restore, in the history
+section, and only when no run is open in that checkout.
 
 Start it with `--read-only` to get the dashboard with every button disabled;
 the commands stay visible and copyable. Onboarding always launches it that way.

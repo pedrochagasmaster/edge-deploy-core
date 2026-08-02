@@ -60,6 +60,11 @@ _SPEC_PARAMS = {
     "nodes": ["node03"],
     "node": "node03",
     "reason": "because",
+    "tag": "release-20260710T000000Z-aaaaaaa",
+    "commit": "a" * 40,
+    "tool": "autobench",
+    "smoke": "standard",
+    "force_lock": False,
 }
 
 _FORBIDDEN_PRODUCTION_COMMANDS = (
@@ -102,6 +107,7 @@ def _write_state(
     training: bool | None = None,
     phases: dict | None = None,
     operator: str = "pedro.chagas",
+    nodes: list[str] | None = None,
 ) -> None:
     run_dir.mkdir(parents=True)
     state = {
@@ -114,7 +120,7 @@ def _write_state(
         "kind": kind,
         "rollback_tag": None,
         "engine": {"version": "1.4.0", "package_dir": "(test)", "content_sha256": "b" * 64},
-        "nodes": ["node03"],
+        "nodes": nodes or ["node03"],
         "status": status,
         "abandon_reason": None,
         "phases": phases if phases is not None else {},
@@ -628,7 +634,7 @@ def test_run_action_payloads_carry_the_runs_own_checkout() -> None:
     any root it does not watch, so a multi-root console can never run one
     tool's command inside another tool's checkout."""
     script = _page_script_through_run_html()
-    body = script.split("function runActions(run, blockers){", 1)[1].split("\n}\n", 1)[0]
+    body = script.split("function runActions(run, blockers, tool, consoleHoldsLock){", 1)[1].split("\n}\n", 1)[0]
     assert "const id = st.run_id, root = run.root" in body
     for payload in ("action:\"release\", root, run_id:id", "action:\"abandon\", root, run_id:id"):
         assert payload in body, payload
@@ -1222,7 +1228,7 @@ def _run_blockers(
 
 _OK_ENV = {
     "engine": {"status": "ok", "content_sha256": "e" * 64, "version": "1.5.4"},
-    "operator_config": {"status": "ok", "path": "/cfg.yaml", "nodes": ["node03"]},
+    "operator_config": {"status": "ok", "path": "/cfg.yaml", "nodes": {"node03": "ssh"}},
     "bb_token": {"present": True},
 }
 
@@ -1266,7 +1272,7 @@ def test_run_blockers_catch_the_refusals_the_engine_would_produce() -> None:
     assert "restart the console" in no_token[0]["text"]
 
     unknown_node = _run_blockers(
-        _open_run(), {**_OK_ENV, "operator_config": {"status": "ok", "path": "/c", "nodes": ["node99"]}}, None
+        _open_run(), {**_OK_ENV, "operator_config": {"status": "ok", "path": "/c", "nodes": {"node99": "ssh"}}}, None
     )
     assert "node03" in unknown_node[0]["text"]
     assert sorted(unknown_node[0]["blocks"]) == ["deploy", "release"]
@@ -1302,6 +1308,102 @@ def test_blockers_do_not_disable_commands_for_phases_already_behind_the_run() ->
         == ["no BB_TOKEN"]
     assert [b["short"] for b in _run_blockers(early, {**_OK_ENV, "powershell": {"present": False}}, None)] \
         == ["no powershell"]
+
+
+def test_pane_transport_nodes_are_refused_by_the_console(tmp_path) -> None:
+    """ADR-0018: the console is a Paramiko surface. A pane node's RSA passcode
+    is typed in the tmux pane, which the console can neither see nor answer, so
+    it would sit on 'waiting for operator' until the operator gave up."""
+    root = _checkout(tmp_path)
+    _write_state(
+        root / "edge-deploy" / "runs" / "run-20260710T000000Z-aaaaaaa",
+        "run-20260710T000000Z-aaaaaaa",
+        phases=_pending_phases(["node03", "node04"]),
+        nodes=["node03", "node04"],
+    )
+    registry = ActionRegistry(
+        roots=[root],
+        argv_builder=_script_runner("print('ok')"),
+        node_transports=lambda: {"node03": "ssh", "node04": "pane"},
+    )
+    run_id = "run-20260710T000000Z-aaaaaaa"
+
+    for body in (
+        {"action": "deploy", "root": str(root), "run_id": run_id, "nodes": ["node04"]},
+        # No --nodes: the refusal has to look at the run's own node list.
+        {"action": "deploy", "root": str(root), "run_id": run_id},
+        {"action": "release", "root": str(root), "run_id": run_id},
+        {"action": "transport_smoke", "root": str(root), "node": "node04"},
+    ):
+        with pytest.raises(ActionError) as refused:
+            registry.start(body)
+        assert refused.value.status == 409, body
+        assert "node04" in str(refused.value)
+        assert "from a terminal" in str(refused.value)
+
+    # The Paramiko node is fine, and preflight is TCP-only either way.
+    for body in (
+        {"action": "deploy", "root": str(root), "run_id": run_id, "nodes": ["node03"]},
+        {"action": "preflight", "root": str(root), "node": "node04"},
+    ):
+        runner = registry.start(body)
+        _await(lambda: runner.snapshot()["status"] == "exited", what=f"{body['action']} to finish")
+
+
+def test_rollback_only_accepts_a_tag_the_engine_would_have_minted(tmp_path) -> None:
+    root = _checkout(tmp_path)
+    registry = _registry([root], script="print('ok')")
+    for bogus in ("v1.5.4", "release-nope", "; rm -rf /", "release-20260710T000000Z-AAAAAAA", ""):
+        with pytest.raises(ActionError):
+            registry.start({"action": "rollback", "root": str(root), "tag": bogus})
+    runner = registry.start(
+        {"action": "rollback", "root": str(root), "tag": "release-20260710T000000Z-aaaaaaa"}
+    )
+    assert runner.command == "py -m edge_deploy rollback --tag release-20260710T000000Z-aaaaaaa"
+
+
+def test_force_lock_and_deep_smoke_reach_the_command_line(tmp_path) -> None:
+    root = _checkout(tmp_path)
+    run_id = "run-20260710T000000Z-aaaaaaa"
+    _write_state(root / "edge-deploy" / "runs" / run_id, run_id, phases=_pending_phases())
+    registry = _registry([root], script="print('ok')")
+
+    forced = registry.start(
+        {"action": "verify", "root": str(root), "run_id": run_id, "force_lock": True}
+    )
+    assert forced.command.endswith("--force-lock")
+    _await(lambda: forced.snapshot()["status"] == "exited", what="verify to finish")
+
+    deep = registry.start(
+        {"action": "deploy", "root": str(root), "run_id": run_id,
+         "nodes": ["node03"], "smoke": "deep"}
+    )
+    assert "--smoke deep" in deep.command
+    _await(lambda: deep.snapshot()["status"] == "exited", what="deploy to finish")
+
+    with pytest.raises(ActionError):
+        registry.start(
+            {"action": "deploy", "root": str(root), "run_id": run_id, "smoke": "shallow"}
+        )
+
+
+def test_a_run_without_an_engine_identity_is_flagged_rather_than_offered() -> None:
+    """enter_phase reads engine.content_sha256 directly and dies on a KeyError."""
+    run = _open_run()
+    del run["state"]["engine"]["content_sha256"]
+    blockers = _run_blockers(run, _OK_ENV, None)
+    assert [b["short"] for b in blockers] == ["no engine identity"]
+    assert "abandon" not in blockers[0]["blocks"]
+
+
+def test_shutdown_waits_for_children_to_actually_stop(tmp_path) -> None:
+    """cancel() escalates on a daemon thread; without the join, console exit
+    would kill that thread and leave the child holding its run lock."""
+    root = _checkout(tmp_path)
+    registry = _registry([root], script="import time; time.sleep(30)")
+    runner = registry.start({"action": "status", "root": str(root)})
+    registry.shutdown()
+    assert runner.snapshot()["status"] == "exited"
 
 
 def test_a_lock_the_console_itself_holds_is_not_reported_as_a_foreign_process() -> None:
@@ -1376,7 +1478,7 @@ def test_operator_config_and_bb_token_are_reported_honestly(tmp_path, monkeypatc
     )
     loaded = probe_operator_config(good)
     assert loaded["status"] == "ok"
-    assert loaded["nodes"] == ["node03"]
+    assert loaded["nodes"] == {"node03": "ssh"}
 
     monkeypatch.delenv("BB_TOKEN", raising=False)
     assert probe_bb_token() == {"present": False}
@@ -1447,14 +1549,8 @@ def test_every_console_action_is_an_allowlisted_engine_or_git_command() -> None:
     """The only mutation surface is ACTION_SPECS: each entry becomes a fixed
     argv list, never a shell string, and never a command of the console's own
     invention."""
-    params = {
-        "run_id": "run-20260710T000000Z-aaaaaaa",
-        "nodes": ["node03"],
-        "node": "node03",
-        "reason": "because",
-    }
     for spec in ACTION_SPECS.values():
-        args = spec.args(params)
+        args = spec.args(_SPEC_PARAMS)
         assert isinstance(args, list) and all(isinstance(a, str) for a in args)
         shown = display_command(spec, args)
         if spec.kind == "git":
@@ -1473,6 +1569,8 @@ def test_every_console_action_is_an_allowlisted_engine_or_git_command() -> None:
                 "status",
                 "preflight",
                 "transport-smoke",
+                "rollback",
+                "drift",
             }
         assert spec.cap in CAPABILITIES
 

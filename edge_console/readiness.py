@@ -96,7 +96,9 @@ def probe_operator_config(path: Path | None = None) -> dict:
     return {
         "status": "ok",
         "path": str(config_path),
-        "nodes": sorted(operator.nodes),
+        # name -> transport: the console drives Paramiko nodes only, because a
+        # pane node's RSA passcode is typed in the tmux pane, which it cannot see.
+        "nodes": {name: node.transport for name, node in sorted(operator.nodes.items())},
         "audit_repo": operator.audit_repo,
     }
 
@@ -163,7 +165,12 @@ class ReadinessProber:
                     "content_sha256": self._demo_engine_sha,
                     "package_dir": "(demo)",
                 },
-                "operator_config": {"status": "ok", "path": "(demo)", "nodes": ["node03", "node04", "node05"]},
+                "operator_config": {
+                    "status": "ok",
+                    "path": "(demo)",
+                    "nodes": {node: "ssh" for node in ("node03", "node04", "node05")},
+                    "audit_repo": "(demo)",
+                },
                 "bb_token": {"present": True},
                 "powershell": {"present": True, "path": "(demo)"},
                 "audit": {"repo": "(demo)", "outbox": "(demo)", "queued": False},

@@ -11,6 +11,7 @@ github-read action and so works in every posture — ADR-0013).
 from __future__ import annotations
 
 import base64
+import json
 import os
 import re
 import socket
@@ -23,7 +24,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from edge_console.demo import demo_git
+from edge_console.demo import demo_ci, demo_git
 from edge_console.ledger import collect_runs, runs_root_for
 from edge_deploy.config import (
     DEFAULT_OPERATOR_CONFIG_PATH,
@@ -37,6 +38,7 @@ PROBE_CACHE_SECONDS = 10.0
 GITHUB_WRITE_TIMEOUT = 20.0
 GITHUB_WRITE_STATUSES = frozenset({"ok", "fail", "unknown"})
 GIT_TIMEOUT = 10.0
+GH_TIMEOUT = 15.0
 TOOLS_CACHE_SECONDS = 30.0
 
 STATIC_GROUPS: dict[str, list[tuple[str, int]]] = {
@@ -374,7 +376,7 @@ def _release_source_state(root: Path, git=_git) -> dict:
     (ADR-0016). Both refuse before anything is published, and both are a file
     read away.
     """
-    state: dict = {"profile": None, "remotes": None, "local_check": None}
+    state: dict = {"profile": None, "remotes": None, "local_check": None, "deep_smoke": False}
     try:
         profile = load_tool_profile(root)
     except Exception as exc:
@@ -402,7 +404,53 @@ def _release_source_state(root: Path, git=_git) -> dict:
             wrong.append(f"{remote} points at {actual}")
     state["remotes"] = {"ok": not wrong, "detail": "; ".join(wrong)}
     state["local_check"] = (root / "tools" / "dev" / "local_check.ps1").is_file()
+    # Deep smoke is the only thing that asks for a Kerberos password, so the
+    # console offers it only where the tool actually declares one.
+    state["deep_smoke"] = bool(getattr(profile.smoke, "deep", None))
     return state
+
+
+def probe_github_ci(root: Path, commit: str | None, *, runner=None) -> dict:
+    """Whether GitHub CI succeeded for exactly this commit.
+
+    Verify refuses without it (``require_successful_github_ci``). This is the
+    one gate the console reports rather than predicts hard: it needs ``gh`` and
+    the network, and it can change between this answer and the click — so an
+    unknown never blocks anything.
+    """
+    if not commit:
+        return {"status": "unknown", "detail": "no commit to check"}
+    command = [
+        "gh", "run", "list", "--commit", commit, "--branch", "main",
+        "--workflow", "CI", "--json", "conclusion", "--limit", "20",
+    ]
+    try:
+        completed = (runner or _run_gh)(root, command)
+    except Exception as exc:  # gh missing, unauthenticated, offline
+        return {"status": "unknown", "detail": f"{type(exc).__name__}: {exc}"}
+    if completed is None:
+        return {"status": "unknown", "detail": "gh could not report CI status"}
+    try:
+        runs = json.loads(completed)
+    except ValueError:
+        return {"status": "unknown", "detail": "gh returned unexpected output"}
+    conclusions = [str(item.get("conclusion") or "") for item in runs]
+    if any(value == "success" for value in conclusions):
+        return {"status": "success", "detail": ""}
+    if not conclusions:
+        return {"status": "missing", "detail": f"no CI run recorded for {commit[:7]}"}
+    if any(value == "" for value in conclusions):
+        return {"status": "pending", "detail": f"CI has not finished for {commit[:7]}"}
+    return {"status": "failed", "detail": f"CI concluded {conclusions[0]} for {commit[:7]}"}
+
+
+def _run_gh(root: Path, command: list[str]) -> str | None:
+    env = dict(os.environ)
+    env["GH_PROMPT_DISABLED"] = "1"
+    completed = subprocess.run(
+        command, cwd=str(root), capture_output=True, text=True, timeout=GH_TIMEOUT, env=env
+    )
+    return completed.stdout if completed.returncode == 0 else None
 
 
 def _last_deployed(runs: list[dict]) -> dict | None:
@@ -497,7 +545,7 @@ def probe_divergence(root: Path, runs: list[dict], *, git=_git) -> dict:
     }
 
 
-def probe_tool(root: Path, *, git=_git) -> dict:
+def probe_tool(root: Path, *, git=_git, ci=probe_github_ci) -> dict:
     """Everything the tool card needs: identity, open run, nodes, divergence."""
     runs = collect_runs(runs_root_for(root))
     open_run = next(
@@ -512,15 +560,19 @@ def probe_tool(root: Path, *, git=_git) -> dict:
         "nodes": nodes,
     }
     entry.update(probe_divergence(root, runs, git=git))
+    entry["ci"] = ci(root, entry.get("head"))
     return entry
 
 
 class ToolsProber:
     """Cached per-checkout divergence probe (ls-remote hits the network)."""
 
-    def __init__(self, roots: list[Path], demo: bool, git=None) -> None:
+    def __init__(self, roots: list[Path], demo: bool, git=None, ci=None) -> None:
         self._roots = roots
         self._git = git or (demo_git if demo else _git)
+        # --demo has no GitHub to ask, and a canned "success" would be a lie
+        # dressed as a fact; report it as unknown, which blocks nothing.
+        self._ci = ci or (demo_ci if demo else probe_github_ci)
         self._lock = threading.Lock()
         self._cached: dict | None = None
         self._cached_at = 0.0
@@ -536,7 +588,9 @@ class ToolsProber:
             if self._cached and time.monotonic() - self._cached_at < TOOLS_CACHE_SECONDS:
                 return self._cached
         with ThreadPoolExecutor(max_workers=max(1, len(self._roots))) as pool:
-            tools = list(pool.map(lambda root: probe_tool(root, git=self._git), self._roots))
+            tools = list(
+                pool.map(lambda root: probe_tool(root, git=self._git, ci=self._ci), self._roots)
+            )
         result = {"probed_at": time.strftime("%H:%M:%SZ", time.gmtime()), "tools": tools}
         with self._lock:
             self._cached = result

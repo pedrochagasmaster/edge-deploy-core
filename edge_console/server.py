@@ -31,7 +31,10 @@ MAX_LONG_POLL_SECONDS = 25.0
 # Actions that create or advance a Run must run in a real tool checkout.
 # Training workspaces deliberately are not git checkouts (ADR-0017).
 _NEEDS_CHECKOUT = frozenset(
-    {"release", "verify", "publish", "deploy", "tag_bitbucket", "tag_github", "abandon"}
+    {
+        "release", "rollback", "verify", "publish", "deploy",
+        "tag_bitbucket", "tag_github", "abandon",
+    }
 )
 
 
@@ -267,6 +270,14 @@ def main(argv: list[str] | None = None) -> int:
         roots, write_roots = resolve_console_roots(args)
 
     tools_prober = ToolsProber(roots, demo=args.demo)
+    readiness = ReadinessProber(
+        engine_python=args.engine_python or sys.executable,
+        # Actions run inside a watched checkout, so that is where the engine
+        # identity has to be asked for the answer to be the one they will get.
+        probe_root=roots[0] if roots else None,
+        demo=args.demo,
+        demo_engine_sha=DEMO_ENGINE_SHA,
+    )
     registry = None
     if not args.read_only:
         registry = ActionRegistry(
@@ -276,19 +287,13 @@ def main(argv: list[str] | None = None) -> int:
             # A finished command usually moved the ledger or the checkout;
             # drop the cached divergence so the next poll re-reads reality.
             on_finish=lambda _runner: tools_prober.invalidate(),
+            node_transports=lambda: readiness.snapshot()["operator_config"].get("nodes") or {},
         )
 
     ConsoleHandler.roots = roots
     ConsoleHandler.prober = PostureProber(demo=args.demo, roots=write_roots)
     ConsoleHandler.tools_prober = tools_prober
-    ConsoleHandler.readiness = ReadinessProber(
-        engine_python=args.engine_python or sys.executable,
-        # Actions run inside a watched checkout, so that is where the engine
-        # identity has to be asked for the answer to be the one they will get.
-        probe_root=roots[0] if roots else None,
-        demo=args.demo,
-        demo_engine_sha=DEMO_ENGINE_SHA,
-    )
+    ConsoleHandler.readiness = readiness
     ConsoleHandler.registry = registry
     ConsoleHandler.demo = args.demo
     ConsoleHandler.read_only = args.read_only

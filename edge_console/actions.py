@@ -65,8 +65,15 @@ RETAINED_FINISHED_ACTIONS = 30
 # only: the console warns, the engine's own git-protocol probe decides.
 CAPABILITIES = frozenset({"any", "bb", "edge", "both", "gh"})
 
+# Commands that reach every node in the run, so the pane-transport refusal has
+# to look past the request's own arguments.
+_CHAINS_DEPLOY = frozenset({"release", "rollback"})
+
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
 _NODE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+_TAG_RE = re.compile(r"release-\d{8}T\d{6}Z-[0-9a-f]{7}")
+_SHA_RE = re.compile(r"[0-9a-f]{7,40}")
+_TOOL_RE = re.compile(r"[a-z][a-z0-9_-]{0,39}")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -93,19 +100,45 @@ class ActionSpec:
     summary: str = ""
 
 
+def _lock_flag(params: dict) -> list[str]:
+    """``--force-lock`` steals a lock the operator has said is dead."""
+    return ["--force-lock"] if params.get("force_lock") else []
+
+
+def _smoke_flag(params: dict) -> list[str]:
+    return ["--smoke", "deep"] if params.get("smoke") == "deep" else []
+
+
+def _phase_args(command: str) -> Callable[[dict], list[str]]:
+    return lambda p: [command, "--run", p["run_id"], *_lock_flag(p)]
+
+
 def _deploy_args(params: dict) -> list[str]:
     args = ["deploy", "--run", params["run_id"]]
     nodes = params.get("nodes")
     if nodes:
         args += ["--nodes", ",".join(nodes)]
-    return args
+    return args + _smoke_flag(params) + _lock_flag(params)
 
 
 def _release_args(params: dict) -> list[str]:
     args = ["release", "--guided"]
     if params.get("run_id"):
         args += ["--run", params["run_id"]]
-    return args
+    return args + _smoke_flag(params) + _lock_flag(params)
+
+
+def _rollback_args(params: dict) -> list[str]:
+    return ["rollback", "--tag", params["tag"], *_smoke_flag(params), *_lock_flag(params)]
+
+
+def _drift_args(params: dict) -> list[str]:
+    return [
+        "drift",
+        "--tool", params["tool"],
+        "--node", params["node"],
+        "--commit", params["commit"],
+    ]
 
 
 ACTION_SPECS: dict[str, ActionSpec] = {
@@ -116,8 +149,8 @@ ACTION_SPECS: dict[str, ActionSpec] = {
             label="Run verify",
             kind="engine",
             cap="any",
-            args=lambda p: ["verify", "--run", p["run_id"]],
-            params=("run_id",),
+            args=_phase_args("verify"),
+            params=("run_id", "force_lock"),
             needs_run=True,
             summary="Inspect the checkout, GitHub CI, and the committed tool gate.",
         ),
@@ -126,8 +159,8 @@ ACTION_SPECS: dict[str, ActionSpec] = {
             label="Run publish",
             kind="engine",
             cap="bb",
-            args=lambda p: ["publish-phase", "--run", p["run_id"]],
-            params=("run_id",),
+            args=_phase_args("publish-phase"),
+            params=("run_id", "force_lock"),
             needs_run=True,
             summary="Publish the reviewed source to Bitbucket.",
         ),
@@ -137,7 +170,7 @@ ACTION_SPECS: dict[str, ActionSpec] = {
             kind="engine",
             cap="both",
             args=_deploy_args,
-            params=("run_id", "nodes"),
+            params=("run_id", "nodes", "smoke", "force_lock"),
             needs_run=True,
             summary="Roll the pending Edge Nodes to the published snapshot.",
         ),
@@ -146,8 +179,8 @@ ACTION_SPECS: dict[str, ActionSpec] = {
             label="Tag Bitbucket",
             kind="engine",
             cap="bb",
-            args=lambda p: ["tag-bitbucket", "--run", p["run_id"]],
-            params=("run_id",),
+            args=_phase_args("tag-bitbucket"),
+            params=("run_id", "force_lock"),
             needs_run=True,
             summary="Push the immutable release tag to Bitbucket.",
         ),
@@ -156,8 +189,8 @@ ACTION_SPECS: dict[str, ActionSpec] = {
             label="Tag GitHub",
             kind="engine",
             cap="gh",
-            args=lambda p: ["tag-github", "--run", p["run_id"]],
-            params=("run_id",),
+            args=_phase_args("tag-github"),
+            params=("run_id", "force_lock"),
             needs_run=True,
             summary="Push the same release tag to GitHub and close the run.",
         ),
@@ -167,8 +200,27 @@ ACTION_SPECS: dict[str, ActionSpec] = {
             kind="engine",
             cap="any",
             args=_release_args,
-            params=("run_id",),
+            params=("run_id", "smoke", "force_lock"),
             summary="Walk every phase, pausing at each posture boundary and RSA prompt.",
+        ),
+        ActionSpec(
+            id="rollback",
+            label="Roll back",
+            kind="engine",
+            cap="any",
+            args=_rollback_args,
+            params=("tag", "smoke", "force_lock"),
+            destructive=True,
+            summary="Restore a previously recorded release tag across the Edge Nodes.",
+        ),
+        ActionSpec(
+            id="drift",
+            label="Check drift",
+            kind="engine",
+            cap="both",
+            args=_drift_args,
+            params=("tool", "node", "commit"),
+            summary="Compare a node's runtime-critical files against a known commit.",
         ),
         ActionSpec(
             id="abandon",
@@ -289,6 +341,35 @@ def _clean_reason(raw: object) -> str:
     return value[:200]
 
 
+def _clean_tag(raw: object) -> str:
+    """Only a tag the engine itself mints: ``release-<UTC>-<sha7>``."""
+    value = str(raw or "")
+    if not _TAG_RE.fullmatch(value):
+        raise ActionError(f"not a release tag: {value!r}")
+    return value
+
+
+def _clean_commit(raw: object) -> str:
+    value = str(raw or "")
+    if not _SHA_RE.fullmatch(value):
+        raise ActionError(f"not a commit sha: {value!r}")
+    return value
+
+
+def _clean_tool(raw: object) -> str:
+    value = str(raw or "")
+    if not _TOOL_RE.fullmatch(value):
+        raise ActionError(f"invalid tool name: {value!r}")
+    return value
+
+
+def _clean_smoke(raw: object) -> str:
+    value = str(raw or "standard")
+    if value not in ("standard", "deep"):
+        raise ActionError(f"smoke must be standard or deep, got {value!r}")
+    return value
+
+
 # ---------------------------------------------------------------------------
 # One running command
 # ---------------------------------------------------------------------------
@@ -353,6 +434,7 @@ class ActionRunner:
         self._prompt: _Prompt | None = None
         self._prompt_seq = 0
         self._cancel_requested = False
+        self._stopper: threading.Thread | None = None
         self._secrets: list[str] = []
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
@@ -455,7 +537,14 @@ class ActionRunner:
                 proc.stdin.close()
         except OSError:
             pass
-        threading.Thread(target=self._escalate, args=(proc,), daemon=True).start()
+        self._stopper = threading.Thread(target=self._escalate, args=(proc,), daemon=True)
+        self._stopper.start()
+
+    def wait_for_stop(self, timeout: float) -> None:
+        """Block until a cancel has finished escalating (or the timeout)."""
+        stopper = self._stopper
+        if stopper is not None:
+            stopper.join(timeout=timeout)
 
     def _escalate(self, proc: subprocess.Popen) -> None:
         try:
@@ -701,11 +790,13 @@ class ActionRegistry:
         engine_python: str | None = None,
         argv_builder: Callable[[ActionSpec, list[str], Path], list[str]] | None = None,
         on_finish: Callable[[ActionRunner], None] | None = None,
+        node_transports: Callable[[], dict[str, str]] | None = None,
     ) -> None:
         self._roots = {str(Path(root).resolve()): Path(root).resolve() for root in roots}
         self._engine_python = engine_python or sys.executable
         self._argv_builder = argv_builder or self._default_argv
         self._on_finish = on_finish
+        self._node_transports = node_transports or dict
         self._lock = threading.Lock()
         self._runners: dict[str, ActionRunner] = {}
         self._order: list[str] = []
@@ -750,11 +841,55 @@ class ActionRegistry:
                 params["run_id"] = run_id
         if "nodes" in spec.params:
             params["nodes"] = _clean_nodes(body.get("nodes"))
+            self._reject_pane_nodes(spec, params["nodes"] or self._run_nodes(root, params))
         if "node" in spec.params:
             params["node"] = _clean_node(body.get("node"))
+            if spec.id != "preflight":  # preflight is TCP only and works either way
+                self._reject_pane_nodes(spec, [params["node"]])
         if "reason" in spec.params:
             params["reason"] = _clean_reason(body.get("reason"))
+        if "tag" in spec.params:
+            params["tag"] = _clean_tag(body.get("tag"))
+        if "commit" in spec.params:
+            params["commit"] = _clean_commit(body.get("commit"))
+        if "tool" in spec.params:
+            params["tool"] = _clean_tool(body.get("tool"))
+        if "smoke" in spec.params:
+            params["smoke"] = _clean_smoke(body.get("smoke"))
+        if "force_lock" in spec.params:
+            params["force_lock"] = bool(body.get("force_lock"))
+        if spec.id in _CHAINS_DEPLOY:
+            # A guided release rolls every node in the run, or — for a fresh
+            # one — every configured node.
+            nodes = self._run_nodes(root, params) or list(self._node_transports())
+            self._reject_pane_nodes(spec, nodes)
         return params
+
+    def _run_nodes(self, root: Path, params: dict) -> list[str]:
+        """The nodes a deploy would touch when the request names none."""
+        run_id = params.get("run_id")
+        state = find_run_state(root, run_id) if run_id else None
+        if not state:
+            return []
+        return list(state.get("nodes") or state.get("phases", {}).get("deploy", {}))
+
+    def _reject_pane_nodes(self, spec: ActionSpec, nodes: list[str]) -> None:
+        """The console is a Paramiko-transport surface (ADR-0018).
+
+        A ``transport: pane`` node takes its RSA passcode in the tmux pane, not
+        on the engine's stdout, so the console can neither see the prompt nor
+        answer it — it would sit on "waiting for operator" forever. Refuse
+        rather than strand the operator mid-deploy.
+        """
+        transports = self._node_transports()
+        pane = sorted(node for node in nodes if transports.get(node) == "pane")
+        if pane:
+            raise ActionError(
+                f"{', '.join(pane)} {'uses' if len(pane) == 1 else 'use'} the pane transport; "
+                f"its RSA passcode is typed in the tmux pane, which the console cannot see. "
+                f"Run {spec.id.replace('_', '-')} for that node from a terminal.",
+                status=409,
+            )
 
     def start(self, body: dict) -> ActionRunner:
         spec = ACTION_SPECS.get(str(body.get("action") or ""))
@@ -818,10 +953,18 @@ class ActionRegistry:
         return {"actions": [runner.snapshot() for runner in runners]}
 
     def shutdown(self) -> None:
+        """Stop every command, and wait for the escalation to actually happen.
+
+        cancel() escalates on a daemon thread; without joining, console exit
+        kills those threads before they terminate anything, so a child would
+        outlive the console holding its run lock.
+        """
         with self._lock:
             runners = list(self._runners.values())
         for runner in runners:
             runner.cancel()
+        for runner in runners:
+            runner.wait_for_stop(timeout=GRACEFUL_STOP_SECONDS * 2 + 1.0)
 
 
 def catalog() -> list[dict]:

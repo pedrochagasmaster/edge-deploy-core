@@ -53,6 +53,12 @@ def demo_git(root: Path, *args: str, timeout: float | None = None) -> str | None
     return None
 
 
+def demo_ci(root: Path, commit: str | None) -> dict:
+    """No GitHub to ask in demo, and inventing a green tick would be a lie."""
+    del root
+    return {"status": "success" if commit else "unknown", "detail": "demo: not a real CI query"}
+
+
 def demo_argv_builder(spec, args: list[str], cwd: Path) -> list[str]:
     """Route every allowlisted command to the offline simulator."""
     del cwd

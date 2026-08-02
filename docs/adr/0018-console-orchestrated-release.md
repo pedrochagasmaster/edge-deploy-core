@@ -80,7 +80,15 @@ engine says while they run.** It gains no release logic of its own.
    masked. It is never written to disk by the console and never returned by
    any endpoint.
 
-6. **Posture stays manual and is stated as such.** There is no posture action
+6. **The console is a Paramiko-transport surface.** A `transport: pane` node
+   (ADR-0011) takes its RSA passcode in the tmux pane, not on the engine's
+   stdout, so the console can neither see the prompt nor answer it — a deploy
+   would sit on "waiting for operator" until the operator gave up. The server
+   refuses `deploy`, `release`, `rollback` and `transport-smoke` for any pane
+   node and says to use a terminal. `preflight` is TCP-only and still works.
+   Pane remains the documented recovery path; it is simply not a console one.
+
+7. **Posture stays manual and is stated as such.** There is no posture action
    and no posture-changing command in the allowlist. At a boundary, the
    console shows which posture the phase needs, that the operator must switch
    it themselves, and a single button that forwards the acknowledgement the
@@ -88,13 +96,13 @@ engine says while they run.** It gains no release logic of its own.
    git-protocol probe (ADR-0012) remains authoritative, so the console warns
    rather than blocks.
 
-7. **Only this page may act.** The server binds to loopback, requires a
+8. **Only this page may act.** The server binds to loopback, requires a
    loopback `Host`, and requires a per-process token embedded in the page it
    served. Read endpoints stay open; every mutating endpoint requires the
    token. `--read-only` starts the console with no action registry at all, and
    onboarding uses it.
 
-8. **The page leads with what is happening now.** Open runs are spotlighted
+9. **The page leads with what is happening now.** Open runs are spotlighted
    with their rail, live progress, action rows, and terminal. Checkouts with
    no run in flight get a release decision card: a one-sentence verdict, the
    three facts it rests on (what the nodes hold, what the checkout holds, what
@@ -103,7 +111,7 @@ engine says while they run.** It gains no release logic of its own.
    stated reason when a release would fail. Closed runs move to a collapsed
    history section.
 
-9. **A refusal the console can predict is shown, not discovered.** The engine
+10. **A refusal the console can predict is shown, not discovered.** The engine
    turns commands away for several reasons that are already on disk or in the
    console's own environment: the run was created by a different engine build
    (Engine Identity, ADR-0008), another process holds the run lock, the
@@ -119,7 +127,7 @@ engine says while they run.** It gains no release logic of its own.
    disable a run whose only remaining phase is `tag_github`, which pushes to
    GitHub. `status` is never disabled: it reads local ledgers only and is the
    one command that still works when everything else does not. This matters
-   most in a guided release, where a refusal the console could have predicted
+    most in a guided release, where a refusal the console could have predicted
    otherwise arrives several phases and a manual posture switch later.
 
    Taking a working button away is worse than failing to predict a refusal, so
@@ -130,7 +138,7 @@ engine says while they run.** It gains no release logic of its own.
    stale between the probe and the click), Bitbucket remote state, and
    anything the phase exists to attempt.
 
-10. **`--demo` drives an offline simulator.** `edge_console.demo_engine`
+11. **`--demo` drives an offline simulator.** `edge_console.demo_engine`
    produces the same output shapes and the same operator gates as the real
    engine against fabricated checkouts, so the orchestration path is
    exercisable — and reviewable — with no Bitbucket, Edge, SSH, Kerberos, or
@@ -161,18 +169,17 @@ engine says while they run.** It gains no release logic of its own.
   hash, so open Runs created by the previous engine must be finished with it
   or abandoned before upgrading. This is the standing rule for engine
   changes (ADR-0008), not a new exception.
-- Two operator paths still need a terminal: a deep-smoke release
-  (`--smoke deep`, which is what triggers the Kerberos prompt) has no console
-  action, and `transport: pane` nodes take their RSA passcode in the attached
-  pane rather than on the engine's stdout, so the console can only show that
-  it is waiting.
-- The console will not steal a run lock: `--force-lock` is deliberately not in
-  the allowlist, because a lock held by a live process should take a
-  deliberate decision and a typed command. To keep that from being a trap,
-  stopping a command closes the child's stdin and waits before terminating, so
-  the engine takes its own unwind path and releases the lock. A lock left by a
-  process that died some other way still needs a terminal, and the console
-  says so.
+- `transport: pane` nodes are the one operator path the console refuses
+  outright rather than half-supporting.
+- Stealing a run lock takes a named confirmation: the console offers
+  `--force-lock` only on the run that is blocked, only when the console does
+  not itself hold that lock, and only behind a dialog naming the pid and host.
+  Stopping a command closes the child's stdin and waits before terminating, so
+  the common case never needs it at all — the engine takes its own unwind path
+  and releases the lock.
+- A rollback is offered from the completed run it would restore, because the
+  history is exactly the list of tags worth restoring, and only when no run is
+  open in that checkout (the engine refuses otherwise).
 - The child inherits the console process's environment, so `BB_TOKEN` has to
   be set in the shell that starts the console — exporting it later, or in
   another window, does not reach the buttons. The console reports its absence
