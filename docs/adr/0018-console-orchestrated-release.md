@@ -133,10 +133,17 @@ engine says while they run.** It gains no release logic of its own.
    Taking a working button away is worse than failing to predict a refusal, so
    where the console cannot tell, it does not block.
 
+   GitHub CI is the one condition reported rather than enforced. A conclusion
+   exists only in the GitHub API — git publishes `refs/heads`, `refs/tags` and
+   `refs/pull` and nothing about checks — so it cannot be read offline, and it
+   can change between the answer and the click. The console asks `gh` first,
+   because that is what the engine's own gate uses, and falls back to the REST
+   API with the credential git already holds (the same route as the GitHub
+   write probe). When neither answers, CI is unknown and blocks nothing.
+
    What the console cannot predict cheaply and honestly is left to the
-   streamed refusal: GitHub CI state (needs `gh` and the network, and goes
-   stale between the probe and the click), Bitbucket remote state, and
-   anything the phase exists to attempt.
+   streamed refusal: Bitbucket remote state, and anything the phase exists to
+   attempt.
 
 11. **`--demo` drives an offline simulator.** `edge_console.demo_engine`
    produces the same output shapes and the same operator gates as the real

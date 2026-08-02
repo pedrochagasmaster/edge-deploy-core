@@ -343,8 +343,13 @@ reviewed commit or whose remotes do not match its `edge_deploy.yaml`, a missing
 or audit records still queued, and nodes in the ledger that are no longer in
 the operator config, and GitHub CI that is not green for the commit being released.
 `status` is never blocked — it reads local ledgers only, and is the one command
-that still answers when the rest refuse. A CI answer the console cannot get
-(no `gh`, no network) never blocks anything; it is reported, not enforced.
+that still answers when the rest refuse.
+
+CI is the one condition reported rather than enforced. A conclusion lives only
+in the GitHub API, so the console asks `gh` first — what the engine's own gate
+uses — and falls back to the REST API with the credential git already holds.
+`gh` is therefore convenient, not required. When neither can answer, CI is
+unknown and blocks nothing.
 
 Rollbacks are offered from the completed run they would restore, in the history
 section, and only when no run is open in that checkout.

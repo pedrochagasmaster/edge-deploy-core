@@ -44,7 +44,12 @@ from edge_console.actions import (  # noqa: E402
     display_command,
 )
 from edge_console.demo import DEMO_ENGINE_PATH  # noqa: E402
-from edge_console.probes import _tool_name  # noqa: E402
+from edge_console.probes import (  # noqa: E402
+    _ci_verdict,
+    _github_repo_path,
+    _tool_name,
+    probe_github_ci,
+)
 from edge_console.readiness import (  # noqa: E402
     ReadinessProber,
     probe_audit,
@@ -1129,6 +1134,70 @@ def test_remote_and_gate_checks_match_the_engine_on_a_real_repository(tmp_path) 
     assert "origin points at" in drifted["remotes"]["detail"]
     with pytest.raises(RepositoryError, match="origin points to unexpected repository"):
         inspect()
+
+
+def test_ci_conclusions_are_mapped_the_way_the_engine_gates_on_them(tmp_path) -> None:
+    """require_successful_github_ci passes only when some run for the exact SHA
+    concluded success; everything else is a refusal the card should explain."""
+    sha = "a" * 40
+    for conclusions, expected in (
+        (["success"], "success"),
+        (["failure", "success"], "success"),  # a re-run that went green counts
+        ([], "missing"),
+        (["", "failure"], "pending"),
+        (["pending"], "pending"),
+        (["failure"], "failed"),
+        (["cancelled"], "failed"),
+    ):
+        assert _ci_verdict(conclusions, sha, "test")["status"] == expected, conclusions
+
+
+def test_github_ci_falls_back_from_gh_to_the_rest_api(tmp_path) -> None:
+    """gh is a convenience, not a dependency: CI conclusions live only in the
+    API, but the API is reachable with the credential git already holds."""
+    sha = "a" * 40
+    gh_only = probe_github_ci(
+        tmp_path, sha,
+        sources=(lambda r, c: {"status": "success", "source": "gh"}, lambda r, c: pytest.fail("gh answered")),
+    )
+    assert gh_only["source"] == "gh"
+
+    fell_back = probe_github_ci(
+        tmp_path, sha,
+        sources=(lambda r, c: None, lambda r, c: {"status": "failed", "source": "api"}),
+    )
+    assert fell_back["source"] == "api"
+
+    # Neither available is "unknown", which blocks nothing by design.
+    silent = probe_github_ci(tmp_path, sha, sources=(lambda r, c: None, lambda r, c: None))
+    assert silent["status"] == "unknown"
+    assert silent["source"] is None
+
+    # A probe that blows up must not take the tool card with it.
+    def explode(root, commit):
+        raise RuntimeError("boom")
+
+    assert probe_github_ci(tmp_path, sha, sources=(explode, lambda r, c: None))["status"] == "unknown"
+    assert probe_github_ci(tmp_path, None)["status"] == "unknown"
+
+
+def test_github_remote_paths_are_recognised_for_both_url_forms() -> None:
+    assert _github_repo_path("https://github.com/mastercard/autobench.git") == "mastercard/autobench"
+    assert _github_repo_path("git@github.com:mastercard/autobench.git") == "mastercard/autobench"
+    assert _github_repo_path("https://github.com/mastercard/autobench") == "mastercard/autobench"
+    assert _github_repo_path("https://scm.mastercard.int/edge/autobench.git") is None
+    assert _github_repo_path("https://github.com/toodeep/a/b.git") is None
+
+
+def test_an_unknown_ci_answer_blocks_nothing() -> None:
+    """The one predicted condition that is reported rather than enforced."""
+    tool = {"on_main": True, "dirty": False, "head": "a" * 40,
+            "profile": {"ok": True}, "remotes": {"ok": True}, "local_check": True}
+    for ci in ({"status": "unknown", "detail": "no gh"}, {"status": "success", "detail": ""}, None):
+        assert _run_blockers(_open_run(), _OK_ENV, {**tool, "ci": ci}) == [], ci
+    failed = _run_blockers(_open_run(), _OK_ENV, {**tool, "ci": {"status": "failed", "detail": "CI concluded failure"}})
+    assert [b["short"] for b in failed] == ["ci failed"]
+    assert sorted(failed[0]["blocks"]) == ["release", "verify"]
 
 
 def test_powershell_and_audit_prerequisites_are_reported(tmp_path, monkeypatch) -> None:

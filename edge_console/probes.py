@@ -52,8 +52,8 @@ _TOOL_NAME_RE = re.compile(r"^tool:\s*[\"']?([A-Za-z0-9_-]+)", re.MULTILINE)
 # GitHub write probe
 # ---------------------------------------------------------------------------
 
-def _github_receive_pack_url(remote_url: str) -> str | None:
-    """Authenticated Smart HTTP write endpoint for a GitHub remote."""
+def _github_repo_path(remote_url: str) -> str | None:
+    """``owner/repo`` for a GitHub remote, or None if it is not one."""
     remote_url = remote_url.strip()
     if remote_url.startswith("git@github.com:"):
         path = remote_url.removeprefix("git@github.com:")
@@ -63,9 +63,43 @@ def _github_receive_pack_url(remote_url: str) -> str | None:
             return None
         path = parsed.path.lstrip("/")
     path = path.removesuffix(".git").strip("/")
-    if path.count("/") != 1:
+    return path if path.count("/") == 1 else None
+
+
+def _github_receive_pack_url(remote_url: str) -> str | None:
+    """Authenticated Smart HTTP write endpoint for a GitHub remote."""
+    path = _github_repo_path(remote_url)
+    return f"https://github.com/{path}.git/git-receive-pack" if path else None
+
+
+def _git_credential(host: str = "github.com") -> tuple[str, str] | None:
+    """Ask git's credential helper for the token it already holds.
+
+    The same route the GitHub write probe uses, so it needs no credential the
+    operator has not already given git.
+    """
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "never"
+    try:
+        completed = subprocess.run(
+            ["git", "credential", "fill"],
+            input=f"protocol=https\nhost={host}\n\n".encode(),
+            capture_output=True,
+            timeout=GIT_TIMEOUT,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
         return None
-    return f"https://github.com/{path}.git/git-receive-pack"
+    if completed.returncode != 0:
+        return None
+    fields = dict(
+        line.split(b"=", 1) for line in completed.stdout.splitlines() if b"=" in line
+    )
+    password = fields.get(b"password")
+    if not password:
+        return None
+    return fields.get(b"username", b"x-access-token").decode(), password.decode()
 
 
 def _default_github_write_runner(repo_root: Path, *, timeout: float) -> int:
@@ -410,47 +444,106 @@ def _release_source_state(root: Path, git=_git) -> dict:
     return state
 
 
-def probe_github_ci(root: Path, commit: str | None, *, runner=None) -> dict:
-    """Whether GitHub CI succeeded for exactly this commit.
+def _ci_verdict(conclusions: list[str], commit: str, source: str) -> dict:
+    """Map workflow conclusions the way require_successful_github_ci does."""
+    if any(value == "success" for value in conclusions):
+        return {"status": "success", "detail": "", "source": source}
+    if not conclusions:
+        return {"status": "missing", "detail": f"no CI run recorded for {commit[:7]}", "source": source}
+    if any(value in ("", "pending") for value in conclusions):
+        return {"status": "pending", "detail": f"CI has not finished for {commit[:7]}", "source": source}
+    return {
+        "status": "failed",
+        "detail": f"CI concluded {conclusions[0]} for {commit[:7]}",
+        "source": source,
+    }
 
-    Verify refuses without it (``require_successful_github_ci``). This is the
-    one gate the console reports rather than predicts hard: it needs ``gh`` and
-    the network, and it can change between this answer and the click — so an
-    unknown never blocks anything.
-    """
-    if not commit:
-        return {"status": "unknown", "detail": "no commit to check"}
+
+def _ci_via_gh(root: Path, commit: str) -> dict | None:
+    """The same query the engine's own gate makes."""
+    env = dict(os.environ)
+    env["GH_PROMPT_DISABLED"] = "1"
     command = [
         "gh", "run", "list", "--commit", commit, "--branch", "main",
         "--workflow", "CI", "--json", "conclusion", "--limit", "20",
     ]
     try:
-        completed = (runner or _run_gh)(root, command)
-    except Exception as exc:  # gh missing, unauthenticated, offline
-        return {"status": "unknown", "detail": f"{type(exc).__name__}: {exc}"}
-    if completed is None:
-        return {"status": "unknown", "detail": "gh could not report CI status"}
+        completed = subprocess.run(
+            command, cwd=str(root), capture_output=True, text=True, timeout=GH_TIMEOUT, env=env
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None  # gh missing or wedged; try the API directly
+    if completed.returncode != 0:
+        return None
     try:
-        runs = json.loads(completed)
+        runs = json.loads(completed.stdout)
     except ValueError:
-        return {"status": "unknown", "detail": "gh returned unexpected output"}
-    conclusions = [str(item.get("conclusion") or "") for item in runs]
-    if any(value == "success" for value in conclusions):
-        return {"status": "success", "detail": ""}
-    if not conclusions:
-        return {"status": "missing", "detail": f"no CI run recorded for {commit[:7]}"}
-    if any(value == "" for value in conclusions):
-        return {"status": "pending", "detail": f"CI has not finished for {commit[:7]}"}
-    return {"status": "failed", "detail": f"CI concluded {conclusions[0]} for {commit[:7]}"}
+        return None
+    return _ci_verdict([str(item.get("conclusion") or "") for item in runs], commit, "gh")
 
 
-def _run_gh(root: Path, command: list[str]) -> str | None:
-    env = dict(os.environ)
-    env["GH_PROMPT_DISABLED"] = "1"
-    completed = subprocess.run(
-        command, cwd=str(root), capture_output=True, text=True, timeout=GH_TIMEOUT, env=env
+def _ci_via_api(root: Path, commit: str, git=_git) -> dict | None:
+    """Ask the REST API with the credential git already holds.
+
+    ``gh`` is a convenience, not the only door: this is the same
+    credential-helper route the GitHub write probe uses, so it needs nothing
+    the operator has not already given git. It can still come back empty —
+    ``api.github.com`` is a different host from ``github.com`` and a corporate
+    proxy may treat it differently — in which case CI simply stays unknown.
+    """
+    remote = git(root, "remote", "get-url", "origin", timeout=5.0)
+    path = _github_repo_path(remote) if remote else None
+    credential = _git_credential() if path else None
+    if not credential:
+        return None
+    username, token = credential
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{path}/actions/runs"
+        f"?head_sha={urllib.parse.quote(commit)}&per_page=20",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "edge-deploy-console-ci-probe",
+        },
     )
-    return completed.stdout if completed.returncode == 0 else None
+    del username  # the token alone authenticates the REST API
+    try:
+        with urllib.request.urlopen(request, timeout=GH_TIMEOUT) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return None
+    runs = [run for run in payload.get("workflow_runs") or [] if run.get("name") == "CI"]
+    conclusions = [
+        str(run.get("conclusion") or ("pending" if run.get("status") != "completed" else ""))
+        for run in runs
+    ]
+    return _ci_verdict(conclusions, commit, "api")
+
+
+def probe_github_ci(root: Path, commit: str | None, *, sources=None) -> dict:
+    """Whether GitHub CI succeeded for exactly this commit.
+
+    Verify refuses without it (``require_successful_github_ci``). This is the
+    one gate the console reports rather than predicts hard: it needs the
+    network, and it can change between this answer and the click — so an
+    unknown never blocks anything. ``gh`` is tried first because it is what the
+    engine itself uses; the REST API is a fallback for a machine that has git
+    credentials but no ``gh``.
+    """
+    if not commit:
+        return {"status": "unknown", "detail": "no commit to check", "source": None}
+    for probe in sources or (_ci_via_gh, _ci_via_api):
+        try:
+            verdict = probe(root, commit)
+        except Exception:  # a probe that cannot answer must not break the card
+            verdict = None
+        if verdict is not None:
+            return verdict
+    return {
+        "status": "unknown",
+        "detail": "neither gh nor the GitHub API could report CI status",
+        "source": None,
+    }
 
 
 def _last_deployed(runs: list[dict]) -> dict | None:
