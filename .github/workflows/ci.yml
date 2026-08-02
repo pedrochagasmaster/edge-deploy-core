@@ -18,6 +18,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      # The console tests execute the page's JavaScript through Node; without
+      # it they would silently skip rather than guard the UI.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - name: Install uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:

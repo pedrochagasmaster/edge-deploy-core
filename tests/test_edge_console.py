@@ -10,7 +10,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.request
 from http.client import HTTPConnection
 from pathlib import Path
 from threading import Thread
@@ -705,12 +704,13 @@ def test_probe_github_write_sends_empty_authenticated_receive_pack_post(
         def __exit__(self, *args):
             return None
 
-        def read(self):
+        def read(self, *_size):
             return b"0000"
 
-    def fake_urlopen(request, timeout):
-        requests.append((request, timeout))
-        return Response()
+    class FakeOpener:
+        def open(self, request, timeout):
+            requests.append((request, timeout))
+            return Response()
 
     def fake_run(command, **kwargs):
         assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
@@ -730,7 +730,7 @@ def test_probe_github_write_sends_empty_authenticated_receive_pack_post(
         )
 
     monkeypatch.setattr("edge_console.probes.subprocess.run", fake_run)
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr("edge_console.probes._no_redirect_opener", FakeOpener)
     result = probe_github_write(root, runner=None)
 
     assert result["status"] == "ok"
@@ -740,6 +740,11 @@ def test_probe_github_write_sends_empty_authenticated_receive_pack_post(
     assert request.data == b"0000"
     assert request.full_url.endswith("/git-receive-pack")
     assert timeout == 20.0
+    # The write probe must not follow a redirect that would re-send the Basic
+    # credential to another host.
+    from edge_console.probes import _NoRedirect
+
+    assert _NoRedirect().redirect_request(None, None, None, None, None) is None
 
 
 def test_aggregate_github_write_rules() -> None:

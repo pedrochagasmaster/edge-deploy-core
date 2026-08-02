@@ -52,6 +52,20 @@ _TOOL_NAME_RE = re.compile(r"^tool:\s*[\"']?([A-Za-z0-9_-]+)", re.MULTILINE)
 # GitHub write probe
 # ---------------------------------------------------------------------------
 
+_MAX_PROBE_BYTES = 1024 * 1024
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects so a credential is never re-sent to another host."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def _no_redirect_opener() -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(_NoRedirect())
+
+
 def _github_receive_pack_url(remote_url: str) -> str | None:
     """Authenticated Smart HTTP write endpoint for a GitHub remote."""
     path = github_repo_path(remote_url)
@@ -113,8 +127,10 @@ def _default_github_write_runner(repo_root: Path, *, timeout: float) -> int:
             },
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            response.read()
+        # No redirects (the Basic credential must not be re-sent to another
+        # host) and a bounded read.
+        with _no_redirect_opener().open(request, timeout=timeout) as response:
+            response.read(_MAX_PROBE_BYTES)
             return 0 if response.status == 200 else response.status
     except urllib.error.HTTPError as exc:
         return exc.code
