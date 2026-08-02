@@ -233,7 +233,10 @@ digest-verified Paramiko SSH connection per node by default
 per-node recovery override (`transport: pane`), not a universal channel.
 
 See [docs/release-workflow.md](docs/release-workflow.md) for the operator
-procedure and [docs/DESIGN.md](docs/DESIGN.md) for engine internals. Architecture
+procedure, [docs/edge-deploy-handbook.html](docs/edge-deploy-handbook.html) for
+the offline operator handbook covering the engine and the console (open it in
+any browser; it needs no network), and [docs/DESIGN.md](docs/DESIGN.md) for
+engine internals. Architecture
 decisions: [ADR-0008](docs/adr/0008-run-ledger-and-posture-phases.md) (run
 ledger and phases), [ADR-0009](docs/adr/0009-on-node-runner-file-evidence.md)
 (runner and file evidence), [ADR-0013](docs/adr/0013-five-posture-capability-model.md)

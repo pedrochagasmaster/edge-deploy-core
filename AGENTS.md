@@ -23,6 +23,7 @@ operator configuration must never enter GitHub.
 - `edge_console/`: operator web UI (outside `edge_deploy` so Engine Identity is unaffected; run with `python -m edge_console` from the core checkout)
 - `tests/`: full validation suite
 - `docs/release-workflow.md`: Release Operator procedure
+- `docs/edge-deploy-handbook.html`: offline HTML handbook for the engine and console (guarded by `tests/test_handbook.py`)
 - `docs/adr/`: durable release-engine decisions
 
 ## Learned User Preferences

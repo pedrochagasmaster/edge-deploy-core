@@ -1,0 +1,805 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Offline Release Operator handbook and reference for the edge-deploy-core engine and the Edge Console.">
+  <title>edge-deploy-core · Release Operator handbook</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17212b;
+      --muted: #5f6b76;
+      --paper: #f6f8fa;
+      --surface: #ffffff;
+      --soft: #edf1f4;
+      --line: #d7dee4;
+      --accent: #0f62a8;
+      --accent-soft: #e8f1fb;
+      --navy: #15344a;
+      --good: #1c6b4a;
+      --warn: #8a5b00;
+      --bad: #a12d2d;
+      --code: #10212e;
+      --code-ink: #eaf2f7;
+      --shadow: 0 18px 50px rgba(18, 42, 58, .09);
+    }
+    html[data-theme="dark"] {
+      color-scheme: dark;
+      --ink: #e8eef2;
+      --muted: #aebbc5;
+      --paper: #0e171e;
+      --surface: #15232d;
+      --soft: #1d2d38;
+      --line: #31434f;
+      --accent: #5aa9ff;
+      --accent-soft: #1c2f45;
+      --navy: #b8dced;
+      --good: #7bd4aa;
+      --warn: #f3c36a;
+      --bad: #f0908d;
+      --code: #091118;
+      --code-ink: #eaf2f7;
+      --shadow: 0 18px 50px rgba(0, 0, 0, .28);
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font: 16px/1.62 "Segoe UI", Inter, system-ui, sans-serif;
+    }
+    a { color: var(--accent); text-underline-offset: 3px; }
+    button, a { -webkit-tap-highlight-color: transparent; }
+    :focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+    .skip-link { position: fixed; left: 12px; top: -80px; z-index: 20; padding: 8px 12px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); font-weight: 700; }
+    .skip-link:focus { top: 12px; }
+    .site-shell { min-height: 100vh; display: grid; grid-template-columns: 286px minmax(0, 1fr); }
+    .sidebar {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      padding: 26px 22px;
+      background: var(--surface);
+      border-right: 1px solid var(--line);
+      overflow-y: auto;
+    }
+    .brand { display: flex; gap: 11px; align-items: center; margin-bottom: 6px; color: var(--ink); text-decoration: none; }
+    .brand-mark { width: 34px; height: 34px; border-radius: 8px; background: var(--navy); box-shadow: inset 0 0 0 3px var(--accent); flex-shrink: 0; }
+    .brand strong { font-size: 1.08rem; letter-spacing: -.02em; }
+    .brand-sub { margin: 0 0 24px; color: var(--muted); font-size: .78rem; text-transform: uppercase; letter-spacing: .12em; }
+    .site-nav { display: grid; gap: 4px; }
+    .site-nav a { padding: 9px 10px; border-radius: 7px; color: var(--muted); text-decoration: none; font-weight: 600; font-size: .92rem; transition: background-color .12s ease-out, color .12s ease-out; }
+    .site-nav a:hover { background: var(--soft); color: var(--ink); }
+    .site-nav a[aria-current="page"] { color: var(--accent); background: var(--accent-soft); }
+    .sidebar-actions { display: grid; margin-top: 24px; }
+    .control {
+      min-height: 42px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: var(--surface);
+      color: var(--ink);
+      cursor: pointer;
+      font: inherit;
+      font-size: .8rem;
+      font-weight: 700;
+      transition: border-color .12s ease-out;
+    }
+    .control:hover { border-color: var(--accent); }
+    .content { min-width: 0; padding: 46px clamp(24px, 6vw, 90px) 30px; }
+    .doc-page { max-width: 1050px; margin: 0 auto; }
+    .doc-page[hidden] { display: none; }
+    .eyebrow { margin: 0 0 9px; color: var(--accent); font: 750 .76rem/1.2 Consolas, monospace; text-transform: uppercase; letter-spacing: .12em; }
+    h1 { max-width: 850px; margin: 0; font-size: clamp(2.3rem, 5vw, 4.2rem); line-height: .99; letter-spacing: -.04em; }
+    h2 { margin: 55px 0 14px; font-size: clamp(1.55rem, 3vw, 2.35rem); line-height: 1.12; letter-spacing: -.035em; }
+    h3 { margin: 28px 0 8px; font-size: 1.12rem; }
+    .lede { max-width: 760px; margin: 20px 0 28px; color: var(--muted); font-size: 1.12rem; }
+    .hero-rule { height: 5px; width: 92px; background: var(--accent); margin: 25px 0; }
+    .status-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 18px 0 30px; }
+    .pill { padding: 5px 9px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: .78rem; font-weight: 700; }
+    .run-path { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; margin: 30px 0; overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: var(--line); box-shadow: var(--shadow); }
+    .run-step { padding: 18px; background: var(--surface); }
+    .run-step b { display: block; color: var(--accent); font: 800 .74rem/1.2 Consolas, monospace; letter-spacing: .08em; }
+    .run-step strong { display: block; margin: 8px 0 4px; }
+    .run-step span { color: var(--muted); font-size: .85rem; }
+    .card-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+    .card { padding: 18px 20px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); }
+    .card h3 { margin-top: 0; }
+    .card p:last-child { margin-bottom: 0; }
+    .callout { margin: 20px 0; padding: 16px 18px; border: 1px solid color-mix(in srgb, var(--accent) 42%, var(--line)); background: var(--accent-soft); border-radius: 8px; }
+    .callout.good { border-color: color-mix(in srgb, var(--good) 45%, var(--line)); background: color-mix(in srgb, var(--good) 10%, var(--surface)); }
+    .callout.warn { border-color: color-mix(in srgb, var(--warn) 45%, var(--line)); background: color-mix(in srgb, var(--warn) 10%, var(--surface)); }
+    code { font-family: Consolas, "SFMono-Regular", monospace; font-size: .9em; }
+    pre { position: relative; margin: 12px 0 20px; padding: 17px 19px; overflow-x: auto; border-radius: 8px; background: var(--code); color: var(--code-ink); line-height: 1.48; }
+    pre code { font-size: .83rem; }
+    pre .dim { color: #7d93a3; }
+    .copy { float: right; margin: -5px -6px 6px 10px; border: 1px solid #526675; border-radius: 5px; background: var(--code); color: #dce8ef; cursor: pointer; font: 700 .72rem "Segoe UI", sans-serif; padding: 4px 7px; transition: border-color .12s ease-out, color .12s ease-out; }
+    .copy:hover { border-color: #8ea6b6; color: #ffffff; }
+    .table-wrap { margin: 16px 0 24px; overflow-x: auto; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); }
+    table { width: 100%; border-collapse: collapse; min-width: 620px; }
+    th, td { padding: 11px 13px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: var(--soft); color: var(--muted); font-size: .76rem; text-transform: uppercase; letter-spacing: .07em; }
+    tr:last-child td { border-bottom: 0; }
+    td .yes { color: var(--good); font-weight: 700; }
+    td .no { color: var(--bad); font-weight: 700; }
+    ul, ol { padding-left: 1.35rem; }
+    li { margin: 6px 0; }
+    details { margin: 10px 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
+    summary { cursor: pointer; font-weight: 750; }
+    .page-links { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 24px 0; }
+    .page-links a { display: block; min-height: 110px; padding: 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink); text-decoration: none; transition: border-color .15s ease-out, transform .15s ease-out; }
+    .page-links a:hover { border-color: var(--accent); transform: translateY(-2px); }
+    .page-links strong { display: block; color: var(--accent); }
+    .metadata { max-width: 1050px; margin: 54px auto 0; padding-top: 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: .75rem; }
+    .term-grid { display: grid; grid-template-columns: 200px 1fr; gap: 0; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+    .term-grid dt, .term-grid dd { margin: 0; padding: 11px 13px; border-bottom: 1px solid var(--line); }
+    .term-grid dt { background: var(--soft); font-weight: 750; }
+    .term-grid dd { background: var(--surface); }
+    .term-grid dt:last-of-type, .term-grid dd:last-of-type { border-bottom: 0; }
+    .tabs { display: flex; overflow-x: auto; margin-top: 18px; border: 1px solid var(--line); border-bottom: 0; border-radius: 9px 9px 0 0; background: var(--soft); }
+    .tab { flex: 1; min-width: 130px; padding: 11px 14px; border: 0; border-right: 1px solid var(--line); background: transparent; color: var(--muted); cursor: pointer; font: inherit; font-size: .9rem; font-weight: 700; white-space: nowrap; transition: background-color .12s ease-out, color .12s ease-out; }
+    .tab:last-child { border-right: 0; }
+    .tab[aria-selected="true"] { color: var(--accent); background: var(--surface); box-shadow: inset 0 -3px var(--accent); }
+    .tab-panel { display: none; padding: 6px 20px 20px; border: 1px solid var(--line); border-top: 0; border-radius: 0 0 9px 9px; background: var(--surface); }
+    .tab-panel.active { display: block; }
+    .tab-panel > h3:first-of-type { margin-top: 16px; }
+    .checks { list-style: none; margin: 14px 0; padding: 0 16px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); }
+    .checks li { position: relative; margin: 0; padding: 10px 0 10px 30px; border-bottom: 1px solid var(--line); }
+    .checks li:last-child { border-bottom: 0; }
+    .checks li::before { content: "✓"; position: absolute; left: 2px; color: var(--good); font-weight: 800; }
+    @media (max-width: 860px) {
+      .site-shell { display: block; }
+      .sidebar { position: sticky; z-index: 10; height: auto; padding: 12px 14px; border-right: 0; border-bottom: 1px solid var(--line); overflow: visible; }
+      .brand { display: inline-flex; margin-bottom: 3px; }
+      .brand-mark { width: 25px; height: 25px; }
+      .brand-sub { display: none; }
+      .site-nav { display: flex; gap: 4px; margin-top: 8px; overflow-x: auto; padding-bottom: 5px; scrollbar-width: none; }
+      .site-nav::-webkit-scrollbar { display: none; }
+      .site-nav a { flex: 0 0 auto; padding: 7px 8px; font-size: .78rem; }
+      .sidebar-actions { position: absolute; right: 12px; top: 9px; display: flex; margin: 0; }
+      .control { min-height: 34px; padding: 4px 8px; }
+      .content { padding: 28px 16px 22px; }
+      .run-path { grid-template-columns: 1fr 1fr; }
+      .card-grid, .page-links { grid-template-columns: 1fr; }
+      .term-grid { grid-template-columns: 1fr; }
+      .term-grid dt { border-bottom: 0; }
+      .tab-panel { padding: 2px 14px 14px; }
+      h1 { font-size: clamp(2.1rem, 12vw, 3.6rem); }
+    }
+    @media (max-width: 480px) {
+      .brand strong { font-size: 1rem; }
+      .sidebar-actions { top: 8px; }
+      .control { font-size: .73rem; }
+      .run-path { grid-template-columns: 1fr; }
+    }
+    @media print {
+      .sidebar, .copy, .skip-link, .tabs { display: none !important; }
+      .site-shell { display: block; }
+      .content { padding: 0; }
+      .doc-page[hidden] { display: none !important; }
+      .tab-panel { display: block; border: 0; border-top: 1px solid var(--line); border-radius: 0; padding: 0; }
+      .card, .table-wrap, details { break-inside: avoid; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      * { transition: none !important; }
+    }
+  </style>
+  <script>
+    // Resolve the theme before first paint to avoid a light flash for dark-mode readers.
+    (() => {
+      let saved = null;
+      try { saved = localStorage.getItem('edge-deploy-doc-theme'); } catch { saved = null; }
+      document.documentElement.dataset.theme = saved === 'dark' || saved === 'light'
+        ? saved
+        : matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    })();
+  </script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to content</a>
+  <div class="site-shell">
+    <aside class="sidebar">
+      <a class="brand" href="#overview" data-page-link="overview"><span class="brand-mark" aria-hidden="true"></span><strong>edge-deploy-core</strong></a>
+      <p class="brand-sub">Release Operator handbook</p>
+      <nav class="site-nav" id="documentation-navigation" aria-label="Documentation pages">
+        <a href="#overview" data-page-link="overview">Overview</a>
+        <a href="#postures" data-page-link="postures">Postures &amp; Network</a>
+        <a href="#engine" data-page-link="engine">The Engine (CLI)</a>
+        <a href="#console" data-page-link="console">The Edge Console</a>
+        <a href="#recovery" data-page-link="recovery">Recovery</a>
+        <a href="#glossary" data-page-link="glossary">Glossary</a>
+      </nav>
+      <div class="sidebar-actions">
+        <button class="control" id="theme-toggle" type="button" aria-pressed="false">☾ Dark mode</button>
+      </div>
+    </aside>
+
+    <main class="content" id="main-content" tabindex="-1">
+
+      <!-- ══════════════════════════ OVERVIEW ══════════════════════════ -->
+      <article class="doc-page" data-page="overview">
+        <p class="eyebrow">Start here · release operator workflow</p>
+        <h1>Release reviewed code across an air gap.</h1>
+        <div class="hero-rule"></div>
+        <p class="lede">edge-deploy-core publishes reviewed Autobench and Dispatch commits from GitHub to
+        corporate Bitbucket and deploys them to Hadoop Edge Nodes — through exclusive firewall postures,
+        interactive RSA authentication, and durable, resumable run ledgers. This handbook covers the two ways
+        to drive a release: the <a href="#engine" data-page-link="engine">engine CLI</a> in a terminal, and the
+        <a href="#console" data-page-link="console">Edge Console</a> in a browser.</p>
+        <div class="status-row"><span class="pill">Offline handbook</span><span class="pill">v1.5.4</span><span class="pill">Windows PowerShell 5.1 · <code>py</code> launcher</span><span class="pill">Terminal · Console</span></div>
+        <div class="run-path" aria-label="Normal release path">
+          <div class="run-step"><b>01</b><strong>Decide</strong><span>Confirm the checkout, CI, and nodes are ready to release.</span></div>
+          <div class="run-step"><b>02</b><strong>Start</strong><span>One guided run walks every phase in order.</span></div>
+          <div class="run-step"><b>03</b><strong>Answer</strong><span>RSA passcodes and posture switches — the only manual acts.</span></div>
+          <div class="run-step"><b>04</b><strong>Verify</strong><span>Tags on both remotes, audit recorded, status complete.</span></div>
+        </div>
+
+        <h2>What a release is</h2>
+        <p>Development is normal GitHub flow — contributors and maintainers never need Bitbucket, Edge access,
+        SSH, Kerberos, or RSA credentials. A <strong>release</strong> is the explicit operator act that takes one
+        reviewed commit the rest of the way: <strong>Publish</strong> fast-forwards the exact GitHub commit to
+        Bitbucket, <strong>Deploy</strong> applies it to each selected Edge Node and verifies the result, and two
+        tag phases pin what happened on both remotes.</p>
+        <div class="callout"><strong>The invariant.</strong> GitHub <code>main</code>, Bitbucket <code>main</code>,
+        the release tag, and the deployed Edge state must identify the <em>same full source SHA</em>. Every gate in
+        the engine exists to keep those four aligned.</div>
+        <div class="card-grid">
+          <div class="card"><h3>Run Ledger</h3><p>Every release attempt is one durable <strong>Run</strong> under
+            <code>edge-deploy/runs/</code>: its source SHA, per-phase and per-node state, and an append-only event
+            log. Releases pause and resume cleanly at posture boundaries; at most one Run may be open per tool.</p></div>
+          <div class="card"><h3>Engine Identity</h3><p>The engine fingerprints its own installed source. A Run is
+            bound to the engine that created it: change the engine and open Runs are orphaned — finish them with
+            the old engine or abandon them. This is why console code lives outside <code>edge_deploy/</code>.</p></div>
+          <div class="card"><h3>Posture</h3><p>The workstation firewall has five exclusive states. GitHub write and
+            Bitbucket/Edge access can never be held at once, so a release necessarily crosses posture boundaries.
+            Switching is a human act — no software changes posture for you.</p></div>
+          <div class="card"><h3>Transport</h3><p>SSH (Paramiko) is the default per-node transport: one persistent,
+            digest-verified connection per deploy. <code>transport: pane</code> is the explicit per-node recovery
+            override that drives an authenticated tmux pane instead.</p></div>
+        </div>
+
+        <h2>The five phases</h2>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Phase</th><th>What it does</th><th>Posture</th></tr></thead>
+          <tbody>
+            <tr><td><code>verify</code></td><td>Pins the source SHA, requires green post-merge GitHub CI for exactly that commit, and runs the tool's committed <code>local_check.ps1</code>.</td><td>any (GitHub read)</td></tr>
+            <tr><td><code>publish-phase</code></td><td>Fast-forwards the reviewed commit to Bitbucket <code>main</code>. No history rewrite, ever.</td><td>bitbucket-vpn or both-vpns</td></tr>
+            <tr><td><code>deploy</code></td><td>Applies the published snapshot to each selected Edge Node; verifies final commit, drift, permissions, and smoke checks.</td><td>both-vpns</td></tr>
+            <tr><td><code>tag-bitbucket</code></td><td>Tags the release on Bitbucket and appends the redacted audit record to the <code>release-log</code> branch.</td><td>bitbucket-vpn or both-vpns</td></tr>
+            <tr><td><code>tag-github</code></td><td>Tags the same SHA on GitHub. Runs last because GitHub write needs the firewall off.</td><td>firewall-off</td></tr>
+          </tbody>
+        </table></div>
+        <p>Started on <strong>both-vpns</strong>, a guided release needs exactly one posture switch — to
+        firewall-off for the final tag. Published release tags are immutable: never move one; publish a new
+        version instead.</p>
+
+        <h2>Two ways to drive it</h2>
+        <div class="card-grid">
+          <div class="card"><h3>Terminal</h3><p><code>py -m edge_deploy release --guided --tool autobench</code>
+            walks every phase, prompt, and posture boundary in one invocation. Every phase is also a standalone
+            command for surgical work. Fully supported, always available.</p></div>
+          <div class="card"><h3>Edge Console</h3><p><code>py -m edge_console</code> serves a local web UI over the
+            same run ledgers. Every command in this handbook is a button that runs that exact command, streams its
+            output, and relays its prompts — including the RSA passcode. It holds no release logic and never
+            writes a ledger (ADR-0018).</p></div>
+        </div>
+        <div class="callout warn"><strong>Operator-only, GitHub-clean.</strong> This package runs on the operator
+        workstation only — Edge Nodes never import it. Generated reports, run ledgers, credentials, RSA passcodes,
+        Kerberos passwords, tokens, and operator configuration never enter GitHub.</div>
+
+        <h2>Where next</h2>
+        <div class="page-links">
+          <a href="#engine" data-page-link="engine"><strong>The Engine (CLI)</strong>Prerequisites, the release flow, every command.</a>
+          <a href="#console" data-page-link="console"><strong>The Edge Console</strong>The cockpit: buttons, prompts, predicted refusals.</a>
+          <a href="#recovery" data-page-link="recovery"><strong>Recovery</strong>Locks, resumes, rollbacks, and exact refusal texts.</a>
+        </div>
+      </article>
+
+      <!-- ══════════════════════════ POSTURES ══════════════════════════ -->
+      <article class="doc-page" data-page="postures" hidden>
+        <p class="eyebrow">Network model · ADR-0012 / ADR-0013</p>
+        <h1>Five postures, one at a time.</h1>
+        <div class="hero-rule"></div>
+        <p class="lede">The workstation's firewall posture decides which remote is reachable. Everything about the
+        release flow — phase ordering, pauses, the guided prompts — follows from this table.</p>
+
+        <h2>The posture table</h2>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Posture</th><th>GitHub read</th><th>GitHub write</th><th>Bitbucket</th><th>Edge Nodes</th></tr></thead>
+          <tbody>
+            <tr><td><code>baseline</code></td><td><span class="yes">yes</span></td><td><span class="no">no</span></td><td><span class="no">no</span></td><td><span class="no">no</span></td></tr>
+            <tr><td><code>edge-vpn</code></td><td><span class="yes">yes</span></td><td><span class="no">no</span></td><td><span class="no">no</span></td><td><span class="yes">yes</span></td></tr>
+            <tr><td><code>bitbucket-vpn</code></td><td><span class="yes">yes</span></td><td><span class="no">no</span></td><td><span class="yes">yes</span></td><td><span class="no">no</span></td></tr>
+            <tr><td><code>both-vpns</code></td><td><span class="yes">yes</span></td><td><span class="no">no</span></td><td><span class="yes">yes</span></td><td><span class="yes">yes</span></td></tr>
+            <tr><td><code>firewall-off</code></td><td><span class="yes">yes</span></td><td><span class="yes">yes</span></td><td><span class="no">no</span></td><td><span class="no">no</span></td></tr>
+          </tbody>
+        </table></div>
+        <ul>
+          <li>GitHub <strong>read</strong> (pull/fetch) works in every posture.</li>
+          <li>GitHub <strong>write</strong> requires the firewall off, which drops both VPNs — so GitHub write and
+            Bitbucket/Edge access are <em>never</em> held together.</li>
+          <li>The Bitbucket and Edge VPNs are independent and may be held at once (<code>both-vpns</code>).</li>
+        </ul>
+
+        <h2>How the engine knows</h2>
+        <p>The corporate proxy accepts TCP connects in every posture and only fails at the HTTP layer, so a socket
+        test proves nothing about git. Posture is therefore verified with <strong>protocol-level git probes</strong>:
+        <code>git ls-remote</code> for reads and <code>git push --dry-run</code> for writes (ADR-0012). Edge SSH
+        endpoints are still TCP-probed — there is no protocol shortcut for them.</p>
+        <p>When the current posture does not satisfy a phase, the engine refuses with exactly:</p>
+        <pre><button class="copy" type="button">Copy</button><code>phase '&lt;phase&gt;' requires posture [&lt;satisfying postures&gt;]; unreachable: &lt;failures&gt;.
+Switch the firewall posture, then re-run: &lt;next command&gt;</code></pre>
+
+        <h2>Switching mid-release</h2>
+        <p>In a guided release the engine prints the satisfying posture names and any unreachable endpoints, then
+        stops and asks:</p>
+        <pre><button class="copy" type="button">Copy</button><code>Switch firewall posture to [both-vpns], then press Enter to continue...</code></pre>
+        <p>Switch the firewall, confirm, and the engine polls its probes for up to ~90&nbsp;seconds while the switch
+        propagates. If endpoints are still unreachable it re-prompts with the updated list; if a phase hits a
+        transient remote error right after a switch (an HTTP 503 from the proxy, say), guided mode retries with
+        10/20/30&nbsp;second backoff before giving up.</p>
+        <div class="callout good"><strong>Plan for one switch.</strong> Start on <code>both-vpns</code>: verify runs
+        anywhere, publish/deploy/tag-bitbucket all run there, and only the final <code>tag-github</code> needs
+        <code>firewall-off</code>. A release started anywhere else pays extra switches.</div>
+        <div class="callout warn"><strong>No software switches posture.</strong> Not the engine, not the console.
+        The console names the posture the next phase needs and shows whether it looks held — its markers are
+        advisory; the engine's own probes are authoritative, and the switch itself is always your hands on the
+        firewall.</div>
+      </article>
+
+      <!-- ══════════════════════════ ENGINE ══════════════════════════ -->
+      <article class="doc-page" data-page="engine" hidden>
+        <p class="eyebrow">The engine · <code>py -m edge_deploy</code></p>
+        <h1>One command per phase, one ledger per run.</h1>
+        <div class="hero-rule"></div>
+        <p class="lede">The engine is a Python package driven entirely from the command line. Every phase is
+        short, idempotent, and posture-scoped; every attempt is recorded in a durable run ledger that survives
+        pauses, posture switches, and reboots.</p>
+
+        <h2>Before your first release</h2>
+        <ul class="checks">
+          <li>Operator config installed at <code>%APPDATA%\edge-deploy\config.yaml</code> (first-time onboarding
+            does this; <code>config.example.yaml</code> documents the shape).</li>
+          <li><code>BB_TOKEN</code> set in the environment of every shell that runs the engine or the console.</li>
+          <li>A clean tool checkout on GitHub <code>main</code>: <code>git pull --ff-only origin main</code>, with
+            green post-merge CI for <code>HEAD</code>.</li>
+          <li>Dependencies installed from the <strong>tool</strong> checkout:
+            <code>py -m pip install -e ".[dev,release]"</code> (the pins live in the tool, not core — ADR-0001).</li>
+          <li>Node transport verified once per node (and after any SSH config change).</li>
+        </ul>
+        <p>Transport verification is two commands:</p>
+        <pre><button class="copy" type="button">Copy</button><code>py -m edge_deploy preflight --node node03
+py -m edge_deploy transport-smoke --node node03</code></pre>
+        <p><code>preflight</code> checks DNS and TCP reachability only. <code>transport-smoke</code> authenticates
+        once (this is an RSA prompt) and exercises command execution, verified file transfer, PTY dialogue, and
+        keepalive over that single connection, then always tears it down and reports pass/fail per check.</p>
+
+        <h2>Start or resume a run</h2>
+        <div class="tabs" role="tablist" aria-label="Ways to run a release">
+          <button class="tab" id="tab-guided" type="button" role="tab" aria-selected="true" aria-controls="panel-guided">Guided (recommended)</button>
+          <button class="tab" id="tab-phased" type="button" role="tab" aria-selected="false" aria-controls="panel-phased">Phase by phase</button>
+        </div>
+        <div class="tab-panel active" id="panel-guided" role="tabpanel" aria-labelledby="tab-guided">
+          <p>One invocation walks every phase, pausing only for RSA passcodes and posture switches:</p>
+          <pre><button class="copy" type="button">Copy</button><code>py -m edge_deploy release --guided --tool autobench</code></pre>
+          <p>Press <code>Ctrl+C</code> (or send EOF) at any prompt to pause. The run stays open and the engine
+          prints the exact resume command:</p>
+          <pre><button class="copy" type="button">Copy</button><code>Paused at posture boundary. Resume with: py -m edge_deploy release --guided --run &lt;run_id&gt;</code></pre>
+          <p>Resume works across postures: once <code>verify</code> has passed, resuming does not fetch from
+          GitHub, so you can continue from <code>bitbucket-vpn</code> or <code>both-vpns</code> without repeating
+          it. On completion guided mode prints <code>release complete: &lt;run_id&gt;</code> and the same summary
+          as <code>status</code>.</p>
+        </div>
+        <div class="tab-panel" id="panel-phased" role="tabpanel" aria-labelledby="tab-phased">
+          <p>The non-guided wrapper chains phases until the first posture boundary, saves state, prints the
+          posture message, and exits 0 — re-run after switching:</p>
+          <pre><button class="copy" type="button">Copy</button><code>py -m edge_deploy release --tool autobench
+<span class="dim"># … switch posture when told, then …</span>
+py -m edge_deploy release --run &lt;run_id&gt;</code></pre>
+          <p>Or run each phase yourself — <code>status</code> always prints the next command with the posture it
+          needs:</p>
+          <pre><button class="copy" type="button">Copy</button><code>py -m edge_deploy verify --run &lt;run_id&gt;
+py -m edge_deploy publish-phase --run &lt;run_id&gt;
+py -m edge_deploy deploy --run &lt;run_id&gt; --nodes node03,node04
+py -m edge_deploy tag-bitbucket --run &lt;run_id&gt;
+py -m edge_deploy tag-github --run &lt;run_id&gt;</code></pre>
+        </div>
+        <p>Starting a new release while an unresolved run exists is refused, with both ways out — continue or
+        abandon — spelled out in the refusal. At most one run may be open per tool.</p>
+
+        <h2>Watch the state</h2>
+        <pre><button class="copy" type="button">Copy</button><code>py -m edge_deploy status</code></pre>
+        <p>With an active run, <code>status</code> prints per-phase state and the next command:</p>
+        <pre><button class="copy" type="button">Copy</button><code>run run-20260703T120000Z-aa6d9a5  tool=autobench  kind=release  source=aa6d9a5  created=2026-07-03T12:00:00+00:00
+  verify:        passed
+  publish:       passed (snapshot bb7c8d1)
+  deploy:        node03=passed node04=failed
+  tag_bitbucket: pending
+  tag_github:    pending
+next: py -m edge_deploy deploy --run run-20260703T120000Z-aa6d9a5 --nodes node04   [posture: both-vpns]</code></pre>
+        <p><code>status</code> reads local ledgers only. It works in every posture and is the one command that
+        still answers when everything else refuses.</p>
+
+        <h2>The verify gate</h2>
+        <p>Verify is where the engine decides the commit is releasable. Two checks, both hard:</p>
+        <div class="card-grid">
+          <div class="card"><h3>GitHub CI, exactly this SHA</h3><p>A successful post-merge run of the <code>CI</code>
+            workflow for the exact source commit on <code>main</code>. The engine asks <code>gh run list</code>
+            first and falls back to the GitHub REST API using the credential git's own helper already holds —
+            <code>gh</code> is convenient, not required. The fallback is consulted <em>only</em> when
+            <code>gh</code> could not answer at all: an answer from <code>gh</code> is final in both directions,
+            and an unknown never reads as a pass.</p></div>
+          <div class="card"><h3>The tool's own gate</h3><p>The source checkout's committed
+            <code>tools/dev/local_check.ps1</code>. The tool owns test selection and parallelism; the engine owns
+            ordering and evidence. Only a successful exit records passed tests; a failure writes a redacted tail to
+            <code>verify-local-check.log</code> and blocks every later phase.</p></div>
+        </div>
+        <p>Publish normally reuses the run ledger's verification instead of repeating the local check — but only
+        when the evidence is bound to the run's exact source SHA with successful CI and passed tests. An incomplete
+        ledger safely falls back to running the check again. <code>--no-local-check</code> bypasses only that
+        publish fallback; verify always runs the source-bound tool gate.</p>
+
+        <h2>Deploy and the RSA prompt</h2>
+        <p>Deploy opens one persistent, digest-verified SSH connection per node and reuses it for authentication,
+        dependency transfer, rollout, and drift checks. Enter the RSA passcode at the interactive prompt when
+        asked; the progress heartbeat shows <code>&gt;&gt;&gt; WAITING FOR OPERATOR - …</code> while the engine
+        waits on you. Matching dependency archives already on the node are reused by digest without moving bytes;
+        new archives stream with live progress (MiB sent, percent, MiB/s) to the terminal and to
+        <code>release-progress.json</code>, which the console renders as a progress bar.</p>
+        <div class="callout"><strong>Deep smoke.</strong> <code>--smoke deep</code> (on <code>release</code>,
+        <code>deploy</code>, and <code>rollback</code>) runs the tool's deeper smoke checks on the node and may
+        prompt for a Kerberos password the same way deploy prompts for RSA. Use it when the tool profile declares
+        deep smoke support.</div>
+
+        <h2>Command reference</h2>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+          <tbody>
+            <tr><td><code>release</code></td><td>Create or resume a run; <code>--guided</code> walks every boundary. Key flags: <code>--tool</code>, <code>--run</code>, <code>--nodes</code>, <code>--smoke deep</code>, <code>--force-lock</code>, <code>--fail-fast</code>.</td></tr>
+            <tr><td><code>verify</code> · <code>publish-phase</code> · <code>deploy</code> · <code>tag-bitbucket</code> · <code>tag-github</code></td><td>The five phases, individually, against an existing <code>--run</code>.</td></tr>
+            <tr><td><code>status</code></td><td>Per-phase state and the next command. Local, never blocked.</td></tr>
+            <tr><td><code>rollback</code></td><td>Start a rollback run restoring a recorded release tag: <code>--tag release-…</code>. Forward-deploys the old snapshot; never rewinds Bitbucket <code>main</code>.</td></tr>
+            <tr><td><code>abandon</code></td><td>Close an open run with a recorded <code>--reason</code>. Nothing already deployed is rolled back (ADR-0003).</td></tr>
+            <tr><td><code>preflight</code></td><td>DNS/TCP reachability for one node. No credentials needed.</td></tr>
+            <tr><td><code>transport-smoke</code></td><td>Authenticate once and exercise the whole transport, then tear down. One RSA prompt.</td></tr>
+            <tr><td><code>drift</code></td><td>Compare runtime-critical files on a node against a commit — judged against the snapshot's tree, never your working tree.</td></tr>
+            <tr><td><code>rollout</code></td><td>Low-level: roll one node to one exact commit. The phases use this; you rarely call it directly.</td></tr>
+            <tr><td><code>publish</code> · <code>mirror</code></td><td>Standalone publish of one tool commit; mirror an immutable core tag to Bitbucket (ADR-0007 fallback for rejected merge commits).</td></tr>
+            <tr><td><code>onboard</code></td><td>First-time operator setup: config import, checkouts, transport checks, a training run, and the read-only console tour.</td></tr>
+          </tbody>
+        </table></div>
+
+        <h2>After completion</h2>
+        <ul>
+          <li>Both tags exist and <code>status --run &lt;run_id&gt;</code> reports <code>complete</code>.</li>
+          <li>The audit record is on Bitbucket's <code>release-log</code> branch (appended by
+            <code>tag-bitbucket</code>).</li>
+          <li>Bump the pinned <code>edge-deploy-core</code> version in each tool's <code>pyproject.toml</code>
+            through a normal GitHub pull request — only after the new engine tag is published.</li>
+        </ul>
+      </article>
+
+      <!-- ══════════════════════════ CONSOLE ══════════════════════════ -->
+      <article class="doc-page" data-page="console" hidden>
+        <p class="eyebrow">The cockpit · <code>py -m edge_console</code> · ADR-0018</p>
+        <h1>Every command is a button. Every prompt reaches you.</h1>
+        <div class="hero-rule"></div>
+        <p class="lede">The Edge Console is a local web UI over the run ledgers of the tool checkouts you point it
+        at. It runs the engine's own commands on your behalf, streams their output live, and relays the prompts the
+        engine blocks on — including the RSA passcode. It holds no release logic, never writes a ledger, and never
+        switches posture.</p>
+
+        <h2>Launch it</h2>
+        <p>The console is deliberately <strong>not</strong> pip-installed — editing it must never change Engine
+        Identity — so run it from the core checkout:</p>
+        <pre><button class="copy" type="button">Copy</button><code>cd D:\edge-deploy-core
+py -m edge_console --root D:\autobench --root D:\robocop</code></pre>
+        <p>It binds to loopback only and opens <code>http://127.0.0.1:7643/</code>.</p>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Flag</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>--root</code></td><td>Tool checkout containing <code>edge-deploy/runs</code>; repeat to watch several. Defaults to the current directory.</td></tr>
+            <tr><td><code>--github-write-root</code></td><td>Checkout used for the GitHub write probe; defaults to the <code>--root</code> paths.</td></tr>
+            <tr><td><code>--port</code></td><td>Listen port (default 7643).</td></tr>
+            <tr><td><code>--read-only</code></td><td>Watch only: every button disabled, commands still visible and copyable. Onboarding always launches it this way.</td></tr>
+            <tr><td><code>--demo</code></td><td>Fabricated checkouts driven by an offline simulator — the whole flow, prompts included, with no network and no credentials. The safest way to learn the console.</td></tr>
+            <tr><td><code>--engine-python</code></td><td>Interpreter used for <code>python -m edge_deploy</code> (default: the one running the console). It must match your terminal interpreter, or runs created on one side are refused by the other on Engine Identity.</td></tr>
+            <tr><td><code>--no-browser</code></td><td>Do not auto-open a browser tab.</td></tr>
+          </tbody>
+        </table></div>
+        <div class="callout warn"><strong>Environment matters.</strong> Every command the console runs inherits the
+        console process's environment — so <code>BB_TOKEN</code> must be set in the shell that starts it, exactly
+        as it must for a terminal release.</div>
+
+        <h2>What the page shows</h2>
+        <div class="card-grid">
+          <div class="card"><h3>Live runs, spotlighted</h3><p>An open run leads the page: its phase rail, live
+            progress, one action row per legal next step, and a terminal streaming the engine's output. Terminals
+            survive re-renders — scroll position and a half-typed passcode included.</p></div>
+          <div class="card"><h3>Release decision cards</h3><p>Every watched checkout with no run in flight gets a
+            verdict, the three commits it rests on (nodes, checkout, GitHub main), a precondition checklist with a
+            button beside each fixable item, and one <em>Start guided release</em> call to action.</p></div>
+          <div class="card"><h3>History</h3><p>Closed runs collapse into history. Each completed release offers a
+            rollback to its own tag — only when no run is open in that checkout.</p></div>
+          <div class="card"><h3>Posture panel</h3><p>The five postures, which one looks held, and per-endpoint
+            reachability lamps. Advisory only: the engine's probes decide, and switching stays manual.</p></div>
+        </div>
+
+        <h2>Prompts, relayed</h2>
+        <p>The engine's operator boundaries are recognised by their exact text and rendered as typed prompts:</p>
+        <ul>
+          <li>the <strong>RSA passcode</strong> — a masked field written straight to the process stdin, never
+            stored, never logged, shown only as asterisks in the transcript;</li>
+          <li>a <strong>Kerberos password</strong> (deep smoke) — the same way;</li>
+          <li>the <strong>guided posture boundary</strong> — the posture name plus one “I have switched” button;</li>
+          <li>any <strong><code>[y/N]</code> gate</strong> — a yes/no pair;</li>
+          <li>and, as a safety net, any other question the engine prints and then waits on gets a generic answer
+            box, so an unrecognised prompt can never hang a run silently. The console cannot know that answer is
+            not a password, so it is masked like one.</li>
+        </ul>
+
+        <h2>Refusals you see coming</h2>
+        <p>Conditions that already sit on disk or in the console's environment are stated <em>before</em> you press
+        anything, and disable exactly the actions they would stop — scoped to the phases the run has not passed
+        yet. Among them: a run created by a different engine build, a lock another process holds, a missing or
+        unreadable operator config, <code>BB_TOKEN</code> absent, a checkout off <code>main</code> / dirty /
+        drifted off the run's reviewed commit / with remotes that do not match its <code>edge_deploy.yaml</code>,
+        a missing <code>local_check.ps1</code> or no PowerShell, an unset <code>audit_repo</code> or queued audit
+        records, ledger nodes no longer in the operator config, and non-green GitHub CI.</p>
+        <div class="callout"><strong>CI is the one networked prediction.</strong> A known non-green answer (failed,
+        pending, or no run for the SHA) disables verify and release like any other predicted refusal. An answer the
+        console <em>could not get</em> blocks nothing — the engine's gate still decides. The console runs the
+        engine's own probe, so on any answer they both have, prediction and gate cannot disagree.</div>
+        <div class="callout warn"><strong>Paramiko only.</strong> A node configured <code>transport: pane</code>
+        takes its RSA passcode in the tmux pane, which the console can neither see nor answer — so
+        <code>deploy</code>, <code>release</code>, <code>rollback</code> and <code>transport-smoke</code> are
+        refused for that node with a pointer to the terminal. <code>preflight</code> is TCP-only and still works.
+        Pane remains the documented recovery override (ADR-0011); it is just not driven from here.</div>
+
+        <h2>The safety model</h2>
+        <ul class="checks">
+          <li>Loopback bind, a loopback <code>Host</code> check on every request, and a per-process token embedded
+            in the page — no other origin can read a ledger or press a button.</li>
+          <li>Every button maps to one entry in a closed allowlist and runs with a fixed argument list — nothing
+            the browser sends can become shell syntax, a new flag, or a different program.</li>
+          <li>Checkouts must be ones the console was started with; run ids, node names, tags, commits, and tool
+            names are pattern-checked server-side; one command per checkout at a time.</li>
+          <li>Training ledgers are refused by the server, not just hidden. Release commands are refused outside a
+            git checkout.</li>
+          <li>Secrets are written to one child process and dropped: never stored, never logged, masked in the
+            transcript, never returned by any endpoint.</li>
+          <li>Stopping a command closes the child's stdin first, so the engine unwinds and releases its own run
+            lock; force-taking a lock needs a dialog naming the pid and host that hold it.</li>
+        </ul>
+
+        <h2>Try it offline, right now</h2>
+        <pre><button class="copy" type="button">Copy</button><code>py -m edge_console --demo</code></pre>
+        <p>Demo mode fabricates two checkouts and drives an offline simulator that reproduces the engine's output,
+        its prompts, and its refusals — a complete guided release, RSA prompt and posture stops included, with
+        nothing real attached.</p>
+      </article>
+
+      <!-- ══════════════════════════ RECOVERY ══════════════════════════ -->
+      <article class="doc-page" data-page="recovery" hidden>
+        <p class="eyebrow">When it stops · locks, resumes, rollbacks</p>
+        <h1>Nothing is lost. Read the refusal, then resume.</h1>
+        <div class="hero-rule"></div>
+        <p class="lede">The engine is built to stop safely: every pause leaves an open run that resumes exactly
+        where it stopped, and every refusal names its reason and, usually, the next command. Fix the first concrete
+        error; do not improvise around a gate.</p>
+
+        <h2>Pause and resume</h2>
+        <p><code>Ctrl+C</code> (or EOF) at any guided prompt pauses the run. It stays <code>open</code>, the lock
+        is released, and the engine prints the resume command. Resuming skips phases that already passed; once
+        verify has passed, resuming does not even need GitHub.</p>
+
+        <h2>The exact refusals</h2>
+        <details>
+          <summary><code>run &lt;run_id&gt; is locked by PID &lt;pid&gt; on &lt;hostname&gt;…</code></summary>
+          <p>Another process holds the run lock. If it is a live engine (or a console-driven one), let it finish —
+          two engines in one run corrupt it. Only when you know the holder is dead, re-run with
+          <code>--force-lock</code>; the console offers the same thing as <em>Take the lock and resume</em>, behind
+          a confirmation naming the pid and host.</p>
+        </details>
+        <details>
+          <summary><code>release refused: unresolved run &lt;run_id&gt; … exists</code></summary>
+          <p>At most one run may be open per tool. Continue it (<code>py -m edge_deploy release --run
+          &lt;run_id&gt;</code>) or abandon it with a recorded reason. The refusal prints both commands.</p>
+        </details>
+        <details>
+          <summary><code>phase '&lt;phase&gt;' requires posture […]; unreachable: …</code></summary>
+          <p>Not an error — a boundary. Switch the firewall to a listed posture and re-run the printed command.
+          Endpoints can fail transiently for up to a minute while a switch propagates.</p>
+        </details>
+        <details>
+          <summary>Verify refuses: no successful GitHub CI run for the commit</summary>
+          <p>The gate wants a green post-merge <code>CI</code> run for exactly the release SHA on
+          <code>main</code>. Wait for CI, or fix and merge again. If <code>gh</code> is missing the engine already
+          fell back to the REST API by itself; if neither could answer, the refusal keeps the diagnosis — an
+          unknown never passes.</p>
+        </details>
+        <details>
+          <summary>Verify or publish fails the local check</summary>
+          <p>Read the redacted tail in <code>verify-local-check.log</code> (or
+          <code>publish-local-check.log</code>) inside the run directory. The tool's committed gate failed for its
+          own reason; correct it and re-run the same phase. No Bitbucket mutation happens before the gate passes.</p>
+        </details>
+        <details>
+          <summary>Engine identity mismatch: the run was created by a different engine build</summary>
+          <p>Any engine source change orphans open runs. Finish the run with the engine that created it, or abandon
+          it and start fresh with the new engine. The console detects this before you press anything.</p>
+        </details>
+        <details>
+          <summary>The console refuses a node: pane transport</summary>
+          <p>By design — the pane's RSA prompt lives in tmux where the console cannot answer it. Drive that node
+          from a terminal; everything else about the run stays console-drivable.</p>
+        </details>
+        <details>
+          <summary>Drift detected on a node</summary>
+          <p>Something on the node no longer matches the released snapshot. Investigate before releasing on top:
+          <code>py -m edge_deploy drift --tool &lt;tool&gt; --node &lt;node&gt; --commit &lt;sha&gt;</code> lists
+          the differing files. A drifted node is a finding, not an automatic rollback.</p>
+        </details>
+
+        <h2>Rollback</h2>
+        <pre><button class="copy" type="button">Copy</button><code>py -m edge_deploy rollback --tag release-20260707T153012Z-41d9b0c</code></pre>
+        <p>Rollback restores a previously recorded successful release tag by starting a <em>new</em> run that
+        forward-deploys the old snapshot. It never rewinds Bitbucket <code>main</code> and never moves a published
+        tag — tags are immutable. The console offers it from the completed run it would restore, in history, only
+        while no run is open in that checkout.</p>
+
+        <h2>Abandon</h2>
+        <pre><button class="copy" type="button">Copy</button><code>py -m edge_deploy abandon --run &lt;run_id&gt; --reason "&lt;why&gt;"</code></pre>
+        <p>Closes an open run with a recorded reason. Nothing already deployed is rolled back (ADR-0003) — if
+        nodes received the release before you abandoned, decide separately whether to roll them back.</p>
+
+        <h2>Artifact hygiene</h2>
+        <div class="callout warn"><strong>Local means local.</strong> Run ledgers, generated reports, logs,
+        credentials, RSA passcodes, Kerberos passwords, tokens, and operator configuration never enter GitHub. The
+        audit trail that <em>is</em> shared lives on Bitbucket's <code>release-log</code> branch, appended
+        (redacted) by <code>tag-bitbucket</code>.</div>
+      </article>
+
+      <!-- ══════════════════════════ GLOSSARY ══════════════════════════ -->
+      <article class="doc-page" data-page="glossary" hidden>
+        <p class="eyebrow">Shared language · CONTEXT.md</p>
+        <h1>Say it the way the ledger says it.</h1>
+        <div class="hero-rule"></div>
+        <p class="lede">These terms have exact meanings in the engine, the console, and the ADRs. When a refusal
+        uses one of them, this is what it means.</p>
+        <dl class="term-grid">
+          <dt>Release Operator</dt><dd>The person who explicitly releases merged GitHub <code>main</code>. The only role that touches Bitbucket, Edge, RSA, or Kerberos.</dd>
+          <dt>Tool</dt><dd>One deployable product: Autobench or Robocop/Dispatch.</dd>
+          <dt>Tool Profile</dt><dd>The tool's committed <code>edge_deploy.yaml</code>: node-independent release metadata, no operator paths or credentials.</dd>
+          <dt>Publish</dt><dd>Fast-forward the exact reviewed GitHub commit to Bitbucket. Never a rewrite.</dd>
+          <dt>Deploy</dt><dd>Apply the published commit to each selected Edge Node and verify final commit, drift, permissions, and smoke checks.</dd>
+          <dt>Release</dt><dd>One operator-controlled publish-and-deploy run for the tool in the current checkout.</dd>
+          <dt>Rollback</dt><dd>Explicitly restore a previously recorded successful release tag. Never rewinds Bitbucket <code>main</code>.</dd>
+          <dt>Snapshot</dt><dd>The exact source tree a release or rollback delivers. Every deployed-state judgement — drift included — is against the snapshot's tree, never the operator's working tree.</dd>
+          <dt>Posture</dt><dd>The workstation's firewall state, one of five (ADR-0013). Switching is a human act.</dd>
+          <dt>Run</dt><dd>One durable release attempt, from creation to <code>complete</code> or <code>abandoned</code>. At most one open run per tool.</dd>
+          <dt>Run Ledger</dt><dd>The durable, append-audited record of a run: source SHA, per-phase and per-node state, and the engine identity that created it.</dd>
+          <dt>Engine Identity</dt><dd>The exact content of the installed release engine. A run is bound to the engine that created it; any engine change orphans open runs.</dd>
+          <dt>Guided Release</dt><dd>A release in which one engine invocation walks the operator through every posture switch and RSA prompt instead of exiting at each boundary.</dd>
+          <dt>Edge Console</dt><dd>The local web UI over the run ledgers of the watched checkouts. Runs the engine's own commands, streams output, relays prompts; holds no release logic, never writes a ledger, never switches posture (ADR-0018).</dd>
+          <dt>Action allowlist</dt><dd>The closed set of engine commands the console can run. Every button maps to one entry with validated parameters; nothing else is constructible from the browser.</dd>
+          <dt>Decision card</dt><dd>The console's per-checkout release verdict: the three commits it compares, a precondition checklist, and one call to action that disables itself with a stated reason.</dd>
+          <dt>Predicted refusal</dt><dd>A condition the console can already see (on disk or in its environment) that would make the engine refuse — shown before the button is pressed, scoped to the phases it would actually stop.</dd>
+          <dt>Authenticated Pane</dt><dd>The local tmux/psmux session holding an authenticated SSH connection to one Edge Node. A lossy, screen-scraped text channel — not a byte pipe.</dd>
+          <dt>Pane-Safe</dt><dd>A remote command or payload that survives the pane's known corruptions: single-line, quote-stripping, length limits, screen-wrap. Arbitrary content crosses base64-encoded between digest-verified sentinels.</dd>
+          <dt>Drift</dt><dd>A difference between runtime-critical files in the released commit and the files present on an Edge Node.</dd>
+          <dt>Training run</dt><dd>An onboarding run against a sandbox ledger, explicitly marked <code>training</code>. The console displays it read-only and its server refuses to act on it.</dd>
+          <dt>Demo mode</dt><dd><code>py -m edge_console --demo</code>: fabricated checkouts and an offline engine simulator. Prompts and refusals behave like the real thing; nothing real is attached.</dd>
+        </dl>
+
+        <h2>The invariant, one more time</h2>
+        <div class="callout good"><strong>GitHub <code>main</code> == Bitbucket <code>main</code> == release tag ==
+        deployed Edge state.</strong> All four must identify the same full source SHA. Everything else in this
+        handbook is machinery to keep that true.</div>
+      </article>
+
+      <footer class="metadata">
+        edge-deploy-core v1.5.4 · Offline handbook — no network needed, safe to copy anywhere except GitHub-bound
+        trees with operator data. Sources of truth: <code>README.md</code>, <code>docs/release-workflow.md</code>,
+        <code>CONTEXT.md</code>, and the ADRs under <code>docs/adr/</code> (0001–0018). When this page and the
+        engine disagree, the engine is right — then fix this page.
+      </footer>
+    </main>
+  </div>
+
+  <script>
+    (() => {
+      const pages = new Set(['overview', 'postures', 'engine', 'console', 'recovery', 'glossary']);
+      const themeButton = document.getElementById('theme-toggle');
+      const root = document.documentElement;
+      let theme = root.dataset.theme === 'dark' ? 'dark' : 'light';
+
+      const save = (key, value) => { try { localStorage.setItem(key, value); } catch { /* file:// or locked-down profile */ } };
+
+      function currentPage() {
+        const candidate = location.hash.slice(1);
+        return pages.has(candidate) ? candidate : 'overview';
+      }
+
+      function applyState({ focus = false } = {}) {
+        const page = currentPage();
+        root.dataset.theme = theme;
+        document.querySelectorAll('.doc-page').forEach(article => {
+          article.hidden = article.dataset.page !== page;
+        });
+        document.querySelectorAll('[data-page-link]').forEach(link => {
+          if (link.dataset.pageLink === page) link.setAttribute('aria-current', 'page');
+          else link.removeAttribute('aria-current');
+        });
+        const dark = theme === 'dark';
+        themeButton.textContent = dark ? '☀ Light mode' : '☾ Dark mode';
+        themeButton.setAttribute('aria-pressed', String(dark));
+        themeButton.setAttribute('aria-label', dark ? 'Switch to light mode' : 'Switch to dark mode');
+        if (focus) {
+          const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+          window.scrollTo({ top: 0, behavior: reduceMotion ? 'auto' : 'smooth' });
+          document.getElementById('main-content').focus({ preventScroll: true });
+        }
+      }
+
+      themeButton.addEventListener('click', () => {
+        theme = theme === 'dark' ? 'light' : 'dark';
+        save('edge-deploy-doc-theme', theme);
+        applyState();
+      });
+      addEventListener('hashchange', () => applyState({ focus: true }));
+
+      function copyToClipboard(text) {
+        if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text).then(() => true, () => legacyCopy(text));
+        return Promise.resolve(legacyCopy(text));
+      }
+      // The handbook is often opened from file shares or plain http, where the async clipboard API is unavailable.
+      function legacyCopy(text) {
+        const helper = document.createElement('textarea');
+        helper.value = text;
+        helper.setAttribute('readonly', '');
+        helper.style.cssText = 'position:fixed;top:0;left:0;opacity:0;';
+        document.body.append(helper);
+        helper.select();
+        let copied = false;
+        try { copied = document.execCommand('copy'); } catch { copied = false; }
+        helper.remove();
+        return copied;
+      }
+      document.querySelectorAll('.copy').forEach(button => {
+        const idleLabel = button.textContent;
+        let resetTimer = 0;
+        button.addEventListener('click', async () => {
+          const text = button.parentElement.querySelector('code').innerText;
+          const copied = await copyToClipboard(text);
+          button.textContent = copied ? 'Copied' : 'Failed';
+          clearTimeout(resetTimer);
+          resetTimer = setTimeout(() => { button.textContent = idleLabel; }, 1200);
+        });
+      });
+      document.querySelectorAll('[role="tablist"]').forEach(tablist => {
+        const tabs = [...tablist.querySelectorAll('[role="tab"]')];
+        const panels = tabs.map(tab => document.getElementById(tab.getAttribute('aria-controls')));
+        const activate = tab => {
+          tabs.forEach(item => item.setAttribute('aria-selected', String(item === tab)));
+          panels.forEach(panel => panel.classList.toggle('active', panel.id === tab.getAttribute('aria-controls')));
+        };
+        tabs.forEach((tab, index) => {
+          tab.addEventListener('click', () => activate(tab));
+          tab.addEventListener('keydown', event => {
+            if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+            event.preventDefault();
+            const next = tabs[(index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length];
+            next.focus();
+            activate(next);
+          });
+        });
+      });
+      if (!pages.has(location.hash.slice(1))) history.replaceState(null, '', '#overview');
+      applyState();
+    })();
+  </script>
+</body>
+</html>
