@@ -46,7 +46,6 @@ from edge_console.actions import (  # noqa: E402
 from edge_console.demo import DEMO_ENGINE_PATH  # noqa: E402
 from edge_console.probes import (  # noqa: E402
     _ci_verdict,
-    _github_repo_path,
     _tool_name,
     probe_github_ci,
 )
@@ -1181,14 +1180,6 @@ def test_github_ci_falls_back_from_gh_to_the_rest_api(tmp_path) -> None:
     assert probe_github_ci(tmp_path, None)["status"] == "unknown"
 
 
-def test_github_remote_paths_are_recognised_for_both_url_forms() -> None:
-    assert _github_repo_path("https://github.com/mastercard/autobench.git") == "mastercard/autobench"
-    assert _github_repo_path("git@github.com:mastercard/autobench.git") == "mastercard/autobench"
-    assert _github_repo_path("https://github.com/mastercard/autobench") == "mastercard/autobench"
-    assert _github_repo_path("https://scm.mastercard.int/edge/autobench.git") is None
-    assert _github_repo_path("https://github.com/toodeep/a/b.git") is None
-
-
 def test_an_unknown_ci_answer_blocks_nothing() -> None:
     """The one predicted condition that is reported rather than enforced."""
     tool = {"on_main": True, "dirty": False, "head": "a" * 40,
@@ -1330,7 +1321,11 @@ def test_run_blockers_catch_the_refusals_the_engine_would_produce() -> None:
     assert held[0]["blocks"] == [
         "release", "verify", "publish", "deploy", "tag_bitbucket", "tag_github", "abandon"
     ]
-    assert "--force-lock" in held[0]["text"]
+    # The blocker points at the on-page recovery, not a terminal — the console
+    # can steal the lock now, and the copy must not say otherwise.
+    assert "Take the lock and resume" in held[0]["text"]
+    assert "--force-lock" not in held[0]["text"]
+    assert "from a terminal" not in held[0]["text"]
 
     no_config = {**_OK_ENV, "operator_config": {"status": "missing", "path": "/x"}}
     missing_config = _run_blockers(_open_run(), no_config, None)
@@ -1475,16 +1470,31 @@ def test_shutdown_waits_for_children_to_actually_stop(tmp_path) -> None:
     assert runner.snapshot()["status"] == "exited"
 
 
+def test_lock_recovery_row_escapes_the_lock_holder_fields() -> None:
+    """Regression: the lock hostname/pid come off disk and were interpolated
+    into an HTML action slot unescaped — a script injection into the page that
+    holds the console's action token."""
+    run = _open_run()
+    run["lock"] = {
+        "pid": 4242,
+        "hostname": "<img src=x onerror=alert(1)>",
+        "acquired_at": "2026-07-10T00:00:00+00:00",
+    }
+    html = _render_run_html(run)
+    assert "<img src=x" not in html
+    assert "&lt;img src=x onerror=alert(1)&gt;" in html
+
+
 def test_a_lock_the_console_itself_holds_is_not_reported_as_a_foreign_process() -> None:
     """A console-driven release holds the run lock for its whole life, so the
     advice to steal it with --force-lock would be exactly wrong."""
     run = _open_run()
     run["lock"] = {"pid": 4242, "hostname": "THIS-HOST", "acquired_at": "2026-07-10T00:00:00+00:00"}
     ours = _run_blockers(run, _OK_ENV, None, console_busy=True)
-    assert "--force-lock" not in ours[0]["text"]
     assert "command running above" in ours[0]["text"]
     theirs = _run_blockers(run, _OK_ENV, None, console_busy=False)
-    assert "--force-lock" in theirs[0]["text"]
+    assert "Take the lock and resume" in theirs[0]["text"]
+    assert "cannot steal" not in theirs[0]["text"]
 
 
 def test_run_blockers_carry_the_checkout_gate_onto_open_runs() -> None:
@@ -1611,9 +1621,10 @@ def test_console_never_writes_a_ledger_or_bypasses_the_engine() -> None:
         "edge_deploy.config.load_operator_config",
         "edge_deploy.config.load_tool_profile",
         "edge_deploy.preflight.endpoint_from_node",
-        # The CI probe is the engine's own, so the console's prediction and the
-        # engine's gate cannot answer differently.
+        # The CI probe and the repo-path parser are the engine's own, so the
+        # console's prediction and the engine's gate cannot answer differently.
         "edge_deploy.repository.github_ci_conclusions_via_api",
+        "edge_deploy.repository.github_repo_path",
     }, engine_imports
 
 

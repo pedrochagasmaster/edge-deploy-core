@@ -32,12 +32,11 @@ from edge_deploy.config import (
     load_tool_profile,
 )
 from edge_deploy.preflight import endpoint_from_node
-from edge_deploy.repository import github_ci_conclusions_via_api
+from edge_deploy.repository import github_ci_conclusions_via_api, github_repo_path
 
 PROBE_TIMEOUT = 1.5
 PROBE_CACHE_SECONDS = 10.0
 GITHUB_WRITE_TIMEOUT = 20.0
-GITHUB_WRITE_STATUSES = frozenset({"ok", "fail", "unknown"})
 GIT_TIMEOUT = 10.0
 GH_TIMEOUT = 15.0
 TOOLS_CACHE_SECONDS = 30.0
@@ -53,26 +52,10 @@ _TOOL_NAME_RE = re.compile(r"^tool:\s*[\"']?([A-Za-z0-9_-]+)", re.MULTILINE)
 # GitHub write probe
 # ---------------------------------------------------------------------------
 
-def _github_repo_path(remote_url: str) -> str | None:
-    """``owner/repo`` for a GitHub remote, or None if it is not one."""
-    remote_url = remote_url.strip()
-    if remote_url.startswith("git@github.com:"):
-        path = remote_url.removeprefix("git@github.com:")
-    else:
-        parsed = urllib.parse.urlsplit(remote_url)
-        if parsed.scheme != "https" or parsed.hostname != "github.com":
-            return None
-        path = parsed.path.lstrip("/")
-    path = path.removesuffix(".git").strip("/")
-    return path if path.count("/") == 1 else None
-
-
 def _github_receive_pack_url(remote_url: str) -> str | None:
     """Authenticated Smart HTTP write endpoint for a GitHub remote."""
-    path = _github_repo_path(remote_url)
+    path = github_repo_path(remote_url)
     return f"https://github.com/{path}.git/git-receive-pack" if path else None
-
-
 
 
 def _default_github_write_runner(repo_root: Path, *, timeout: float) -> int:
@@ -282,19 +265,9 @@ class PostureProber:
             )
         with ThreadPoolExecutor(max_workers=max(1, len(self._roots) or 1)) as pool:
             write_tools = list(pool.map(probe_github_write, self._roots)) if self._roots else []
-        # Strip command from API payload (argv is an implementation detail).
-        api_tools = [
-            {
-                "tool": row["tool"],
-                "root": row["root"],
-                "status": row["status"],
-                "detail": row["detail"],
-            }
-            for row in write_tools
-        ]
         result["groups"]["github"] = {
-            "aggregate": aggregate_github_write(api_tools),
-            "tools": api_tools,
+            "aggregate": aggregate_github_write(write_tools),
+            "tools": write_tools,
         }
         with self._lock:
             self._cached = result

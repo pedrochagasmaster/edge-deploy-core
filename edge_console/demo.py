@@ -13,7 +13,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from edge_console.demo_engine import DEMO_AHEAD_BY_TOOL, DEMO_HEAD_BY_TOOL
+from edge_console.demo_engine import DEMO_AHEAD_BY_TOOL, DEMO_ENGINE_SHA, DEMO_HEAD_BY_TOOL
 from edge_console.demo_engine import __file__ as _DEMO_ENGINE_FILE
 from edge_console.ledger import SCHEMA
 
@@ -30,7 +30,6 @@ DEMO_REMOTES = {
 }
 # The fabricated engine fingerprint every demo ledger carries, so the console's
 # engine-identity check sees the simulator agreeing with itself.
-DEMO_ENGINE_SHA = "d3m0" + "0" * 60
 
 
 def demo_git(root: Path, *args: str, timeout: float | None = None) -> str | None:
@@ -54,9 +53,10 @@ def demo_git(root: Path, *args: str, timeout: float | None = None) -> str | None
 
 
 def demo_ci(root: Path, commit: str | None) -> dict:
-    """No GitHub to ask in demo, and inventing a green tick would be a lie."""
-    del root
-    return {"status": "success" if commit else "unknown", "detail": "demo: not a real CI query"}
+    """No GitHub to ask in demo, so CI is honestly unknown — which blocks
+    nothing, so the fabricated release path stays open without a faked tick."""
+    del root, commit
+    return {"status": "unknown", "detail": "demo: CI is not queried offline", "source": None}
 
 
 def demo_argv_builder(spec, args: list[str], cwd: Path) -> list[str]:

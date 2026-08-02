@@ -78,6 +78,7 @@ header{border-bottom:1px solid var(--line);background:var(--panel);position:stic
 .banner[hidden]{display:none}  /* a class-level display: wins over [hidden] */
 .banner b{color:var(--ink)}
 .banner.demo{border-color:var(--warn);color:var(--warn)}
+.banner.warn{border-color:var(--warn);color:var(--warn)}
 .banner.readonly{border-color:var(--gh);color:var(--gh)}
 .banner.offline{border-color:var(--fail);color:var(--fail)}
 .rootline{font-family:var(--mono);font-size:11px;color:var(--faint);padding:14px 0 0}
@@ -512,21 +513,23 @@ function actionRow(a){
   const cls = ["act", a.primary ? "primary" : "", a.danger ? "danger" : ""].filter(Boolean).join(" ");
   const disabled = readOnly || a.disabled || !!a.blockedBy;
   const btnCls = ["run", a.primary ? "primary" : "", a.primary ? "big" : "", a.danger ? "danger" : ""].filter(Boolean).join(" ");
-  const why = a.why ? `<div class="ctawhy">${a.why}</div>` : "";
+  const describedBy = a.blockedBy ? `why-${esc(a.payload.action)}-${esc(a.payload.root || "")}` : "";
   return `<div class="${cls}">
     <button class="${btnCls}" data-payload="${esc(JSON.stringify(a.payload))}"
       ${disabled ? "disabled" : ""} ${a.confirm ? `data-confirm="${esc(a.confirm)}"` : ""}
       ${a.confirmText ? `data-confirm-text="${esc(a.confirmText)}"` : ""}
+      ${describedBy ? `aria-describedby="${describedBy}"` : ""}
       title="${esc(a.cmd)}">${esc(a.label)}</button>
     <div class="actmain">
       <div class="acttext">${a.text}</div>
-      ${why}
       <div class="actcmd"><code>${esc(a.cmd)}</code>
         <button class="copy" data-cmd="${esc(a.cmd)}">copy</button></div>
     </div>
     <div class="actside">
       <span class="need ${cap}">${esc(needText)}</span>
-      ${a.blockedBy ? `<span class="blocked-why">${esc(a.blockedBy)}</span>` : readinessHtml(cap)}
+      ${a.blockedBy
+        ? `<span class="blocked-why" id="${describedBy}">${esc(a.blockedBy)}</span>`
+        : readinessHtml(cap)}
     </div>
   </div>`;
 }
@@ -545,11 +548,15 @@ function environment(){
 function toolFor(root){
   return ((toolsData && toolsData.tools) || []).find(t => t.root === root) || null;
 }
-// A console-driven release holds the run lock for its whole life, so the lock
-// the card is looking at is often our own child rather than a foreign process.
+// Only these commands take the run lock, so only these mean "the lock the card
+// sees is our own child" — a status/drift/git probe running in the checkout
+// does not, and must not hide the lock-recovery row or reword the blocker.
+const LOCK_HOLDING_ACTIONS = new Set(
+  ["release","verify","publish","deploy","tag_bitbucket","tag_github","abandon","rollback"]);
 function consoleIsBusyIn(root){
   for(const a of actionsById.values())
-    if(a.root === root && (a.status === "running" || a.status === "starting")) return true;
+    if(a.root === root && LOCK_HOLDING_ACTIONS.has(a.action)
+       && (a.status === "running" || a.status === "starting")) return true;
   return false;
 }
 
@@ -662,8 +669,8 @@ function runBlockers(run, env, tool, consoleHoldsLock){
         ? `<b>The command running above holds this run's lock.</b> Everything else on this run waits for it;
            stopping it releases the lock.`
         : `<b>Another process holds this run's lock</b> (pid ${esc(run.lock.pid)} on ${esc(run.lock.hostname)}).
-           Every phase refuses, and so does abandon. If that process is gone, release it from a terminal with
-           <code>--force-lock</code> — the console deliberately cannot steal a lock.`});
+           Every phase refuses, and so does abandon. If you know that process is gone, use
+           <b>Take the lock and resume</b> below.`});
 
   const runSha = st.engine && st.engine.content_sha256;
   const live = env && env.engine;
@@ -710,9 +717,10 @@ function runBlockers(run, env, tool, consoleHoldsLock){
           Deploy resolves node names against it and stops on the first one it does not know.`});
     const pane = paneNodes(runNodes, env);
     if(pane.length)
-      out.push({blocks: ["deploy","release"], short: "pane transport",
+      // rollback re-runs deploy across the same nodes, so it is refused too.
+      out.push({blocks: ["deploy","release","rollback"], short: "pane transport",
         text: `<b>${esc(pane.join(", "))} ${pane.length === 1 ? "uses" : "use"} the tmux pane transport.</b>
-          Its RSA passcode is typed in the pane, which the console cannot see or answer — run this deploy
+          Its RSA passcode is typed in the pane, which the console cannot see or answer — run this
           from a terminal.`});
   }
   return out;
@@ -774,11 +782,12 @@ function runActions(run, blockers, tool, consoleHoldsLock){
       label: "Take the lock and resume",
       danger: true,
       cap: "any",
-      text: `Steals the run lock held by pid ${run.lock.pid} on ${run.lock.hostname} and resumes the guided
-             release. Only do this once you know that process is gone — two engines in one run corrupt it.`,
+      text: `Steals the run lock held by pid ${esc(run.lock.pid)} on ${esc(run.lock.hostname)} and resumes the
+             guided release. Only do this once you know that process is gone — two engines in one run corrupt it.`,
       cmd: `py -m edge_deploy release --guided --run ${id} --force-lock`,
       payload: {action:"release", root, run_id:id, force_lock:true},
       confirm: "yes-no",
+      // Plain text: this feeds window.confirm(), not innerHTML.
       confirmText: `The lock on ${id} is held by pid ${run.lock.pid} on ${run.lock.hostname}. `
                  + `Take it anyway? Two engines in one run corrupt it.`,
       // Every other reason still applies — this row only ignores the lock.
@@ -976,7 +985,7 @@ function rollbackHtml(run, opts){
     cmd: `py -m edge_deploy rollback --tag ${tag}`,
     payload: {action: "rollback", root: run.root, tag},
     confirm: "yes-no",
-    confirmText: `Roll the Edge Nodes back to ${tag}? This starts a new run.`,
+    confirmText: `Roll ${st.tool} (${run.root}) back to ${tag}? This starts a new run.`,
   })}</div>`;
 }
 
@@ -1167,15 +1176,16 @@ function checklistHtml(t){
   // Every checklist button carries the posture it needs, for the same reason
   // the action rows do: git push wants firewall-off, the node probes want the
   // Edge VPN, and finding that out from a failure is a bad way to find out.
-  const btn = (label, payload, cmd, cap) =>
+  const btn = (label, payload, cmd, cap, note) =>
     `<span class="checkact">` +
-    `<button class="run" data-payload="${esc(JSON.stringify(payload))}" ${readOnly ? "disabled" : ""}
+    `<button class="run" data-payload="${esc(JSON.stringify(payload))}" ${readOnly || note ? "disabled" : ""}
       title="${esc(cmd)}">${esc(label)}</button>` +
     `<code style="font-family:var(--mono);font-size:10.5px;color:var(--faint)">${esc(cmd)}</code>` +
-    (cap && cap !== "any" ? `<span class="need ${cap}">needs ${esc(REQ_POSTURE[cap])}</span>` : "") +
+    (note ? `<span class="blocked-why">${esc(note)}</span>`
+          : (cap && cap !== "any" ? `<span class="need ${cap}">needs ${esc(REQ_POSTURE[cap])}</span>` : "")) +
     // Only the blocked case earns a marker here: a green tick on every row is
     // noise, and the posture line above already reports the good news.
-    (cap && cap !== "any" && postureReady(cap) === false ? readinessHtml(cap) : "") +
+    (!note && cap && cap !== "any" && postureReady(cap) === false ? readinessHtml(cap) : "") +
     `</span>`;
   const item = (cls, text, action) => items.push(
     `<li class="${cls}"><span class="ctext">${text}</span>` +
@@ -1215,17 +1225,20 @@ function checklistHtml(t){
 
   const node = (t.nodes && t.nodes[0]) || null;
   if(node){
+    // transport-smoke authenticates, so a pane node's passcode is out of reach.
+    const paneNote = paneNodes([node], environment()).length ? "pane node — use a terminal" : null;
     item("", `Optional: confirm the node answers before trusting it.`,
       btn(`Preflight ${node}`, {action:"preflight", root:t.root, node},
           `py -m edge_deploy preflight --node ${node}`, "edge"));
     item("", `Optional: exercise the Paramiko transport end to end.`,
       btn(`Smoke ${node}`, {action:"transport_smoke", root:t.root, node},
-          `py -m edge_deploy transport-smoke --node ${node}`, "edge"));
+          `py -m edge_deploy transport-smoke --node ${node}`, "edge", paneNote));
     if(t.deployed && t.deployed.sha)
       item("", `Optional: check the node still matches what was last deployed.`,
         btn(`Drift ${node}`,
             {action:"drift", root:t.root, tool:t.tool, node, commit:t.deployed.sha},
-            `py -m edge_deploy drift --tool ${t.tool} --node ${node} --commit ${sha7(t.deployed.sha)}`,
+            // Full SHA, so the shown command is exactly what the button runs.
+            `py -m edge_deploy drift --tool ${t.tool} --node ${node} --commit ${t.deployed.sha}`,
             "both"));
   }
   return `<ol class="checklist">${items.join("")}</ol>`;
@@ -1607,7 +1620,7 @@ function renderBanners(){
   // run cards and the decision cards also read.
   const env = environment();
   for(const problem of environmentProblems(env))
-    parts.push(`<div class="banner ${problem.phases === null ? "offline" : "demo"}">${problem.text}</div>`);
+    parts.push(`<div class="banner ${problem.phases === null ? "offline" : "warn"}">${problem.text}</div>`);
   if(env && env.engine && env.engine.status === "unknown")
     parts.push(`<div class="banner offline"><b>The release engine could not be identified</b>
       (${esc(env.engine.detail || "")}). Commands may not run at all; check

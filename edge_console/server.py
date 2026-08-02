@@ -287,7 +287,7 @@ def main(argv: list[str] | None = None) -> int:
             # A finished command usually moved the ledger or the checkout;
             # drop the cached divergence so the next poll re-reads reality.
             on_finish=lambda _runner: tools_prober.invalidate(),
-            node_transports=lambda: readiness.snapshot()["operator_config"].get("nodes") or {},
+            node_transports=readiness.node_transports,
         )
 
     ConsoleHandler.roots = roots

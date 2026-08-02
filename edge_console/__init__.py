@@ -57,7 +57,6 @@ from edge_console.ledger import (
 )
 from edge_console.page import PAGE
 from edge_console.probes import (
-    GITHUB_WRITE_STATUSES,
     PostureProber,
     ToolsProber,
     aggregate_github_write,
@@ -85,7 +84,6 @@ __all__ = [
     "ActionRunner",
     "ActionSpec",
     "ConsoleHandler",
-    "GITHUB_WRITE_STATUSES",
     "PAGE",
     "PostureProber",
     "ReadinessProber",

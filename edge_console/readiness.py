@@ -154,6 +154,17 @@ class ReadinessProber:
         self._cached: dict | None = None
         self._cached_at = 0.0
 
+    def node_transports(self) -> dict[str, str]:
+        """Just the node→transport map, without the engine-identity subprocess.
+
+        The pane-transport refusal needs this on the request path, and paying
+        the ~20s identity probe there would stall the first action after
+        startup. The operator config is a local file read.
+        """
+        if self._demo:
+            return {node: "ssh" for node in ("node03", "node04", "node05")}
+        return probe_operator_config().get("nodes") or {}
+
     def snapshot(self) -> dict:
         if self._demo:
             # --demo drives the simulator, not edge_deploy: reporting the real

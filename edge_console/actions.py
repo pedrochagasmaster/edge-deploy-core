@@ -11,9 +11,10 @@ verbatim, and when the engine stops to ask the operator something (the RSA
 passcode, a Kerberos password, a guided posture acknowledgement, a y/N gate) it
 surfaces that question as a prompt and relays the answer to the process stdin.
 Secrets are written straight through to the child process, never persisted, and
-masked in the transcript (ADR-0002). The Kerberos prompt is recognised as a
-safety net: no allowlisted command passes ``--smoke deep``, which is the only
-thing that asks for it.
+masked in the transcript (ADR-0002). The Kerberos prompt appears when a deploy
+or release is run with ``--smoke deep`` (offered where the tool profile
+declares deep smoke); the console relays it the same way it relays the RSA
+passcode.
 
 Switching the workstation firewall posture stays manual and outside this
 allowlist: the console can only show the boundary and forward the operator's
@@ -518,12 +519,13 @@ class ActionRunner:
     def cancel(self) -> None:
         """Stop the command, giving the engine a chance to unwind first.
 
-        Terminating outright leaves the run lock behind, and no console action
-        can pass ``--force-lock`` — so a stopped run would need a terminal to
-        rescue. Closing stdin first turns a pending prompt into the EOF the
-        engine already handles: the guided loop prints its resume command and
-        releases the lock on the way out.
+        Terminating outright leaves the run lock behind. Closing stdin first
+        turns a pending prompt into the EOF the engine already handles: the
+        guided loop prints its resume command and releases the lock on the way
+        out, so the usual stop needs no lock recovery afterward.
         """
+        if self._stopper is not None:
+            return  # already stopping; do not start a second escalation thread
         proc = self._proc
         if proc is None:
             # Still inside Popen; start() terminates it as soon as it exists.
@@ -721,23 +723,26 @@ class ActionRunner:
 
     def snapshot(self) -> dict:
         with self._cond:
-            return {
-                "id": self.id,
-                "action": self.spec.id,
-                "label": self.spec.label,
-                "command": self.command,
-                "cap": self.spec.cap,
-                "root": self.root,
-                "run_id": self.run_id,
-                "tool": self.tool,
-                "status": self.status,
-                "exit_code": self.exit_code,
-                "error": self.error,
-                "started_at": self.started_at,
-                "finished_at": self.finished_at,
-                "prompt": self._prompt.payload() if self._prompt else None,
-                "cursor": self._dropped + len(self._text),
-            }
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> dict:
+        return {
+            "id": self.id,
+            "action": self.spec.id,
+            "label": self.spec.label,
+            "command": self.command,
+            "cap": self.spec.cap,
+            "root": self.root,
+            "run_id": self.run_id,
+            "tool": self.tool,
+            "status": self.status,
+            "exit_code": self.exit_code,
+            "error": self.error,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "prompt": self._prompt.payload() if self._prompt else None,
+            "cursor": self._dropped + len(self._text),
+        }
 
     def output(self, cursor: int, wait: float = 0.0, seen_prompt: str | None = None) -> dict:
         """Everything after ``cursor``, waiting up to ``wait`` seconds for more.
@@ -769,7 +774,10 @@ class ActionRunner:
                 if remaining <= 0:
                     break
                 self._cond.wait(min(remaining, 1.0))
-        payload = self.snapshot()
+            # Snapshot inside the lock: otherwise the reader thread can append
+            # the exit line and flip status between the loop and here, handing
+            # the client `exited` with a cursor that omits that tail forever.
+            payload = self._snapshot_locked()
         payload["text"] = text
         payload["cursor"] = end
         payload["reset"] = reset

@@ -186,7 +186,12 @@ def _load_yaml_mapping(path: str | Path) -> dict[str, Any]:
         import yaml  # type: ignore[import-not-found]
     except ModuleNotFoundError:
         return _fallback_yaml_load(text)
-    loaded = yaml.safe_load(text) or {}
+    try:
+        loaded = yaml.safe_load(text) or {}
+    except yaml.YAMLError as exc:
+        # A syntax error is an operator-fixable mistake; surface it as a
+        # ValueError naming the file so cli.main reports it, not a traceback.
+        raise ValueError(f"invalid YAML in {config_path}: {exc}") from exc
     if not isinstance(loaded, dict):
         raise ValueError(f"YAML file must be a mapping: {config_path}")
     return loaded

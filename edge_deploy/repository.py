@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
+import re
 import subprocess
 import time
 import urllib.error
@@ -17,6 +19,14 @@ CommandRunner = Callable[[Sequence[str]], str]
 
 _CI_WORKFLOW = "CI"
 _API_TIMEOUT = 20.0
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects so a bearer token is never re-sent to another host."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
 
 _TRANSIENT_GITHUB_MARKERS = (
     "unexpected eof",
@@ -118,6 +128,10 @@ def inspect_repository(
 def github_repo_path(remote_url: str) -> str | None:
     """``owner/repo`` for a GitHub remote, or None when it is not one."""
     remote_url = remote_url.strip()
+    if _CONTROL_RE.search(remote_url):
+        # git will store a newline in a remote URL; refuse to build a request
+        # line out of it rather than raise http.client.InvalidURL later.
+        return None
     if remote_url.startswith("git@github.com:"):
         path = remote_url.removeprefix("git@github.com:")
     else:
@@ -125,7 +139,7 @@ def github_repo_path(remote_url: str) -> str | None:
         if parsed.scheme != "https" or parsed.hostname != "github.com":
             return None
         path = parsed.path.lstrip("/")
-    path = path.removesuffix(".git").strip("/")
+    path = path.strip("/").removesuffix(".git")
     return path if path.count("/") == 1 else None
 
 
@@ -153,6 +167,12 @@ def _git_credential_token(root: Path) -> str | None:
     return None
 
 
+# The token must reach api.github.com and nowhere else, so the request must not
+# follow a redirect that would re-send the Authorization header to another host.
+_NO_REDIRECT = urllib.request.build_opener(_NoRedirect())
+_MAX_API_BYTES = 4 * 1024 * 1024
+
+
 def _fetch_json(url: str, token: str) -> dict | None:
     request = urllib.request.Request(
         url,
@@ -163,10 +183,11 @@ def _fetch_json(url: str, token: str) -> dict | None:
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=_API_TIMEOUT) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        with _NO_REDIRECT.open(request, timeout=_API_TIMEOUT) as response:
+            payload = json.loads(response.read(_MAX_API_BYTES).decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError, http.client.HTTPException):
         return None
+    return payload if isinstance(payload, dict) else None
 
 
 def github_ci_conclusions_via_api(
@@ -199,16 +220,31 @@ def github_ci_conclusions_via_api(
     token = (credential or _git_credential_token)(root)
     if not token:
         return None
+    # The same filters `gh run list --commit <sha> --branch main --workflow CI`
+    # applies (gh always sets exclude_pull_requests), so the fallback cannot
+    # accept a run on a branch or a pull request that gh would have refused.
+    query = urllib.parse.urlencode(
+        {
+            "head_sha": commit,
+            "branch": "main",
+            "exclude_pull_requests": "true",
+            "per_page": "20",
+        }
+    )
     payload = (fetch or _fetch_json)(
-        f"https://api.github.com/repos/{path}/actions/runs"
-        f"?head_sha={urllib.parse.quote(commit)}&per_page=20",
-        token,
+        f"https://api.github.com/repos/{path}/actions/runs?{query}", token
     )
     if payload is None:
         return None
     conclusions = []
     for workflow_run in payload.get("workflow_runs") or []:
+        # Belt and braces on top of the server-side filters: the same run gh
+        # would have counted, and nothing else.
         if workflow_run.get("name") != _CI_WORKFLOW:
+            continue
+        if workflow_run.get("head_sha") != commit or workflow_run.get("head_branch") != "main":
+            continue
+        if workflow_run.get("event") == "pull_request":
             continue
         if workflow_run.get("status") != "completed":
             conclusions.append("pending")
@@ -260,9 +296,18 @@ def require_successful_github_ci(
                 continue
             break
         try:
-            conclusions = [str(item.get("conclusion") or "") for item in json.loads(output)]
+            parsed = json.loads(output)
         except json.JSONDecodeError as exc:
             gh_error = RepositoryError(f"GitHub CI status was not valid JSON: {exc}")
+            break
+        if not isinstance(parsed, list):
+            # gh --json always emits a list; anything else means it could not
+            # answer, so fall through to the API rather than crash on .get().
+            gh_error = RepositoryError("GitHub CI status was not a list")
+            break
+        conclusions = [
+            str(item.get("conclusion") or "") for item in parsed if isinstance(item, dict)
+        ]
         break
 
     if conclusions is None:

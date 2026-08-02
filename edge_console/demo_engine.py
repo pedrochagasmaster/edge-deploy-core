@@ -32,6 +32,11 @@ DEMO_HEAD_BY_TOOL = {
     "robocop": "7fa9e21c3d5b8a0f2e4c6d8b1a3f5c7e9d2b4a6c",
 }
 DEMO_AHEAD_BY_TOOL = {"autobench": "5", "robocop": "3"}
+# The fabricated engine fingerprint every demo ledger carries, so the console's
+# engine-identity check sees the simulator agreeing with itself. Defined here,
+# beside the other demo constants, because this module is executed as a path
+# script and cannot import edge_console.demo.
+DEMO_ENGINE_SHA = "d3m0" + "0" * 60
 
 PHASE_ORDER = ("verify", "publish", "deploy", "tag_bitbucket", "tag_github")
 # ADR-0013, shrunk to what the simulation needs.
@@ -374,7 +379,7 @@ def _create_run(tool: str) -> dict:
         "created_at": _now(),
         "kind": "release",
         "rollback_tag": None,
-        "engine": {"version": "demo", "package_dir": "(demo)", "content_sha256": "d3m0" + "0" * 60},
+        "engine": {"version": "demo", "package_dir": "(demo)", "content_sha256": DEMO_ENGINE_SHA},
         "nodes": list(DEMO_NODES[:2]),
         "status": "open",
         "abandon_reason": None,
