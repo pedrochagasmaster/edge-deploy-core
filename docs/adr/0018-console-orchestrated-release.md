@@ -45,10 +45,12 @@ engine says while they run.** It gains no release logic of its own.
    in `edge_console.actions.ACTION_SPECS`. Each entry builds a fixed `argv`
    list from validated parameters and is executed with `shell=False` in one of
    the watched checkouts. The allowlist covers exactly the operator's
-   documented vocabulary: the five phases, `release --guided`, `abandon`,
-   `status`, `preflight`, `transport-smoke`, and three read-obvious git
-   commands (`pull --ff-only`, `pull --rebase`, `push`). Nothing the browser
-   sends can become shell syntax, a new flag, or a different program.
+   documented vocabulary: the five phases, `release --guided`, `rollback`,
+   `abandon`, `status`, `preflight`, `transport-smoke`, `drift`, and three
+   read-obvious git commands (`pull --ff-only`, `pull --rebase`, `push`), plus
+   three validated modifiers (`--nodes`, `--smoke deep`, `--force-lock`).
+   Nothing the browser sends can become shell syntax, a new flag, or a
+   different program.
 
 2. **Validation is server-side and fails closed.** The checkout must be one
    the console was started with; a run id must match the ledger id shape *and*
@@ -133,14 +135,16 @@ engine says while they run.** It gains no release logic of its own.
    Taking a working button away is worse than failing to predict a refusal, so
    where the console cannot tell, it does not block.
 
-   GitHub CI is the one condition reported rather than enforced. A conclusion
-   exists only in the GitHub API — git publishes `refs/heads`, `refs/tags` and
-   `refs/pull` and nothing about checks — so it cannot be read offline, and it
-   can change between the answer and the click. The console runs the engine's
-   own probe (`repository.github_ci_conclusions_via_api`) rather than a second
-   implementation, so the prediction and the gate cannot disagree. Where verify
-   refuses on an unknown, the console does not: an answer it could not get
-   blocks nothing.
+   GitHub CI is the one condition the console *reports* rather than predicts as
+   a hard block. A conclusion exists only in the GitHub API — git publishes
+   `refs/heads`, `refs/tags` and `refs/pull` and nothing about checks — so it
+   cannot be read offline, and it can change between the answer and the click.
+   A known non-green result (failed, pending, or no run for the SHA) does
+   disable verify and release, because verify will refuse; only an *unknown*
+   answer — one the console could not fetch — blocks nothing. The console runs
+   the engine's own probe (`repository.github_ci_conclusions_via_api`) rather
+   than a second implementation, so the prediction and the gate cannot
+   disagree on a result they both have.
 
    What the console cannot predict cheaply and honestly is left to the
    streamed refusal: Bitbucket remote state, and anything the phase exists to
@@ -165,8 +169,10 @@ engine says while they run.** It gains no release logic of its own.
 
 - The console is no longer read-only, and the guard that asserted so is
   replaced by guards on what it *is* allowed to do: the allowlist shape, the
-  refusal cases, the absence of ledger writes, and the restriction to
-  `edge_deploy.config` / `edge_deploy.preflight` imports.
+  refusal cases, the absence of ledger writes, and the restriction to a small
+  set of read-only engine imports (config and tool-profile loading, probe
+  endpoints, the audit outbox path, the shared GitHub CI probe, and the
+  version string) — a test asserts that set by name.
 - `edge_console.py` becomes the `edge_console` package. It still lives beside
   `edge_deploy`, not inside it, so Engine Identity is unchanged by console
   work. Operators launch it with `py -m edge_console`.

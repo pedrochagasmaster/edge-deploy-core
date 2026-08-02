@@ -94,17 +94,32 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             raise ActionError("request body must be a JSON object")
         return payload
 
-    def _authorize(self) -> None:
-        """Loopback host plus the page token: no other origin can act."""
+    def _require_loopback_host(self) -> None:
+        """Reject a foreign Host on every request, defeating DNS rebinding.
+
+        A rebinded page can point its DNS at 127.0.0.1, but the browser still
+        sends the attacker's Host header — so this guards the reads (the token
+        the page carries, the run ledgers, the transcripts) as well as the
+        writes. A real local client sends ``Host: 127.0.0.1:<port>``.
+        """
         host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
         if host not in ("127.0.0.1", "localhost", "::1"):
             raise ActionError("unexpected Host header", status=403)
+
+    def _authorize(self) -> None:
+        """Loopback host plus the page token: no other origin can act."""
+        self._require_loopback_host()
         if self.headers.get("X-Edge-Console-Token") != self.token:
             raise ActionError("missing or stale console token; reload the page", status=403)
 
     # -- reads -------------------------------------------------------------
 
     def do_GET(self) -> None:  # noqa: N802 (stdlib API)
+        try:
+            self._require_loopback_host()
+        except ActionError as exc:
+            self._error(exc.status, str(exc))
+            return
         parsed = urlsplit(self.path)
         path, query = parsed.path, parse_qs(parsed.query)
         if path == "/":

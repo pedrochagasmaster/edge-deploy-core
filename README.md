@@ -15,8 +15,8 @@ uv sync --extra dev
 uv run pytest
 ```
 
-Python 3.10 and 3.12 are tested in CI. Core declares only the `dev` extra;
-there is no core `release` extra.
+Python 3.10, 3.12, and 3.13 are tested in CI. Core declares only the `dev`
+extra; there is no core `release` extra.
 
 ## Release Operator onboarding (zero state)
 
@@ -156,6 +156,12 @@ this checkout, watching the tool checkouts you release from:
 ```powershell
 py -m edge_console --root D:\autobench --root D:\robocop
 ```
+
+The console is not installed by pip — it is excluded from the package on
+purpose, so that editing it never changes Engine Identity ([ADR-0008](docs/adr/0008-run-ledger-and-posture-phases.md)).
+Run `python -m edge_console` from the core checkout (the directory that
+contains `edge_console/`), or with that directory on `PYTHONPATH`; onboarding
+launches it that way automatically.
 
 It opens `http://127.0.0.1:7643/` and shows:
 

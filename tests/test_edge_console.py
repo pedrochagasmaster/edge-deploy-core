@@ -205,7 +205,7 @@ def _require_node() -> None:
         pytest.skip("node is required to execute the page's JavaScript")
 
 
-def _render_run_html(run: dict, *, tcp_caps: dict | None = None) -> str:
+def _render_run_html(run: dict, *, tcp_caps: dict | None = None, opts: dict | None = None) -> str:
     """Evaluate PAGE's runHtml() in Node so tests assert real card output."""
     _require_node()
     script = _page_script_through_run_html()
@@ -215,7 +215,7 @@ def _render_run_html(run: dict, *, tcp_caps: dict | None = None) -> str:
             fh.write(f"\ntcpCaps = {json.dumps(tcp_caps)};\n")
         fh.write("\nprocess.stdout.write(runHtml(")
         fh.write(json.dumps(run))
-        fh.write("));\n")
+        fh.write(f", {json.dumps(opts or {})}));\n")
         path = Path(fh.name)
     try:
         completed = subprocess.run(
@@ -1414,6 +1414,44 @@ def test_pane_transport_nodes_are_refused_by_the_console(tmp_path) -> None:
         _await(lambda: runner.snapshot()["status"] == "exited", what=f"{body['action']} to finish")
 
 
+def test_drift_builds_an_allowlisted_command_and_rejects_bad_input(tmp_path) -> None:
+    root = _checkout(tmp_path)
+    registry = _registry([root], script="print('ok')")
+    runner = registry.start(
+        {"action": "drift", "root": str(root), "tool": "autobench", "node": "node03",
+         "commit": "9c4f2ae8d1b06f3a7c5e2d4b8a1f0c9e6d3b7a52"}
+    )
+    assert runner.command == (
+        "py -m edge_deploy drift --tool autobench --node node03 "
+        "--commit 9c4f2ae8d1b06f3a7c5e2d4b8a1f0c9e6d3b7a52"
+    )
+    for bad in (
+        {"tool": "Autobench!", "node": "node03", "commit": "a" * 40},
+        {"tool": "autobench", "node": "node03; rm", "commit": "a" * 40},
+        {"tool": "autobench", "node": "node03", "commit": "nothex"},
+    ):
+        with pytest.raises(ActionError):
+            registry.start({"action": "drift", "root": str(root), **bad})
+
+
+def test_console_ci_probe_delegates_to_the_engine(monkeypatch, tmp_path) -> None:
+    """The console must not carry a second CI implementation that could drift
+    from the gate — it calls edge_deploy's probe."""
+    calls = []
+
+    def fake(root, commit):
+        calls.append((str(root), commit))
+        return ["success"]
+
+    monkeypatch.setattr("edge_console.probes.github_ci_conclusions_via_api", fake)
+    from edge_console.probes import _ci_via_api
+
+    verdict = _ci_via_api(tmp_path, "a" * 40)
+    assert verdict["status"] == "success"
+    assert verdict["source"] == "api"
+    assert calls == [(str(tmp_path), "a" * 40)]
+
+
 def test_rollback_only_accepts_a_tag_the_engine_would_have_minted(tmp_path) -> None:
     root = _checkout(tmp_path)
     registry = _registry([root], script="print('ok')")
@@ -1468,6 +1506,28 @@ def test_shutdown_waits_for_children_to_actually_stop(tmp_path) -> None:
     runner = registry.start({"action": "status", "root": str(root)})
     registry.shutdown()
     assert runner.snapshot()["status"] == "exited"
+
+
+def test_completed_release_offers_a_rollback_to_its_own_tag() -> None:
+    tag = "release-20260707T153012Z-41d9b0c"
+    phases = {
+        "verify": {"state": "passed", "updated_at": None, "evidence": {}},
+        "publish": {"state": "passed", "updated_at": None, "evidence": {}},
+        "deploy": {"node03": {"state": "passed", "updated_at": None, "evidence": {}}},
+        "tag_bitbucket": {"state": "passed", "updated_at": None, "evidence": {"tag": tag}},
+        "tag_github": {"state": "passed", "updated_at": None, "evidence": {"tag": tag}},
+    }
+    html = _render_run_html(
+        _sample_run(kind="release", training=None, status="complete", phases=phases)
+    )
+    assert "Roll back to this release" in html
+    assert f"rollback --tag {tag}" in html
+    # A completed run whose checkout has an open run must not offer it.
+    hidden = _render_run_html(
+        _sample_run(kind="release", training=None, status="complete", phases=phases),
+        opts={"rootHasOpenRun": True},
+    )
+    assert "Roll back to this release" not in hidden
 
 
 def test_lock_recovery_row_escapes_the_lock_holder_fields() -> None:
@@ -2349,19 +2409,31 @@ def test_answer_and_cancel_also_require_the_page_token(tmp_path) -> None:
 
 
 def test_non_loopback_host_is_refused(tmp_path) -> None:
-    """The DNS-rebinding guard: a valid token from a foreign origin is not enough."""
+    """The DNS-rebinding guard: a valid token from a foreign origin is not
+    enough — and it covers the reads (the page token, the ledgers, the
+    transcripts), not just the writes."""
     root = _checkout(tmp_path)
     server, port = _serve([root], registry=_registry([root], script="print('ok')"))
+    foreign = {"Host": "attacker.example.com"}
     try:
         status, payload = _request(
             port,
             "POST",
             "/api/actions",
             {"action": "status", "root": str(root)},
-            **{"X-Edge-Console-Token": "test-token", "Host": "attacker.example.com"},
+            **{"X-Edge-Console-Token": "test-token", **foreign},
         )
         assert status == 403
         assert "Host" in payload["error"]
+
+        # Reads must be refused too: a rebinded page could otherwise scrape the
+        # token off `/` and the run ledgers off `/api/runs`.
+        for path in ("/", "/api/runs", "/api/tools", "/api/posture", "/api/actions"):
+            status, _ = _request(port, "GET", path, **foreign)
+            assert status == 403, path
+        # A loopback Host still works.
+        status, _ = _request(port, "GET", "/api/runs", **{"Host": "127.0.0.1"})
+        assert status == 200
     finally:
         server.shutdown()
         server.server_close()

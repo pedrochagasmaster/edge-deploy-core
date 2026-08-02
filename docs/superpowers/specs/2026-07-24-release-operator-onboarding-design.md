@@ -309,11 +309,17 @@ Coordinates the state machine, persists after every transition, invalidates
 stale evidence, handles interactive choices, and renders the final report.
 `edge_deploy/cli.py` only parses arguments and delegates to this runner.
 
-### `edge_console.py`
+### `edge_console`
 
-Remains a standalone, zero-external-dependency, read-only UI outside the
-`edge_deploy` package. It gains support for explicitly marked training ledgers
-and replaces GitHub TCP/read lights with non-mutating write probes.
+> Historical note: this section described the read-only console as it stood at
+> onboarding time. The console has since become the `edge_console` package and
+> can orchestrate releases ([ADR-0018](../../adr/0018-console-orchestrated-release.md));
+> onboarding still launches it `--read-only`, so the description below holds for
+> the onboarding path only.
+
+A standalone UI outside the `edge_deploy` package. It gains support for
+explicitly marked training ledgers and replaces GitHub TCP/read lights with
+non-mutating write probes.
 
 ## State and Resume Model
 
