@@ -355,10 +355,12 @@ the operator config, and GitHub CI that is not green for the commit being releas
 `status` is never blocked — it reads local ledgers only, and is the one command
 that still answers when the rest refuse.
 
-CI is the one condition the console reports rather than enforces. It runs the
-engine's own probe, so its prediction and the gate cannot answer differently —
-but where verify refuses on an unknown, the console does not: an answer it
-could not get blocks nothing.
+CI needs the network to check, so the console treats it a little differently
+from the on-disk conditions: a known non-green answer (failed, pending, or no
+run for the SHA) disables verify and release like any other predicted refusal,
+but an answer the console *could not get* blocks nothing — the engine's gate
+still decides. It runs the engine's own probe, so on any answer they both have,
+the prediction and the gate cannot disagree.
 
 Rollbacks are offered from the completed run they would restore, in the history
 section, and only when no run is open in that checkout.
