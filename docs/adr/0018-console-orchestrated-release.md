@@ -136,10 +136,11 @@ engine says while they run.** It gains no release logic of its own.
    GitHub CI is the one condition reported rather than enforced. A conclusion
    exists only in the GitHub API — git publishes `refs/heads`, `refs/tags` and
    `refs/pull` and nothing about checks — so it cannot be read offline, and it
-   can change between the answer and the click. The console asks `gh` first,
-   because that is what the engine's own gate uses, and falls back to the REST
-   API with the credential git already holds (the same route as the GitHub
-   write probe). When neither answers, CI is unknown and blocks nothing.
+   can change between the answer and the click. The console runs the engine's
+   own probe (`repository.github_ci_conclusions_via_api`) rather than a second
+   implementation, so the prediction and the gate cannot disagree. Where verify
+   refuses on an unknown, the console does not: an answer it could not get
+   blocks nothing.
 
    What the console cannot predict cheaply and honestly is left to the
    streamed refusal: Bitbucket remote state, and anything the phase exists to
@@ -152,6 +153,15 @@ engine says while they run.** It gains no release logic of its own.
    RSA access.
 
 ## Consequences
+
+- `gh` is no longer required to release. `require_successful_github_ci` asks it
+  first and falls back to the REST API with the credential git's helper already
+  holds, so a controller with git credentials but no `gh` can still verify. The
+  fallback runs **only when `gh` could not answer at all** — an answer from
+  `gh` is final in both directions, and if neither source can answer, verify
+  refuses and keeps `gh`'s diagnosis. `api.github.com` is a different host from
+  `github.com`, so a proxy may allow one and not the other; that case lands on
+  the same refusal as before this change.
 
 - The console is no longer read-only, and the guard that asserted so is
   replaced by guards on what it *is* allowed to do: the allowlist shape, the

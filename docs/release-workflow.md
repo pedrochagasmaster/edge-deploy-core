@@ -265,8 +265,18 @@ incomplete or legacy ledger safely falls back to the local check; standalone
 `publish-<tool>.json` record `verification_source` and `local_check_ran` so a
 reused gate is never reported as though the script executed.
 
-Verify itself always runs the exact source checkout's committed
-`tools/dev/local_check.ps1` after GitHub CI succeeds. The tool owns test
+Verify requires a successful post-merge GitHub CI run for the exact source SHA.
+A CI conclusion exists only in GitHub's API — git publishes `refs/heads`,
+`refs/tags` and `refs/pull` and nothing about checks — so verify asks `gh run
+list` first, and falls back to the REST API using the credential git's own
+helper already holds. `gh` is therefore convenient, not required. The fallback
+is consulted **only when `gh` could not answer at all**: an answer from `gh` is
+final, because a gate that asked twice after a refusal would not be a gate. If
+neither source can answer, verify refuses and keeps `gh`'s diagnosis — an
+unknown never reads as a pass.
+
+Verify then runs the exact source checkout's committed
+`tools/dev/local_check.ps1`. The tool owns test
 selection, parallelism, temporary isolation, and platform setup; the engine
 owns ordering and evidence. Only a successful exit records passed tests. A
 failure writes a redacted tail to `verify-local-check.log` and blocks every
@@ -345,11 +355,10 @@ the operator config, and GitHub CI that is not green for the commit being releas
 `status` is never blocked — it reads local ledgers only, and is the one command
 that still answers when the rest refuse.
 
-CI is the one condition reported rather than enforced. A conclusion lives only
-in the GitHub API, so the console asks `gh` first — what the engine's own gate
-uses — and falls back to the REST API with the credential git already holds.
-`gh` is therefore convenient, not required. When neither can answer, CI is
-unknown and blocks nothing.
+CI is the one condition the console reports rather than enforces. It runs the
+engine's own probe, so its prediction and the gate cannot answer differently —
+but where verify refuses on an unknown, the console does not: an answer it
+could not get blocks nothing.
 
 Rollbacks are offered from the completed run they would restore, in the history
 section, and only when no run is open in that checkout.

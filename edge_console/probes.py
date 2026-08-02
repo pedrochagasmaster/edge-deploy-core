@@ -32,6 +32,7 @@ from edge_deploy.config import (
     load_tool_profile,
 )
 from edge_deploy.preflight import endpoint_from_node
+from edge_deploy.repository import github_ci_conclusions_via_api
 
 PROBE_TIMEOUT = 1.5
 PROBE_CACHE_SECONDS = 10.0
@@ -72,34 +73,6 @@ def _github_receive_pack_url(remote_url: str) -> str | None:
     return f"https://github.com/{path}.git/git-receive-pack" if path else None
 
 
-def _git_credential(host: str = "github.com") -> tuple[str, str] | None:
-    """Ask git's credential helper for the token it already holds.
-
-    The same route the GitHub write probe uses, so it needs no credential the
-    operator has not already given git.
-    """
-    env = dict(os.environ)
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    env["GCM_INTERACTIVE"] = "never"
-    try:
-        completed = subprocess.run(
-            ["git", "credential", "fill"],
-            input=f"protocol=https\nhost={host}\n\n".encode(),
-            capture_output=True,
-            timeout=GIT_TIMEOUT,
-            env=env,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if completed.returncode != 0:
-        return None
-    fields = dict(
-        line.split(b"=", 1) for line in completed.stdout.splitlines() if b"=" in line
-    )
-    password = fields.get(b"password")
-    if not password:
-        return None
-    return fields.get(b"username", b"x-access-token").decode(), password.decode()
 
 
 def _default_github_write_runner(repo_root: Path, *, timeout: float) -> int:
@@ -482,42 +455,15 @@ def _ci_via_gh(root: Path, commit: str) -> dict | None:
     return _ci_verdict([str(item.get("conclusion") or "") for item in runs], commit, "gh")
 
 
-def _ci_via_api(root: Path, commit: str, git=_git) -> dict | None:
-    """Ask the REST API with the credential git already holds.
+def _ci_via_api(root: Path, commit: str) -> dict | None:
+    """The engine's own API probe, so the prediction and the gate cannot differ.
 
-    ``gh`` is a convenience, not the only door: this is the same
-    credential-helper route the GitHub write probe uses, so it needs nothing
-    the operator has not already given git. It can still come back empty —
-    ``api.github.com`` is a different host from ``github.com`` and a corporate
-    proxy may treat it differently — in which case CI simply stays unknown.
+    It can still come back empty — ``api.github.com`` is a different host from
+    ``github.com``, and a proxy may treat it differently — in which case CI
+    simply stays unknown, which blocks nothing.
     """
-    remote = git(root, "remote", "get-url", "origin", timeout=5.0)
-    path = _github_repo_path(remote) if remote else None
-    credential = _git_credential() if path else None
-    if not credential:
-        return None
-    username, token = credential
-    request = urllib.request.Request(
-        f"https://api.github.com/repos/{path}/actions/runs"
-        f"?head_sha={urllib.parse.quote(commit)}&per_page=20",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "edge-deploy-console-ci-probe",
-        },
-    )
-    del username  # the token alone authenticates the REST API
-    try:
-        with urllib.request.urlopen(request, timeout=GH_TIMEOUT) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
-        return None
-    runs = [run for run in payload.get("workflow_runs") or [] if run.get("name") == "CI"]
-    conclusions = [
-        str(run.get("conclusion") or ("pending" if run.get("status") != "completed" else ""))
-        for run in runs
-    ]
-    return _ci_verdict(conclusions, commit, "api")
+    conclusions = github_ci_conclusions_via_api(root, commit)
+    return None if conclusions is None else _ci_verdict(conclusions, commit, "api")
 
 
 def probe_github_ci(root: Path, commit: str | None, *, sources=None) -> dict:

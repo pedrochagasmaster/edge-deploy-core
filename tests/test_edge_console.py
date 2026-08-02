@@ -1611,6 +1611,9 @@ def test_console_never_writes_a_ledger_or_bypasses_the_engine() -> None:
         "edge_deploy.config.load_operator_config",
         "edge_deploy.config.load_tool_profile",
         "edge_deploy.preflight.endpoint_from_node",
+        # The CI probe is the engine's own, so the console's prediction and the
+        # engine's gate cannot answer differently.
+        "edge_deploy.repository.github_ci_conclusions_via_api",
     }, engine_imports
 
 
