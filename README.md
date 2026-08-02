@@ -15,8 +15,8 @@ uv sync --extra dev
 uv run pytest
 ```
 
-Python 3.10 and 3.12 are tested in CI. Core declares only the `dev` extra;
-there is no core `release` extra.
+Python 3.10, 3.12, and 3.13 are tested in CI. Core declares only the `dev`
+extra; there is no core `release` extra.
 
 ## Release Operator onboarding (zero state)
 
@@ -86,10 +86,11 @@ isolated under `%APPDATA%\edge-deploy\training\<tool>\` with both
 same `onboard` command to resume; completed runs refresh the report without
 re-practicing.
 
-Edge Console launches against the training roots (`--root`) for ledger
-rendering and against the selected real tool checkouts
+Edge Console launches `--read-only` against the training roots (`--root`) for
+ledger rendering and against the selected real tool checkouts
 (`--github-write-root`) for GitHub write probes. It shows a **simulated**
-posture rail — do not switch workstation posture for it. Training roots may
+posture rail — do not switch workstation posture for it — and no command
+buttons. Training roots may
 lack git; divergence against them is intentionally soft. The console GitHub
 write indicator is green only when every write-root's authenticated, empty
 `git-receive-pack` POST passes. The probe sends no update commands and changes
@@ -146,6 +147,82 @@ see per-phase state and the exact next command.
 py -m edge_deploy rollback --tag release-<UTC>-<short-sha>
 ```
 
+## Edge Console
+
+A local web console over the same commands
+([ADR-0018](docs/adr/0018-console-orchestrated-release.md)). Launch it from
+this checkout, watching the tool checkouts you release from:
+
+```powershell
+py -m edge_console --root D:\autobench --root D:\robocop
+```
+
+The console is not installed by pip — it is excluded from the package on
+purpose, so that editing it never changes Engine Identity ([ADR-0008](docs/adr/0008-run-ledger-and-posture-phases.md)).
+Run `python -m edge_console` from the core checkout (the directory that
+contains `edge_console/`), or with that directory on `PYTHONPATH`; onboarding
+launches it that way automatically.
+
+It opens `http://127.0.0.1:7643/` and shows:
+
+- **whatever is open or live**, spotlighted: the run's rail through the five
+  postures, per-node deploy state, live transfer progress, and one button per
+  remaining command — `release --guided`, the next phase on its own (with a
+  deep-smoke variant where the tool declares one), `status`, `abandon`, and a
+  lock-stealing resume when another process holds the run;
+- **a release decision card** for every checkout with no run in flight: the
+  verdict, the deployed / checkout / GitHub-main commits it rests on, a
+  precondition checklist with `git pull` / `git push` / `preflight` /
+  `transport-smoke` buttons, and one "Start guided release" call to action;
+- **closed runs**, in a collapsed history section — each completed release
+  offering a rollback to its own tag.
+
+Buttons run the exact command shown beside them, in that checkout, and stream
+the engine's output. When the engine stops for the operator — the RSA passcode,
+the guided posture acknowledgement, a `[y/N]` gate — the console shows the
+prompt and relays your answer. Secrets go straight to the running process and
+are masked in the transcript; they are never stored.
+
+The console drives **Paramiko nodes only**. A node configured `transport: pane`
+takes its RSA passcode in the attached tmux pane, which the console can neither
+see nor answer, so it refuses `deploy`, `release`, `rollback` and
+`transport-smoke` for that node and tells you to use a terminal; `preflight` is
+TCP-only and still works. Pane stays the documented per-node recovery override
+([ADR-0011](docs/adr/0011-pane-safe-remote-transport.md)) — just not from here.
+
+Taking a run lock from a process you believe is dead is offered on the blocked
+run itself, behind a dialog naming the pid and host that hold it.
+
+**Start the console from a shell that has `BB_TOKEN` set.** Every command
+inherits the console process's environment, so exporting it later, or in
+another window, does not reach the buttons; the console says so rather than
+letting publish discover it. The same applies to the interpreter: buttons run
+`--engine-python` (default: the console's own), and if that is not the engine
+you would get in your own terminal, runs created from one side are refused by
+the other on Engine Identity ([ADR-0008](docs/adr/0008-run-ledger-and-posture-phases.md)).
+The console reads the identity from the interpreter it will actually spawn and
+flags any open run that does not match.
+
+Changing the workstation firewall posture stays manual. The console names the
+posture a phase needs and waits for you to confirm the switch; it never makes
+one.
+
+| Flag | Behavior |
+|------|----------|
+| `--root` | Tool checkout to watch; repeat for several (default: cwd) |
+| `--github-write-root` | Checkout(s) used for GitHub write probes (default: same as `--root`) |
+| `--read-only` | Serve the dashboard with every command button disabled |
+| `--demo` | Fabricated checkouts driven by an offline simulator; no network |
+| `--engine-python` | Interpreter for `python -m edge_deploy` (default: the console's own) |
+| `--port`, `--no-browser` | Listen port (default 7643); skip opening a browser |
+
+`--demo` needs no operator config, network, or credentials, and walks the whole
+guided release including the RSA prompts and the firewall-off boundary:
+
+```powershell
+py -m edge_console --demo
+```
+
 Successful tool releases receive an immutable `release-<UTC>-<short-sha>` tag on
 GitHub and Bitbucket. Redacted release bundles are appended to the Bitbucket-only
 `release-log` branch of this repository.
@@ -156,11 +233,15 @@ digest-verified Paramiko SSH connection per node by default
 per-node recovery override (`transport: pane`), not a universal channel.
 
 See [docs/release-workflow.md](docs/release-workflow.md) for the operator
-procedure and [docs/DESIGN.md](docs/DESIGN.md) for engine internals. Architecture
+procedure, [docs/edge-deploy-handbook.html](docs/edge-deploy-handbook.html) for
+the offline operator handbook covering the engine and the console (open it in
+any browser; it needs no network), and [docs/DESIGN.md](docs/DESIGN.md) for
+engine internals. Architecture
 decisions: [ADR-0008](docs/adr/0008-run-ledger-and-posture-phases.md) (run
 ledger and phases), [ADR-0009](docs/adr/0009-on-node-runner-file-evidence.md)
 (runner and file evidence), [ADR-0013](docs/adr/0013-five-posture-capability-model.md)
 (five-posture capability model), [ADR-0014](docs/adr/0014-paramiko-release-transport.md)
 (Paramiko as the default release transport),
 [ADR-0017](docs/adr/0017-release-operator-onboarding.md) (Release Operator
-onboarding).
+onboarding), [ADR-0018](docs/adr/0018-console-orchestrated-release.md)
+(console-orchestrated release).

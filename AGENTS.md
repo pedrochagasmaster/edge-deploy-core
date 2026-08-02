@@ -20,8 +20,10 @@ operator configuration must never enter GitHub.
 ## Project map
 
 - `edge_deploy/`: package and CLI
+- `edge_console/`: operator web UI (outside `edge_deploy` so Engine Identity is unaffected; run with `python -m edge_console` from the core checkout)
 - `tests/`: full validation suite
 - `docs/release-workflow.md`: Release Operator procedure
+- `docs/edge-deploy-handbook.html`: offline HTML handbook for the engine and console (guarded by `tests/test_handbook.py`)
 - `docs/adr/`: durable release-engine decisions
 
 ## Learned User Preferences
@@ -52,4 +54,4 @@ this guide targets). The `py` launcher does not exist here and `python` is not o
 - Lint: `.venv/bin/ruff check .` (config in `pyproject.toml`).
 - Test: `.venv/bin/python -m pytest` (standard commands are in `CONTRIBUTING.md` / `README.md`; `-n 4 --dist loadfile` for parallelism). ~100 tests are skipped by design — they need Bitbucket/Edge/SSH/Kerberos/RSA access that does not exist in this environment.
 - CLI: `.venv/bin/python -m edge_deploy status` and `--help` work fully offline. The `release`/`publish`/`rollout`/`drift`/`preflight`/`transport-smoke`/`mirror`/`rollback` commands need operator config plus Bitbucket/Edge network and interactive credentials, so they cannot run end-to-end here.
-- Console: `edge_console.py` is a standalone read-only web UI that lives outside the `edge_deploy` package on purpose (Engine Identity hashes every package `*.py`). It may import a few engine helpers for probe argv and Edge endpoints. Run it fully offline with `.venv/bin/python edge_console.py --demo --no-browser` (serves fabricated runs on `http://127.0.0.1:7643`, override with `--port`). Without `--demo` it needs ledgers under `--root .../edge-deploy/runs`. Optional `--github-write-root` selects checkouts for GitHub write probes (defaults to `--root`).
+- Console: the `edge_console/` package is the operator web UI. It lives outside the `edge_deploy` package on purpose (Engine Identity hashes every package `*.py`) and imports only read-only engine helpers — `edge_deploy.config` (operator config and tool profiles), `edge_deploy.preflight` (probe endpoints), `edge_deploy.audit.default_outbox`, `edge_deploy.repository` (`github_ci_conclusions_via_api` and `github_repo_path`, shared so the console's CI prediction and the engine's gate cannot diverge), and `edge_deploy.__version__`; a test asserts that exact list by name. Since ADR-0018 it also runs allowlisted `edge_deploy` commands in the watched checkouts and relays their interactive prompts; it still holds no release logic and never writes a ledger. Run it fully offline with `.venv/bin/python -m edge_console --demo --no-browser` — fabricated checkouts driven by `edge_console/demo_engine.py`, on `http://127.0.0.1:7643` (override with `--port`), including the RSA prompts and the firewall-off boundary. Without `--demo` it needs tool checkouts on `--root` (each containing `edge-deploy/runs`). Optional: `--github-write-root` selects checkouts for GitHub write probes (defaults to `--root`); `--read-only` disables every command button.

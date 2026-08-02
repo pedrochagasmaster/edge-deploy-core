@@ -4,6 +4,8 @@ import pytest
 from edge_deploy.repository import (
     RepositoryError,
     RepositoryState,
+    github_ci_conclusions_via_api,
+    github_repo_path,
     inspect_repository,
     require_successful_github_ci,
 )
@@ -146,3 +148,216 @@ def test_require_successful_github_ci_does_not_retry_missing_success(tmp_path):
         require_successful_github_ci(state, runner=runner, retry_delay_seconds=0)
 
     assert runner.calls == 1
+
+
+def _ci_state(tmp_path):
+    return RepositoryState(tmp_path, "autobench", "a" * 40, "origin", "bitbucket")
+
+
+def test_api_fallback_refuses_a_green_run_gh_would_have_rejected(tmp_path):
+    """The fallback must not be weaker than gh: a success on a feature branch,
+    or a PR run, or a run for another SHA, does not satisfy the gate."""
+    sha = "a" * 40
+
+    def no_gh(args):
+        raise RepositoryError("gh could not be run: [Errno 2] No such file or directory")
+
+    def only_off_main(root, commit, run=None):
+        # Simulate what the client-side filter must strip: nothing on main.
+        return github_ci_conclusions_via_api(
+            root, commit,
+            run=lambda args: "https://github.com/x/y.git",
+            credential=lambda r: "t",
+            fetch=lambda url, token: {"workflow_runs": [
+                {"name": "CI", "status": "completed", "conclusion": "success",
+                 "head_sha": sha, "head_branch": "feature", "event": "push"},
+                {"name": "CI", "status": "completed", "conclusion": "success",
+                 "head_sha": sha, "head_branch": "main", "event": "pull_request"},
+            ]},
+        )
+
+    with pytest.raises(RepositoryError, match="no successful"):
+        require_successful_github_ci(
+            _ci_state(tmp_path), runner=no_gh, api_probe=only_off_main, retry_delay_seconds=0
+        )
+
+
+def test_non_list_gh_output_falls_through_to_the_api(tmp_path):
+    """gh --json always emits a list; a dict/scalar means it could not answer,
+    so the gate must fall back rather than crash on .get()."""
+    require_successful_github_ci(
+        _ci_state(tmp_path),
+        runner=lambda args: '{"message":"rate limited"}',
+        api_probe=lambda root, commit, run=None: ["success"],
+    )
+    with pytest.raises(RepositoryError, match="could not be fetched|no successful|not a list"):
+        require_successful_github_ci(
+            _ci_state(tmp_path),
+            runner=lambda args: '{"message":"rate limited"}',
+            api_probe=lambda root, commit, run=None: None,
+        )
+
+
+def test_api_probe_rejects_a_control_char_remote_without_crashing(tmp_path):
+    """git will store a newline in a remote URL; the probe must return unknown,
+    not raise http.client.InvalidURL out of the gate."""
+    assert github_ci_conclusions_via_api(
+        tmp_path, "a" * 40,
+        run=lambda args: "https://github.com/owner/repo\nEVIL.git",
+        credential=lambda root: pytest.fail("must not reach credential"),
+    ) is None
+
+
+def test_ci_fallback_never_overturns_an_answer_gh_gave(tmp_path):
+    """The gate must not shop for a second opinion. When gh answers, that
+    answer is final — otherwise a failing build could be released by asking
+    twice."""
+    asked = []
+
+    def api_probe(root, commit, run=None):
+        asked.append(commit)
+        return ["success"]
+
+    with pytest.raises(RepositoryError, match="no successful"):
+        require_successful_github_ci(
+            _ci_state(tmp_path),
+            runner=lambda args: '[{"conclusion":"failure"}]',
+            api_probe=api_probe,
+        )
+    assert asked == [], "the API must not be consulted after gh answered"
+
+
+def test_ci_fallback_answers_when_gh_cannot(tmp_path):
+    """gh missing or unauthenticated is not a reason to block a green build."""
+    def no_gh(args):
+        raise RepositoryError("gh could not be run: [Errno 2] No such file or directory")
+
+    require_successful_github_ci(
+        _ci_state(tmp_path),
+        runner=no_gh,
+        api_probe=lambda root, commit, run=None: ["success"],
+        retry_delay_seconds=0,
+    )
+
+    with pytest.raises(RepositoryError, match="no successful"):
+        require_successful_github_ci(
+            _ci_state(tmp_path),
+            runner=no_gh,
+            api_probe=lambda root, commit, run=None: ["failure"],
+            retry_delay_seconds=0,
+        )
+
+
+def test_ci_fails_closed_when_neither_source_can_answer(tmp_path):
+    """An unknown must never read as a pass, and gh's diagnosis is kept."""
+    def no_gh(args):
+        raise RepositoryError("gh could not be run: [Errno 2] No such file or directory")
+
+    with pytest.raises(RepositoryError, match="could not be run"):
+        require_successful_github_ci(
+            _ci_state(tmp_path),
+            runner=no_gh,
+            api_probe=lambda root, commit, run=None: None,
+            retry_delay_seconds=0,
+        )
+
+
+def test_ci_fallback_is_used_after_transient_gh_failures_are_exhausted(tmp_path):
+    runner = SequenceRunner(
+        [RepositoryError("gh failed: unexpected EOF"), RepositoryError("gh failed: unexpected EOF")]
+    )
+    require_successful_github_ci(
+        _ci_state(tmp_path),
+        runner=runner,
+        attempts=2,
+        retry_delay_seconds=0,
+        api_probe=lambda root, commit, run=None: ["success"],
+    )
+    assert runner.calls == 2
+
+
+def test_ci_fallback_covers_unparseable_gh_output(tmp_path):
+    require_successful_github_ci(
+        _ci_state(tmp_path),
+        runner=lambda args: "not json",
+        api_probe=lambda root, commit, run=None: ["success"],
+    )
+
+
+def test_api_probe_reads_conclusions_for_the_exact_sha(tmp_path):
+    """Mirrors `gh run list --commit <sha> --branch main --workflow CI`: only
+    the CI workflow, only that SHA on main, PR runs excluded, and an unfinished
+    run is pending rather than absent."""
+    sha = "b" * 40
+    requested = {}
+
+    def fetch(url, token):
+        requested["url"] = url
+        return {
+            "workflow_runs": [
+                {"name": "CI", "status": "completed", "conclusion": "success",
+                 "head_sha": sha, "head_branch": "main", "event": "push"},
+                {"name": "CI", "status": "in_progress", "conclusion": None,
+                 "head_sha": sha, "head_branch": "main", "event": "push"},
+                {"name": "Lint", "status": "completed", "conclusion": "failure",
+                 "head_sha": sha, "head_branch": "main", "event": "push"},
+                # A green run on a feature branch — gh would not count it.
+                {"name": "CI", "status": "completed", "conclusion": "success",
+                 "head_sha": sha, "head_branch": "feature-x", "event": "push"},
+                # A green PR run at the same SHA — gh excludes pull requests.
+                {"name": "CI", "status": "completed", "conclusion": "success",
+                 "head_sha": sha, "head_branch": "main", "event": "pull_request"},
+                # A run for a different SHA the server should not have returned.
+                {"name": "CI", "status": "completed", "conclusion": "success",
+                 "head_sha": "c" * 40, "head_branch": "main", "event": "push"},
+            ]
+        }
+
+    conclusions = github_ci_conclusions_via_api(
+        tmp_path,
+        sha,
+        run=lambda args: "https://github.com/mastercard/autobench.git",
+        credential=lambda root: "token",
+        fetch=fetch,
+    )
+    assert conclusions == ["success", "pending"], "only CI runs for this SHA on main"
+    assert "mastercard/autobench" in requested["url"]
+    assert "head_sha=" + sha in requested["url"]
+    assert "branch=main" in requested["url"]
+    assert "exclude_pull_requests=true" in requested["url"]
+
+
+def test_api_probe_returns_unknown_rather_than_guessing(tmp_path):
+    """None means 'could not ask', which callers must not read as 'no runs'."""
+    # Not a GitHub remote.
+    assert github_ci_conclusions_via_api(
+        tmp_path, "a" * 40,
+        run=lambda args: "https://scm.mastercard.int/edge/autobench.git",
+        credential=lambda root: pytest.fail("must not ask for a credential"),
+        fetch=lambda url, token: pytest.fail("must not reach the API"),
+    ) is None
+    # No remote at all.
+    def no_remote(args):
+        raise RepositoryError("git failed: no such remote")
+
+    assert github_ci_conclusions_via_api(tmp_path, "a" * 40, run=no_remote) is None
+    # A GitHub remote but no usable credential.
+    assert github_ci_conclusions_via_api(
+        tmp_path, "a" * 40,
+        run=lambda args: "https://github.com/mastercard/autobench.git",
+        credential=lambda root: None,
+        fetch=lambda url, token: pytest.fail("must not reach the API"),
+    ) is None
+    # The API itself could not be reached.
+    assert github_ci_conclusions_via_api(
+        tmp_path, "a" * 40,
+        run=lambda args: "https://github.com/mastercard/autobench.git",
+        credential=lambda root: "token",
+        fetch=lambda url, token: None,
+    ) is None
+
+
+def test_github_repo_path_accepts_both_remote_forms():
+    assert github_repo_path("https://github.com/mastercard/autobench.git") == "mastercard/autobench"
+    assert github_repo_path("git@github.com:mastercard/autobench.git") == "mastercard/autobench"
+    assert github_repo_path("https://scm.mastercard.int/edge/autobench.git") is None

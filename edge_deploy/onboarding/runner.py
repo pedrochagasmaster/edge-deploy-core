@@ -248,9 +248,18 @@ def _launch_console(
 
     Ledger/tool collection uses ``roots``; GitHub write probes use
     ``github_write_roots`` when provided (real tool checkouts during practice).
+
+    Always ``--read-only``: onboarding is practice, and ADR-0017 keeps training
+    cards display-only, so the console's command buttons stay off here.
     """
-    script = Path(__file__).resolve().parents[2] / "edge_console.py"
-    command: list[str] = [sys.executable, str(script), "--no-browser"]
+    core_root = Path(__file__).resolve().parents[2]
+    command: list[str] = [
+        sys.executable,
+        "-m",
+        "edge_console",
+        "--no-browser",
+        "--read-only",
+    ]
     for root in roots:
         command.extend(["--root", str(root)])
     write_roots = (
@@ -264,6 +273,7 @@ def _launch_console(
     try:
         _popen(
             command,
+            cwd=str(core_root),  # the console package ships beside edge_deploy
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -272,8 +282,8 @@ def _launch_console(
     except OSError as exc:
         raise RuntimeError(
             redact(
-                f"failed to launch edge console ({type(exc).__name__}); "
-                f"start manually: {sys.executable} {script} --no-browser"
+                f"failed to launch edge console ({type(exc).__name__}); start manually from "
+                f"{core_root}: {sys.executable} -m edge_console --no-browser --read-only"
             )
         ) from exc
 

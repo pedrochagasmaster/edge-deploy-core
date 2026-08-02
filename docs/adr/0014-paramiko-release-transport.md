@@ -82,7 +82,7 @@ of which transport is in use.
    callback reports `TransferProgress` (bytes sent, total bytes, elapsed
    time) into `ReleaseProgressTracker.update_transfer`, which is persisted to
    `release-progress.json` and rate-limited on the console (MiB sent/total,
-   percent complete, MiB/s). `edge_console.py` renders the same data as a
+   percent complete, MiB/s). The Edge Console renders the same data as a
    live progress bar per run.
 
 8. **Transport failures are durable node failures, not crashes.** Every

@@ -1487,3 +1487,30 @@ def test_phase_already_passed_treats_skipped_as_satisfied(tmp_path) -> None:
 
     assert cli._phase_already_passed(ledger, "verify", ["node03"])
     assert not cli._phase_already_passed(ledger, "publish", ["node03"])
+
+
+def test_setup_mistakes_are_reported_as_errors_not_tracebacks(tmp_path, monkeypatch, capsys):
+    """A missing tool profile, a malformed operator config, and a missing `gh`
+    are all operator-fixable setup problems. Each used to escape as an uncaught
+    traceback — which the Edge Console now streams into a browser panel."""
+    from edge_deploy.cli import main
+
+    malformed = tmp_path / "operator.yaml"
+    malformed.write_text("- not\n- a mapping\n", encoding="utf-8")
+    assert main(["--config", str(malformed), "status"]) == 0  # status needs no config
+    assert main(["--config", str(malformed), "preflight", "--node", "node03"]) == 2
+    assert "could not be read" in capsys.readouterr().err
+
+    unreadable = tmp_path / "missing.yaml"
+    assert main(["--config", str(unreadable), "preflight", "--node", "node03"]) == 2
+    assert "not found" in capsys.readouterr().err
+
+
+def test_repository_runner_reports_a_missing_binary(tmp_path):
+    """require_successful_github_ci shells out to `gh`; without it the engine
+    used to raise FileNotFoundError straight through cli.main."""
+    from edge_deploy.repository import RepositoryError, _runner
+
+    run = _runner(tmp_path)
+    with pytest.raises(RepositoryError, match="could not be run"):
+        run(["definitely-not-a-real-binary-xyz", "--version"])

@@ -53,9 +53,9 @@ Paths under `%APPDATA%\edge-deploy\`:
 - `config.yaml` — installed operator config (never commit)
 
 Training is not a release: production commands reject training ledgers, and the
-console training rail is labeled simulated. Onboarding launches the console with
-training ledgers on `--root` and selected real tool checkouts on
-`--github-write-root` for write probes. GitHub write aggregate green requires
+console training rail is labeled simulated. Onboarding launches the console
+`--read-only`, with training ledgers on `--root` and selected real tool
+checkouts on `--github-write-root` for write probes. GitHub write aggregate green requires
 every write-root's authenticated, empty `git-receive-pack` POST to pass. The
 probe sends no update commands and changes no refs; **red in `both-vpns` is
 expected and does not fail onboarding**. After onboard completes, the first
@@ -102,8 +102,8 @@ rollout commands, and drift checks. Matching dependency archives already
 present on the node are reused by digest without transferring any bytes; new
 archives stream over SFTP (falling back to a binary exec-channel stream if
 the SFTP subsystem is unavailable) and report live byte progress — MiB sent,
-percent complete, and MiB/s — both on the console and in
-`release-progress.json`, which `edge_console.py` renders as a progress bar.
+percent complete, and MiB/s — both on the terminal and in
+`release-progress.json`, which the Edge Console renders as a progress bar.
 
 `transport: pane` remains an explicit per-node override for recovery when SSH
 access to a node regresses (ADR-0011); selecting it restores the psmux pane
@@ -265,8 +265,18 @@ incomplete or legacy ledger safely falls back to the local check; standalone
 `publish-<tool>.json` record `verification_source` and `local_check_ran` so a
 reused gate is never reported as though the script executed.
 
-Verify itself always runs the exact source checkout's committed
-`tools/dev/local_check.ps1` after GitHub CI succeeds. The tool owns test
+Verify requires a successful post-merge GitHub CI run for the exact source SHA.
+A CI conclusion exists only in GitHub's API — git publishes `refs/heads`,
+`refs/tags` and `refs/pull` and nothing about checks — so verify asks `gh run
+list` first, and falls back to the REST API using the credential git's own
+helper already holds. `gh` is therefore convenient, not required. The fallback
+is consulted **only when `gh` could not answer at all**: an answer from `gh` is
+final, because a gate that asked twice after a refusal would not be a gate. If
+neither source can answer, verify refuses and keeps `gh`'s diagnosis — an
+unknown never reads as a pass.
+
+Verify then runs the exact source checkout's committed
+`tools/dev/local_check.ps1`. The tool owns test
 selection, parallelism, temporary isolation, and platform setup; the engine
 owns ordering and evidence. Only a successful exit records passed tests. A
 failure writes a redacted tail to `verify-local-check.log` and blocks every
@@ -289,6 +299,74 @@ During deploy, enter the RSA passcode at the interactive prompt when asked (the
 keyboard-interactive SSH prompt for `transport: ssh` nodes, or the controller
 tmux pane for `transport: pane` nodes). The progress heartbeat shows
 `>>> WAITING FOR OPERATOR - …` while waiting.
+
+### Running the release from the Edge Console
+
+Everything above can be driven from the console instead of a terminal
+([ADR-0018](adr/0018-console-orchestrated-release.md)). Launch it from the core
+checkout, pointing at the tool checkouts you want to watch:
+
+```powershell
+py -m edge_console --root D:\autobench --root D:\robocop
+```
+
+Each command in this document is a button that runs that exact command in that
+checkout. The console shows the command next to the button before it runs,
+streams the engine's output live, and surfaces the two moments the engine stops
+for you:
+
+- the **RSA passcode** prompt, as a masked field whose value is written
+  straight to the running process and never stored or logged;
+- the **guided posture boundary**, as the posture name the phase needs plus a
+  single "I have switched" button;
+- any `[y/N]` gate, and — as a safety net — any other question the engine
+  prints and then waits on, so an unrecognised prompt cannot hang a run
+  silently.
+
+The console drives **Paramiko nodes only**. A node configured `transport: pane`
+takes its RSA passcode in the attached tmux pane, where the console can neither
+see nor answer it, so `deploy`, `release`, `rollback` and `transport-smoke` are
+refused for that node with a pointer to the terminal. `preflight` is TCP-only
+and still works. Pane remains the documented per-node recovery override
+(ADR-0011); it is just not driven from here.
+
+The console cannot change your firewall posture — that stays a manual
+workstation change, exactly as above. It only names the posture the next phase
+needs, shows whether that posture looks held, and forwards your confirmation.
+
+Checkouts with no run in flight get a release decision card: the verdict, the
+three commits it compares (what the nodes hold, what the checkout holds, what
+GitHub main holds), a precondition checklist whose fixable items have their own
+buttons (`git pull`, `git push`, `preflight`, `transport-smoke`), and one
+"Start guided release" button that is disabled with a stated reason when a
+release would fail.
+
+Refusals the console can see coming are stated before you press anything, and
+disable the commands they would stop — scoped to the phases a run has not
+reached yet, so a condition that only affects a phase already behind it takes
+nothing away: a run created by a different
+engine build, a run lock another process holds, a missing or unreadable
+operator config, `BB_TOKEN` absent from the environment the console was started
+in, a checkout that is not on `main` or not clean or has drifted off the run's
+reviewed commit or whose remotes do not match its `edge_deploy.yaml`, a missing
+`tools/dev/local_check.ps1` or no PowerShell to run it, an unset `audit_repo`
+or audit records still queued, and nodes in the ledger that are no longer in
+the operator config, and GitHub CI that is not green for the commit being released.
+`status` is never blocked — it reads local ledgers only, and is the one command
+that still answers when the rest refuse.
+
+CI needs the network to check, so the console treats it a little differently
+from the on-disk conditions: a known non-green answer (failed, pending, or no
+run for the SHA) disables verify and release like any other predicted refusal,
+but an answer the console *could not get* blocks nothing — the engine's gate
+still decides. It runs the engine's own probe, so on any answer they both have,
+the prediction and the gate cannot disagree.
+
+Rollbacks are offered from the completed run they would restore, in the history
+section, and only when no run is open in that checkout.
+
+Start it with `--read-only` to get the dashboard with every button disabled;
+the commands stay visible and copyable. Onboarding always launches it that way.
 
 ### 4. Complete
 

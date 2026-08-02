@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
-import urllib.request
+import time
 from http.client import HTTPConnection
 from pathlib import Path
 from threading import Thread
@@ -18,11 +21,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import edge_console as edge_console_mod  # noqa: E402
 from edge_console import (  # noqa: E402
-    _SCHEMA,
     PAGE,
+    SCHEMA,
     PostureProber,
     ToolsProber,
-    _tool_name,
     aggregate_github_write,
     build_arg_parser,
     build_demo_checkouts,
@@ -32,6 +34,41 @@ from edge_console import (  # noqa: E402
     probe_github_write,
     resolve_console_roots,
 )
+from edge_console.actions import (  # noqa: E402
+    ACTION_SPECS,
+    CAPABILITIES,
+    ActionError,
+    ActionRegistry,
+    ActionRunner,
+    display_command,
+)
+from edge_console.demo import DEMO_ENGINE_PATH  # noqa: E402
+from edge_console.probes import (  # noqa: E402
+    _ci_verdict,
+    _tool_name,
+    probe_github_ci,
+)
+from edge_console.readiness import (  # noqa: E402
+    ReadinessProber,
+    probe_audit,
+    probe_bb_token,
+    probe_engine_identity,
+    probe_operator_config,
+    probe_powershell,
+)
+
+_SCHEMA = SCHEMA
+_SPEC_PARAMS = {
+    "run_id": "run-20260710T000000Z-aaaaaaa",
+    "nodes": ["node03"],
+    "node": "node03",
+    "reason": "because",
+    "tag": "release-20260710T000000Z-aaaaaaa",
+    "commit": "a" * 40,
+    "tool": "autobench",
+    "smoke": "standard",
+    "force_lock": False,
+}
 
 _FORBIDDEN_PRODUCTION_COMMANDS = (
     "py -m edge_deploy verify",
@@ -73,6 +110,7 @@ def _write_state(
     training: bool | None = None,
     phases: dict | None = None,
     operator: str = "pedro.chagas",
+    nodes: list[str] | None = None,
 ) -> None:
     run_dir.mkdir(parents=True)
     state = {
@@ -85,7 +123,7 @@ def _write_state(
         "kind": kind,
         "rollback_tag": None,
         "engine": {"version": "1.4.0", "package_dir": "(test)", "content_sha256": "b" * 64},
-        "nodes": ["node03"],
+        "nodes": nodes or ["node03"],
         "status": status,
         "abandon_reason": None,
         "phases": phases if phases is not None else {},
@@ -95,15 +133,80 @@ def _write_state(
     (run_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
 
 
+def _serve(
+    roots: list[Path],
+    *,
+    write_roots: list[Path] | None = None,
+    read_only: bool = False,
+    registry: ActionRegistry | None = None,
+    token: str = "test-token",
+) -> tuple[object, int]:
+    """Start a real ConsoleHandler on a loopback port; caller shuts it down."""
+    handler = edge_console_mod.ConsoleHandler
+    handler.roots = roots
+    handler.prober = PostureProber(demo=False, roots=write_roots or roots)
+    handler.tools_prober = ToolsProber(roots, demo=False)
+    # demo=True keeps the readiness probe from shelling out during tests.
+    handler.readiness = ReadinessProber(
+        engine_python=sys.executable, demo=True, demo_engine_sha="d" * 64
+    )
+    handler.registry = registry
+    handler.demo = False
+    handler.read_only = read_only
+    handler.token = token
+    server = edge_console_mod.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    Thread(target=server.serve_forever, daemon=True).start()
+    return server, server.server_address[1]
+
+
+def _request(port: int, method: str, path: str, body: dict | None = None, **headers) -> tuple[int, dict]:
+    conn = HTTPConnection("127.0.0.1", port, timeout=30)
+    payload = json.dumps(body).encode() if body is not None else None
+    conn.request(method, path, body=payload, headers={"Content-Type": "application/json", **headers})
+    response = conn.getresponse()
+    raw = response.read().decode()
+    try:
+        return response.status, json.loads(raw)
+    except ValueError:
+        return response.status, {"raw": raw}
+
+
+def _await(predicate, *, timeout: float = 20.0, what: str = "condition"):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(0.05)
+    raise AssertionError(f"timed out waiting for {what}")
+
+
+def _script_runner(script: str):
+    """An argv builder that runs a throwaway python script instead of the engine."""
+
+    def build(spec, args, cwd):
+        del spec, args, cwd
+        return [sys.executable, "-u", "-c", script]
+
+    return build
+
+
 def _page_script_through_run_html() -> str:
     script = PAGE.split("<script>", 1)[1].split("</script>", 1)[0]
-    marker = "/* ---------- run filter:"
-    assert marker in script, "PAGE script lost the run-filter marker used to extract runHtml"
+    marker = "/* ---------- posture panel ---------- */"
+    assert marker in script, "PAGE script lost the posture-panel marker used to extract runHtml"
     return script.split(marker, 1)[0]
 
 
-def _render_run_html(run: dict, *, tcp_caps: dict | None = None) -> str:
+def _require_node() -> None:
+    """The page's own JS is executed to assert on it; skip where node is absent."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required to execute the page's JavaScript")
+
+
+def _render_run_html(run: dict, *, tcp_caps: dict | None = None, opts: dict | None = None) -> str:
     """Evaluate PAGE's runHtml() in Node so tests assert real card output."""
+    _require_node()
     script = _page_script_through_run_html()
     with tempfile.NamedTemporaryFile("w", suffix=".mjs", encoding="utf-8", delete=False) as fh:
         fh.write(script)
@@ -111,7 +214,7 @@ def _render_run_html(run: dict, *, tcp_caps: dict | None = None) -> str:
             fh.write(f"\ntcpCaps = {json.dumps(tcp_caps)};\n")
         fh.write("\nprocess.stdout.write(runHtml(")
         fh.write(json.dumps(run))
-        fh.write("));\n")
+        fh.write(f", {json.dumps(opts or {})}));\n")
         path = Path(fh.name)
     try:
         completed = subprocess.run(
@@ -513,20 +616,31 @@ def test_demo_tools_show_guide_and_inflight_states() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Copied next-command must not assume cwd == the run's checkout
+# Displayed commands must match what the console actually runs
 # ---------------------------------------------------------------------------
 
 
-def test_next_command_cds_into_the_runs_root() -> None:
-    """Regression guard: a multi-root console must never hand the operator a
-    bare 'py -m edge_deploy ...' command. load_run() falls back to cwd when a
-    run isn't under a configured operator tool path, so copying one tool's
-    command while standing in another tool's checkout fails with 'no such
-    run' — nextCommand() must cd into run.root first."""
+def test_next_command_has_no_cd_because_the_console_sets_the_working_directory() -> None:
+    """The console runs each command with cwd set to the run's own checkout
+    (ActionRegistry.resolve_root -> ActionRunner(cwd=root)), so the command it
+    shows must be the command it runs: a bare 'py -m edge_deploy ...' with no
+    'cd' the operator never typed. The checkout is still carried, in the action
+    payload and on the card."""
     assert "function nextCommand(run, phase){" in PAGE
-    body = PAGE.split("function nextCommand(run, phase){", 1)[1].split("\n}", 1)[0]
-    assert "run.root" in body
-    assert 'cd "${run.root}"' in body or "cd \\\"${run.root}\\\"" in body
+    body = PAGE.split("function nextCommand(run, phase){", 1)[1].split("\n}\n", 1)[0]
+    assert "cd " not in body
+    assert "py -m edge_deploy verify --run ${id}" in body
+
+
+def test_run_action_payloads_carry_the_runs_own_checkout() -> None:
+    """Every runnable action names the root it belongs to; the server refuses
+    any root it does not watch, so a multi-root console can never run one
+    tool's command inside another tool's checkout."""
+    script = _page_script_through_run_html()
+    body = script.split("function runActions(run, blockers, tool, consoleHoldsLock){", 1)[1].split("\n}\n", 1)[0]
+    assert "const id = st.run_id, root = run.root" in body
+    for payload in ("action:\"release\", root, run_id:id", "action:\"abandon\", root, run_id:id"):
+        assert payload in body, payload
 
 
 def test_page_mentions_github_write_probe_not_tcp_authority() -> None:
@@ -590,12 +704,13 @@ def test_probe_github_write_sends_empty_authenticated_receive_pack_post(
         def __exit__(self, *args):
             return None
 
-        def read(self):
+        def read(self, *_size):
             return b"0000"
 
-    def fake_urlopen(request, timeout):
-        requests.append((request, timeout))
-        return Response()
+    class FakeOpener:
+        def open(self, request, timeout):
+            requests.append((request, timeout))
+            return Response()
 
     def fake_run(command, **kwargs):
         assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
@@ -614,8 +729,8 @@ def test_probe_github_write_sends_empty_authenticated_receive_pack_post(
             stdout=b"protocol=https\nhost=github.com\nusername=user\npassword=secret\n",
         )
 
-    monkeypatch.setattr("edge_console.subprocess.run", fake_run)
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr("edge_console.probes.subprocess.run", fake_run)
+    monkeypatch.setattr("edge_console.probes._no_redirect_opener", FakeOpener)
     result = probe_github_write(root, runner=None)
 
     assert result["status"] == "ok"
@@ -625,6 +740,11 @@ def test_probe_github_write_sends_empty_authenticated_receive_pack_post(
     assert request.data == b"0000"
     assert request.full_url.endswith("/git-receive-pack")
     assert timeout == 20.0
+    # The write probe must not follow a redirect that would re-send the Basic
+    # credential to another host.
+    from edge_console.probes import _NoRedirect
+
+    assert _NoRedirect().redirect_request(None, None, None, None, None) is None
 
 
 def test_aggregate_github_write_rules() -> None:
@@ -643,7 +763,7 @@ def test_posture_prober_github_uses_write_probes_not_tcp(tmp_path, monkeypatch) 
         (root / ".git").mkdir()
 
     monkeypatch.setattr(
-        "edge_console.probe_github_write",
+        "edge_console.probes.probe_github_write",
         lambda root, runner=None, timeout=20.0: {
             "tool": Path(root).name,
             "root": str(root),
@@ -654,8 +774,8 @@ def test_posture_prober_github_uses_write_probes_not_tcp(tmp_path, monkeypatch) 
     prober = PostureProber(demo=False, roots=[auto, robo])
     # Force TCP groups empty/fast: stub _probe_one True for bitbucket only path by
     # replacing snapshot internals via monkeypatch on ThreadPoolExecutor path.
-    monkeypatch.setattr("edge_console._edge_endpoints", lambda: [])
-    monkeypatch.setattr("edge_console._probe_one", lambda host, port: True)
+    monkeypatch.setattr("edge_console.probes._edge_endpoints", lambda: [])
+    monkeypatch.setattr("edge_console.probes._probe_one", lambda host, port: True)
     snap = prober.snapshot()
     assert snap["groups"]["github"]["aggregate"] == "fail"
     by_tool = {row["tool"]: row["status"] for row in snap["groups"]["github"]["tools"]}
@@ -664,8 +784,8 @@ def test_posture_prober_github_uses_write_probes_not_tcp(tmp_path, monkeypatch) 
 
 
 def test_posture_prober_github_unknown_without_roots(monkeypatch) -> None:
-    monkeypatch.setattr("edge_console._edge_endpoints", lambda: [])
-    monkeypatch.setattr("edge_console._probe_one", lambda host, port: False)
+    monkeypatch.setattr("edge_console.probes._edge_endpoints", lambda: [])
+    monkeypatch.setattr("edge_console.probes._probe_one", lambda host, port: False)
     snap = PostureProber(demo=False, roots=[]).snapshot()
     assert snap["groups"]["github"]["aggregate"] == "unknown"
     assert snap["groups"]["github"]["tools"] == []
@@ -829,7 +949,10 @@ def test_real_release_card_unchanged_without_training_markers() -> None:
     assert 'class="chip training"' not in html
     assert "TRAINING ONLY" not in html
     assert "py -m edge_deploy verify" in html
-    assert "cd &quot;/tmp/training/autobench&quot;" in html
+    # Real cards get runnable buttons, each naming the checkout the console
+    # will run it in.
+    assert 'class="run primary big"' in html
+    assert "&quot;root&quot;:&quot;/tmp/training/autobench&quot;" in html
     assert "release-tagged on GitHub and Bitbucket" not in html  # still open
 
     complete = _render_run_html(
@@ -852,14 +975,801 @@ def test_real_release_card_unchanged_without_training_markers() -> None:
     assert "release-tagged on GitHub and Bitbucket" in complete
 
 
-def test_console_http_surface_stays_read_only() -> None:
-    """Training visibility is display-only — HTTP handlers remain GET-only."""
-    source = Path("edge_console.py").read_text(encoding="utf-8")
-    assert "def do_GET" in source
-    assert "def do_POST" not in source
-    assert "def do_PUT" not in source
-    assert "def do_PATCH" not in source
-    assert "def do_DELETE" not in source
+def test_phase_timestamps_are_escaped_like_everything_else_off_disk() -> None:
+    """Regression: shortTs returns its input unchanged when the timestamp is
+    not the shape it expects, so an unescaped phase updated_at was a script
+    injection into a page that holds the console's action token."""
+    nasty = "<img src=x onerror=alert(1)>"
+    phases = _pending_phases()
+    phases["verify"] = {"state": "passed", "updated_at": nasty, "evidence": {}}
+    html = _render_run_html(
+        _sample_run(kind="release", training=None, status="open", phases=phases)
+    )
+    assert "<img src=x" not in html
+    assert "&lt;img src=x onerror=alert(1)&gt;" in html
+
+
+def test_divergence_reports_the_branch_and_the_working_tree(tmp_path) -> None:
+    """SHAs alone cannot see the engine's first two gates: a feature branch
+    sitting exactly on origin/main compares as perfectly in sync, and a dirty
+    tree does not move HEAD at all."""
+    answers: dict[tuple, str | None] = {}
+
+    def fake_git(root, *args, timeout=None):
+        del root, timeout
+        return answers.get(args)
+
+    status = ("status", "--porcelain", "--branch", "--untracked-files=all")
+    head = "a" * 40
+
+    answers = {("rev-parse", "HEAD"): head, status: "## main...origin/main"}
+    clean = probe_divergence(tmp_path, [], git=fake_git)
+    assert (clean["branch"], clean["on_main"], clean["dirty"]) == ("main", True, False)
+
+    answers[status] = "## feature/x...origin/main [ahead 1]"
+    other = probe_divergence(tmp_path, [], git=fake_git)
+    assert (other["branch"], other["on_main"]) == ("feature/x", False)
+
+    answers[status] = "## HEAD (no branch)"
+    detached = probe_divergence(tmp_path, [], git=fake_git)
+    assert (detached["branch"], detached["on_main"]) == ("(detached HEAD)", False)
+
+    # Generated release reports are the one untracked path the engine forgives.
+    answers[status] = "## main...origin/main\n?? edge-deploy/reports/release.json"
+    assert probe_divergence(tmp_path, [], git=fake_git)["dirty"] is False
+    answers[status] = "## main...origin/main\n M edge_deploy/cli.py"
+    assert probe_divergence(tmp_path, [], git=fake_git)["dirty"] is True
+
+    # A checkout git cannot answer for stays unknown rather than guessed.
+    answers[status] = None
+    unknown = probe_divergence(tmp_path, [], git=fake_git)
+    assert (unknown["branch"], unknown["on_main"], unknown["dirty"]) == (None, None, None)
+
+
+def test_checkout_state_matches_the_engine_gate_on_a_real_repository(tmp_path) -> None:
+    """The parsing above is only worth anything if it matches real git output
+    and the engine's own reading of it."""
+    from edge_deploy.repository import RepositoryError, inspect_repository
+
+    root = tmp_path / "autobench"
+    root.mkdir()
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "operator@example.com")
+    git("config", "user.name", "operator")
+    (root / "f.txt").write_text("one", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "one")
+    subprocess.run(
+        ["git", "init", "-q", "--bare", str(tmp_path / "origin.git")], check=True, capture_output=True
+    )
+    git("remote", "add", "origin", str(tmp_path / "origin.git"))
+    git("remote", "add", "bitbucket", str(tmp_path / "origin.git"))
+    git("push", "-q", "-u", "origin", "main")
+
+    assert probe_divergence(root, [])["on_main"] is True
+    inspect_repository(
+        root,
+        tool="autobench",
+        expected_origin=str(tmp_path / "origin.git"),
+        expected_bitbucket=str(tmp_path / "origin.git"),
+    )
+
+    # A branch level with origin/main: identical SHAs, and still not releasable.
+    git("checkout", "-qb", "feature")
+    state = probe_divergence(root, [])
+    assert state["head"] == state["origin_main"], "the SHA comparison sees nothing wrong"
+    assert state["stale"] is False
+    assert (state["branch"], state["on_main"]) == ("feature", False)
+    with pytest.raises(RepositoryError, match="requires branch 'main'"):
+        inspect_repository(
+            root,
+            tool="autobench",
+            expected_origin=str(tmp_path / "origin.git"),
+            expected_bitbucket=str(tmp_path / "origin.git"),
+        )
+
+    git("checkout", "-q", "main")
+    (root / "f.txt").write_text("dirty", encoding="utf-8")
+    assert probe_divergence(root, [])["dirty"] is True
+    with pytest.raises(RepositoryError, match="clean working tree"):
+        inspect_repository(
+            root,
+            tool="autobench",
+            expected_origin=str(tmp_path / "origin.git"),
+            expected_bitbucket=str(tmp_path / "origin.git"),
+        )
+
+
+def test_remote_and_gate_checks_match_the_engine_on_a_real_repository(tmp_path) -> None:
+    """The last two parts of inspect_repository that are not about commits: both
+    remotes must match the tool's committed profile, and verify then needs the
+    tool's own gate script to exist."""
+    from edge_deploy.repository import RepositoryError, inspect_repository
+
+    root = tmp_path / "autobench"
+    root.mkdir()
+    origin = tmp_path / "origin.git"
+    bitbucket = tmp_path / "bitbucket.git"
+    for bare in (origin, bitbucket):
+        subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True, capture_output=True)
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "operator@example.com")
+    git("config", "user.name", "operator")
+    (root / "edge_deploy.yaml").write_text(
+        f"tool: autobench\ngithub_url: {origin}\nbitbucket_url: {bitbucket}\n", encoding="utf-8"
+    )
+    git("add", "-A")
+    git("commit", "-qm", "one")
+    git("remote", "add", "origin", str(origin))
+    git("remote", "add", "bitbucket", str(bitbucket))
+    git("push", "-q", "-u", "origin", "main")
+
+    def inspect() -> None:
+        inspect_repository(
+            root, tool="autobench", expected_origin=str(origin), expected_bitbucket=str(bitbucket)
+        )
+
+    state = probe_divergence(root, [])
+    assert state["remotes"] == {"ok": True, "detail": ""}
+    assert state["local_check"] is False, "the gate script is not committed yet"
+    inspect()  # the engine agrees the remotes are right
+
+    (root / "tools" / "dev").mkdir(parents=True)
+    (root / "tools" / "dev" / "local_check.ps1").write_text("exit 0\n", encoding="utf-8")
+    assert probe_divergence(root, [])["local_check"] is True
+    git("add", "-A")
+    git("commit", "-qm", "gate")
+    git("push", "-q", "origin", "main")
+
+    # Point origin at a real repository that is not the one the profile names,
+    # so the engine's fetch succeeds and the URL comparison is what refuses.
+    git("push", "-q", "bitbucket", "main")
+    git("remote", "set-url", "origin", str(bitbucket))
+    drifted = probe_divergence(root, [])
+    assert drifted["remotes"]["ok"] is False
+    assert "origin points at" in drifted["remotes"]["detail"]
+    with pytest.raises(RepositoryError, match="origin points to unexpected repository"):
+        inspect()
+
+
+def test_ci_conclusions_are_mapped_the_way_the_engine_gates_on_them(tmp_path) -> None:
+    """require_successful_github_ci passes only when some run for the exact SHA
+    concluded success; everything else is a refusal the card should explain."""
+    sha = "a" * 40
+    for conclusions, expected in (
+        (["success"], "success"),
+        (["failure", "success"], "success"),  # a re-run that went green counts
+        ([], "missing"),
+        (["", "failure"], "pending"),
+        (["pending"], "pending"),
+        (["failure"], "failed"),
+        (["cancelled"], "failed"),
+    ):
+        assert _ci_verdict(conclusions, sha, "test")["status"] == expected, conclusions
+
+
+def test_github_ci_falls_back_from_gh_to_the_rest_api(tmp_path) -> None:
+    """gh is a convenience, not a dependency: CI conclusions live only in the
+    API, but the API is reachable with the credential git already holds."""
+    sha = "a" * 40
+    gh_only = probe_github_ci(
+        tmp_path, sha,
+        sources=(lambda r, c: {"status": "success", "source": "gh"}, lambda r, c: pytest.fail("gh answered")),
+    )
+    assert gh_only["source"] == "gh"
+
+    fell_back = probe_github_ci(
+        tmp_path, sha,
+        sources=(lambda r, c: None, lambda r, c: {"status": "failed", "source": "api"}),
+    )
+    assert fell_back["source"] == "api"
+
+    # Neither available is "unknown", which blocks nothing by design.
+    silent = probe_github_ci(tmp_path, sha, sources=(lambda r, c: None, lambda r, c: None))
+    assert silent["status"] == "unknown"
+    assert silent["source"] is None
+
+    # A probe that blows up must not take the tool card with it.
+    def explode(root, commit):
+        raise RuntimeError("boom")
+
+    assert probe_github_ci(tmp_path, sha, sources=(explode, lambda r, c: None))["status"] == "unknown"
+    assert probe_github_ci(tmp_path, None)["status"] == "unknown"
+
+
+def test_an_unknown_ci_answer_blocks_nothing() -> None:
+    """The one predicted condition that is reported rather than enforced."""
+    tool = {"on_main": True, "dirty": False, "head": "a" * 40,
+            "profile": {"ok": True}, "remotes": {"ok": True}, "local_check": True}
+    for ci in ({"status": "unknown", "detail": "no gh"}, {"status": "success", "detail": ""}, None):
+        assert _run_blockers(_open_run(), _OK_ENV, {**tool, "ci": ci}) == [], ci
+    failed = _run_blockers(_open_run(), _OK_ENV, {**tool, "ci": {"status": "failed", "detail": "CI concluded failure"}})
+    assert [b["short"] for b in failed] == ["ci failed"]
+    assert sorted(failed[0]["blocks"]) == ["release", "verify"]
+
+
+def test_powershell_and_audit_prerequisites_are_reported(tmp_path, monkeypatch) -> None:
+    shell = probe_powershell()
+    assert shell["present"] is (shell["path"] is not None)
+
+    empty = tmp_path / "outbox"
+    assert probe_audit("/core", outbox=empty)["queued"] is False
+    empty.mkdir()
+    assert probe_audit("/core", outbox=empty)["queued"] is False
+    (empty / "pending").write_text("x", encoding="utf-8")
+    queued = probe_audit("", outbox=empty)
+    assert queued["queued"] is True
+    assert queued["repo"] is None
+
+
+def test_release_cta_is_blocked_whenever_the_checkout_is_not_github_main() -> None:
+    """inspect_repository refuses unless HEAD == origin/main, before a run is
+    even created — so every stale direction blocks, not only the two that also
+    lack CI."""
+    _require_node()
+    script = PAGE.split("<script>", 1)[1].split("</script>", 1)[0]
+    body = script.split("function releaseBlocker(t, env){", 1)[1].split("\n}\n", 1)[0]
+    with tempfile.NamedTemporaryFile("w", suffix=".mjs", encoding="utf-8", delete=False) as fh:
+        # releaseBlocker reads the same problem lists the run cards do.
+        for name in ("function environmentProblems(env){", "function sourceProblems(t){"):
+            fh.write(name + script.split(name, 1)[1].split("\n}\n", 1)[0] + "\n}\n")
+        fh.write("function esc(s){return String(s);}\n")
+        fh.write(f"function releaseBlocker(t, env){{{body}\n}}\n")
+        fh.write(
+            "const cases = ["
+            '  {verdict:"diverged", stale:false, on_main:false, branch:"feature/x"},'
+            '  {verdict:"diverged", stale:false, on_main:false, branch:"(detached HEAD)"},'
+            '  {verdict:"diverged", stale:false, on_main:true, dirty:true},'
+            '  {verdict:"diverged", stale:true, stale_direction:"local_behind"},'
+            '  {verdict:"checkout_stale", stale:true, stale_direction:"local_behind"},'
+            '  {verdict:"diverged", stale:true, stale_direction:"local_ahead", ahead_of_origin:2},'
+            '  {verdict:"diverged", stale:true, stale_direction:"forked"},'
+            '  {verdict:"checkout_stale", stale:true, stale_direction:null},'
+            '  {verdict:"up_to_date", stale:false},'
+            '  {verdict:"unknown", stale:false},'
+            "];\n"
+            "const open = {verdict:'diverged', stale:false, stale_direction:null,"
+        " on_main:true, dirty:false};\n"
+        "const env = {operator_config:{status:'ok'}, bb_token:{present:true},"
+        " powershell:{present:true}, audit:{repo:'/core', queued:false}};\n"
+        "process.stdout.write(JSON.stringify({"
+            "blocked: cases.map(c => releaseBlocker(c, env) !== null),"
+            "open: releaseBlocker(open, env),"
+            "noConfig: releaseBlocker(open, {...env, operator_config:{status:'missing'}}),"
+            "noToken: releaseBlocker(open, {...env, bb_token:{present:false}}),"
+            "noShell: releaseBlocker(open, {...env, powershell:{present:false}}),"
+            "noAudit: releaseBlocker(open, {...env, audit:{repo:null, queued:false}}),"
+            "queued: releaseBlocker(open, {...env, audit:{repo:'/c', queued:true, outbox:'/out'}}),"
+            "badRemote: releaseBlocker({...open, remotes:{ok:false, detail:'origin points at x'}}, env),"
+            "noGate: releaseBlocker({...open, local_check:false}, env)}));\n"
+        )
+        path = Path(fh.name)
+    try:
+        completed = subprocess.run(["node", str(path)], check=False, capture_output=True, text=True)
+    finally:
+        path.unlink(missing_ok=True)
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout)
+    assert all(result["blocked"]), result["blocked"]
+    # A clean checkout that is genuinely ahead of the nodes must still release.
+    assert result["open"] is None
+    # …unless something the console can already see would refuse it anyway.
+    assert "operator config" in result["noConfig"]
+    assert "BB_TOKEN" in result["noToken"]
+    assert "powershell" in result["noShell"]
+    assert "audit_repo" in result["noAudit"]
+    assert "/out" in result["queued"]
+    assert "origin points at x" in result["badRemote"]
+    assert "local_check.ps1" in result["noGate"]
+
+
+def _run_blockers(
+    run: dict, env: dict | None, tool: dict | None, *, console_busy: bool = False
+) -> list[dict]:
+    """Evaluate the page's runBlockers() in Node against explicit inputs."""
+    _require_node()
+    script = _page_script_through_run_html()
+    with tempfile.NamedTemporaryFile("w", suffix=".mjs", encoding="utf-8", delete=False) as fh:
+        fh.write(script)
+        fh.write("\nprocess.stdout.write(JSON.stringify(runBlockers(")
+        fh.write(f"{json.dumps(run)},{json.dumps(env)},{json.dumps(tool)},{json.dumps(console_busy)}")
+        fh.write(")));\n")
+        path = Path(fh.name)
+    try:
+        completed = subprocess.run(["node", str(path)], check=False, capture_output=True, text=True)
+    finally:
+        path.unlink(missing_ok=True)
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout)
+
+
+_OK_ENV = {
+    "engine": {"status": "ok", "content_sha256": "e" * 64, "version": "1.5.4"},
+    "operator_config": {"status": "ok", "path": "/cfg.yaml", "nodes": {"node03": "ssh"}},
+    "bb_token": {"present": True},
+}
+
+
+def _open_run(**engine) -> dict:
+    run = _sample_run(kind="release", training=None, status="open", phases=_pending_phases())
+    run["state"]["engine"] = {"version": "1.5.4", "package_dir": "(t)", "content_sha256": "e" * 64, **engine}
+    return run
+
+
+def test_run_blockers_catch_the_refusals_the_engine_would_produce() -> None:
+    """Each of these makes a button a guaranteed failure, and in a guided
+    release the refusal can arrive several phases and a posture switch later."""
+    clean = _run_blockers(_open_run(), _OK_ENV, {"root": "/tmp/training/autobench", "on_main": True,
+                                                 "dirty": False, "head": "a" * 40})
+    assert clean == [], clean
+
+    # Engine identity: the run belongs to a different engine build.
+    mismatch = _run_blockers(_open_run(content_sha256="f" * 64), _OK_ENV, None)
+    assert len(mismatch) == 1
+    assert "different engine build" in mismatch[0]["text"]
+    assert mismatch[0]["short"] == "engine mismatch"
+    # Abandon is the documented escape hatch and does not check engine identity.
+    assert "abandon" not in mismatch[0]["blocks"]
+
+    # A held lock stops everything, abandon included.
+    locked = _open_run()
+    locked["lock"] = {"pid": 4242, "hostname": "OTHERHOST", "acquired_at": "2026-07-10T00:00:00+00:00"}
+    held = _run_blockers(locked, _OK_ENV, None)
+    assert held[0]["blocks"] == [
+        "release", "verify", "publish", "deploy", "tag_bitbucket", "tag_github", "abandon"
+    ]
+    # The blocker points at the on-page recovery, not a terminal — the console
+    # can steal the lock now, and the copy must not say otherwise.
+    assert "Take the lock and resume" in held[0]["text"]
+    assert "--force-lock" not in held[0]["text"]
+    assert "from a terminal" not in held[0]["text"]
+
+    no_config = {**_OK_ENV, "operator_config": {"status": "missing", "path": "/x"}}
+    missing_config = _run_blockers(_open_run(), no_config, None)
+    assert "No operator config" in missing_config[0]["text"]
+
+    no_token = _run_blockers(_open_run(), {**_OK_ENV, "bb_token": {"present": False}}, None)
+    assert sorted(no_token[0]["blocks"]) == ["publish", "release", "tag_bitbucket"]
+    assert "restart the console" in no_token[0]["text"]
+
+    unknown_node = _run_blockers(
+        _open_run(), {**_OK_ENV, "operator_config": {"status": "ok", "path": "/c", "nodes": {"node99": "ssh"}}}, None
+    )
+    assert "node03" in unknown_node[0]["text"]
+    assert sorted(unknown_node[0]["blocks"]) == ["deploy", "release"]
+
+
+def test_blockers_do_not_disable_commands_for_phases_already_behind_the_run() -> None:
+    """A condition that only stops a phase the run has passed stops nothing.
+    Taking a working button away is worse than not predicting the refusal:
+    tag-github pushes to GitHub with the credential helper, so a missing
+    BB_TOKEN must not disable a run that only has tag-github left."""
+    late = _open_run()
+    for phase in ("verify", "publish", "tag_bitbucket"):
+        late["state"]["phases"][phase] = {"state": "passed", "updated_at": None, "evidence": {}}
+    late["state"]["phases"]["deploy"] = {
+        "node03": {"state": "passed", "updated_at": None, "evidence": {}}
+    }
+
+    for env_key, value in (
+        ("bb_token", {"present": False}),
+        ("audit", {"repo": None, "queued": False}),
+        ("powershell", {"present": False}),
+    ):
+        assert _run_blockers(late, {**_OK_ENV, env_key: value}, None) == [], env_key
+
+    # A checkout problem is likewise only verify's business once verify passed.
+    broken = {"on_main": False, "branch": "feature/x", "dirty": True,
+              "local_check": False, "remotes": {"ok": False, "detail": "origin points at x"}}
+    assert _run_blockers(late, _OK_ENV, broken) == []
+
+    # …but the same conditions do block a run that has not reached them yet.
+    early = _open_run()
+    assert [b["short"] for b in _run_blockers(early, {**_OK_ENV, "bb_token": {"present": False}}, None)] \
+        == ["no BB_TOKEN"]
+    assert [b["short"] for b in _run_blockers(early, {**_OK_ENV, "powershell": {"present": False}}, None)] \
+        == ["no powershell"]
+
+
+def test_pane_transport_nodes_are_refused_by_the_console(tmp_path) -> None:
+    """ADR-0018: the console is a Paramiko surface. A pane node's RSA passcode
+    is typed in the tmux pane, which the console can neither see nor answer, so
+    it would sit on 'waiting for operator' until the operator gave up."""
+    root = _checkout(tmp_path)
+    _write_state(
+        root / "edge-deploy" / "runs" / "run-20260710T000000Z-aaaaaaa",
+        "run-20260710T000000Z-aaaaaaa",
+        phases=_pending_phases(["node03", "node04"]),
+        nodes=["node03", "node04"],
+    )
+    registry = ActionRegistry(
+        roots=[root],
+        argv_builder=_script_runner("print('ok')"),
+        node_transports=lambda: {"node03": "ssh", "node04": "pane"},
+    )
+    run_id = "run-20260710T000000Z-aaaaaaa"
+
+    for body in (
+        {"action": "deploy", "root": str(root), "run_id": run_id, "nodes": ["node04"]},
+        # No --nodes: the refusal has to look at the run's own node list.
+        {"action": "deploy", "root": str(root), "run_id": run_id},
+        {"action": "release", "root": str(root), "run_id": run_id},
+        {"action": "transport_smoke", "root": str(root), "node": "node04"},
+    ):
+        with pytest.raises(ActionError) as refused:
+            registry.start(body)
+        assert refused.value.status == 409, body
+        assert "node04" in str(refused.value)
+        assert "from a terminal" in str(refused.value)
+
+    # The Paramiko node is fine, and preflight is TCP-only either way.
+    for body in (
+        {"action": "deploy", "root": str(root), "run_id": run_id, "nodes": ["node03"]},
+        {"action": "preflight", "root": str(root), "node": "node04"},
+    ):
+        runner = registry.start(body)
+        _await(lambda: runner.snapshot()["status"] == "exited", what=f"{body['action']} to finish")
+
+
+def test_drift_builds_an_allowlisted_command_and_rejects_bad_input(tmp_path) -> None:
+    root = _checkout(tmp_path)
+    registry = _registry([root], script="print('ok')")
+    runner = registry.start(
+        {"action": "drift", "root": str(root), "tool": "autobench", "node": "node03",
+         "commit": "9c4f2ae8d1b06f3a7c5e2d4b8a1f0c9e6d3b7a52"}
+    )
+    assert runner.command == (
+        "py -m edge_deploy drift --tool autobench --node node03 "
+        "--commit 9c4f2ae8d1b06f3a7c5e2d4b8a1f0c9e6d3b7a52"
+    )
+    for bad in (
+        {"tool": "Autobench!", "node": "node03", "commit": "a" * 40},
+        {"tool": "autobench", "node": "node03; rm", "commit": "a" * 40},
+        {"tool": "autobench", "node": "node03", "commit": "nothex"},
+    ):
+        with pytest.raises(ActionError):
+            registry.start({"action": "drift", "root": str(root), **bad})
+
+
+def test_console_ci_probe_delegates_to_the_engine(monkeypatch, tmp_path) -> None:
+    """The console must not carry a second CI implementation that could drift
+    from the gate — it calls edge_deploy's probe."""
+    calls = []
+
+    def fake(root, commit):
+        calls.append((str(root), commit))
+        return ["success"]
+
+    monkeypatch.setattr("edge_console.probes.github_ci_conclusions_via_api", fake)
+    from edge_console.probes import _ci_via_api
+
+    verdict = _ci_via_api(tmp_path, "a" * 40)
+    assert verdict["status"] == "success"
+    assert verdict["source"] == "api"
+    assert calls == [(str(tmp_path), "a" * 40)]
+
+
+def test_rollback_only_accepts_a_tag_the_engine_would_have_minted(tmp_path) -> None:
+    root = _checkout(tmp_path)
+    registry = _registry([root], script="print('ok')")
+    for bogus in ("v1.5.4", "release-nope", "; rm -rf /", "release-20260710T000000Z-AAAAAAA", ""):
+        with pytest.raises(ActionError):
+            registry.start({"action": "rollback", "root": str(root), "tag": bogus})
+    runner = registry.start(
+        {"action": "rollback", "root": str(root), "tag": "release-20260710T000000Z-aaaaaaa"}
+    )
+    assert runner.command == "py -m edge_deploy rollback --tag release-20260710T000000Z-aaaaaaa"
+
+
+def test_force_lock_and_deep_smoke_reach_the_command_line(tmp_path) -> None:
+    root = _checkout(tmp_path)
+    run_id = "run-20260710T000000Z-aaaaaaa"
+    _write_state(root / "edge-deploy" / "runs" / run_id, run_id, phases=_pending_phases())
+    registry = _registry([root], script="print('ok')")
+
+    forced = registry.start(
+        {"action": "verify", "root": str(root), "run_id": run_id, "force_lock": True}
+    )
+    assert forced.command.endswith("--force-lock")
+    _await(lambda: forced.snapshot()["status"] == "exited", what="verify to finish")
+
+    deep = registry.start(
+        {"action": "deploy", "root": str(root), "run_id": run_id,
+         "nodes": ["node03"], "smoke": "deep"}
+    )
+    assert "--smoke deep" in deep.command
+    _await(lambda: deep.snapshot()["status"] == "exited", what="deploy to finish")
+
+    with pytest.raises(ActionError):
+        registry.start(
+            {"action": "deploy", "root": str(root), "run_id": run_id, "smoke": "shallow"}
+        )
+
+
+def test_a_run_without_an_engine_identity_is_flagged_rather_than_offered() -> None:
+    """enter_phase reads engine.content_sha256 directly and dies on a KeyError."""
+    run = _open_run()
+    del run["state"]["engine"]["content_sha256"]
+    blockers = _run_blockers(run, _OK_ENV, None)
+    assert [b["short"] for b in blockers] == ["no engine identity"]
+    assert "abandon" not in blockers[0]["blocks"]
+
+
+def test_shutdown_waits_for_children_to_actually_stop(tmp_path) -> None:
+    """cancel() escalates on a daemon thread; without the join, console exit
+    would kill that thread and leave the child holding its run lock."""
+    root = _checkout(tmp_path)
+    registry = _registry([root], script="import time; time.sleep(30)")
+    runner = registry.start({"action": "status", "root": str(root)})
+    registry.shutdown()
+    assert runner.snapshot()["status"] == "exited"
+
+
+def test_completed_release_offers_a_rollback_to_its_own_tag() -> None:
+    tag = "release-20260707T153012Z-41d9b0c"
+    phases = {
+        "verify": {"state": "passed", "updated_at": None, "evidence": {}},
+        "publish": {"state": "passed", "updated_at": None, "evidence": {}},
+        "deploy": {"node03": {"state": "passed", "updated_at": None, "evidence": {}}},
+        "tag_bitbucket": {"state": "passed", "updated_at": None, "evidence": {"tag": tag}},
+        "tag_github": {"state": "passed", "updated_at": None, "evidence": {"tag": tag}},
+    }
+    html = _render_run_html(
+        _sample_run(kind="release", training=None, status="complete", phases=phases)
+    )
+    assert "Roll back to this release" in html
+    assert f"rollback --tag {tag}" in html
+    # A completed run whose checkout has an open run must not offer it.
+    hidden = _render_run_html(
+        _sample_run(kind="release", training=None, status="complete", phases=phases),
+        opts={"rootHasOpenRun": True},
+    )
+    assert "Roll back to this release" not in hidden
+
+
+def test_lock_recovery_row_escapes_the_lock_holder_fields() -> None:
+    """Regression: the lock hostname/pid come off disk and were interpolated
+    into an HTML action slot unescaped — a script injection into the page that
+    holds the console's action token."""
+    run = _open_run()
+    run["lock"] = {
+        "pid": 4242,
+        "hostname": "<img src=x onerror=alert(1)>",
+        "acquired_at": "2026-07-10T00:00:00+00:00",
+    }
+    html = _render_run_html(run)
+    assert "<img src=x" not in html
+    assert "&lt;img src=x onerror=alert(1)&gt;" in html
+
+
+def test_a_lock_the_console_itself_holds_is_not_reported_as_a_foreign_process() -> None:
+    """A console-driven release holds the run lock for its whole life, so the
+    advice to steal it with --force-lock would be exactly wrong."""
+    run = _open_run()
+    run["lock"] = {"pid": 4242, "hostname": "THIS-HOST", "acquired_at": "2026-07-10T00:00:00+00:00"}
+    ours = _run_blockers(run, _OK_ENV, None, console_busy=True)
+    assert "command running above" in ours[0]["text"]
+    theirs = _run_blockers(run, _OK_ENV, None, console_busy=False)
+    assert "Take the lock and resume" in theirs[0]["text"]
+    assert "cannot steal" not in theirs[0]["text"]
+
+
+def test_run_blockers_carry_the_checkout_gate_onto_open_runs() -> None:
+    """The decision card is hidden while a run is open, so the branch, tree and
+    source-drift gates have to reach the run card too — verify re-inspects the
+    repository until it has passed."""
+    run = _open_run()
+    source = run["state"]["source_sha"]
+
+    for tool, expected in (
+        ({"on_main": False, "branch": "feature/x", "dirty": False, "head": source}, "not on main"),
+        ({"on_main": True, "branch": "main", "dirty": True, "head": source}, "tree not clean"),
+        ({"on_main": True, "branch": "main", "dirty": False, "head": "b" * 40}, "checkout drift"),
+    ):
+        blockers = _run_blockers(run, _OK_ENV, tool)
+        assert [b["short"] for b in blockers] == [expected], (tool, blockers)
+        assert sorted(blockers[0]["blocks"]) == ["release", "verify"]
+
+    # Once verify has passed the engine reuses its evidence, so these stop applying.
+    passed = _open_run()
+    passed["state"]["phases"]["verify"] = {"state": "passed", "updated_at": None, "evidence": {}}
+    drifted = {"on_main": False, "branch": "feature/x", "dirty": True, "head": "b" * 40}
+    assert _run_blockers(passed, _OK_ENV, drifted) == []
+
+
+def test_engine_identity_is_read_from_the_interpreter_that_will_run_the_command() -> None:
+    """--engine-python can point at another interpreter, so importing the hash
+    in this process would answer a question nobody asked."""
+    identity = probe_engine_identity(sys.executable)
+    assert identity["status"] == "ok"
+    assert len(identity["content_sha256"]) == 64
+    from edge_deploy.ledger import engine_identity
+
+    assert identity["content_sha256"] == engine_identity()["content_sha256"]
+
+    broken = probe_engine_identity("/nonexistent/python")
+    assert broken["status"] == "unknown"
+    assert "detail" in broken
+
+
+def test_operator_config_and_bb_token_are_reported_honestly(tmp_path, monkeypatch) -> None:
+    missing = probe_operator_config(tmp_path / "nope.yaml")
+    assert missing["status"] == "missing" and missing["nodes"] == []
+
+    broken = tmp_path / "bad.yaml"
+    broken.write_text("- just\n- a list\n", encoding="utf-8")
+    invalid = probe_operator_config(broken)
+    assert invalid["status"] == "invalid"
+    assert invalid["detail"]
+
+    good = tmp_path / "config.yaml"
+    good.write_text(
+        "operator_email: op@example.com\n"
+        "audit_repo: /tmp/core\n"
+        "nodes:\n"
+        "  node03:\n"
+        "    host: op@edge-03.example\n"
+        "    session: edge-node03\n",
+        encoding="utf-8",
+    )
+    loaded = probe_operator_config(good)
+    assert loaded["status"] == "ok"
+    assert loaded["nodes"] == {"node03": "ssh"}
+
+    monkeypatch.delenv("BB_TOKEN", raising=False)
+    assert probe_bb_token() == {"present": False}
+    monkeypatch.setenv("BB_TOKEN", "x")
+    assert probe_bb_token() == {"present": True}
+
+
+def test_stopping_a_command_lets_the_engine_unwind_before_it_is_terminated(tmp_path) -> None:
+    """Terminating outright strands the run lock, and no console action can
+    pass --force-lock. Closing stdin turns a pending prompt into the EOF the
+    engine already unwinds cleanly."""
+    root = _checkout(tmp_path)
+    script = (
+        "import sys\n"
+        "try:\n"
+        "    input('Switch firewall posture to [firewall-off], then press Enter to continue...')\n"
+        "except EOFError:\n"
+        "    print('Paused at posture boundary.')\n"
+        "    raise SystemExit(0)\n"
+    )
+    registry = _registry([root], script=script)
+    runner = registry.start({"action": "status", "root": str(root)})
+    _await(lambda: runner.snapshot()["prompt"], what="the posture prompt")
+    runner.cancel()
+    _await(lambda: runner.snapshot()["status"] == "exited", what="the command to stop")
+    payload = runner.output(0)
+    assert "Paused at posture boundary." in payload["text"]
+    assert payload["exit_code"] == 0, "a graceful stop must not look like a crash"
+
+
+def test_console_never_writes_a_ledger_or_bypasses_the_engine() -> None:
+    """ADR-0018: the console orchestrates by running engine commands. It must
+    never edit a ledger itself, and must never reach into edge_deploy's release
+    internals — only edge_deploy.config/preflight, for probe endpoints."""
+    package = Path(__file__).resolve().parents[1] / "edge_console"
+    # demo.py and demo_engine.py are the offline simulator: they fabricate and
+    # then advance throwaway ledgers in a temp directory, which is the point.
+    simulator = {"demo.py", "demo_engine.py"}
+    engine_imports: set[str] = set()
+    for source_file in sorted(package.rglob("*.py")):
+        source = source_file.read_text(encoding="utf-8")
+        if source_file.name not in simulator:
+            for forbidden in ("state.json", "events.jsonl", "run.lock"):
+                for line in source.splitlines():
+                    if forbidden in line:
+                        assert "write" not in line and "open(" not in line, (
+                            f"{source_file.name} looks like it writes {forbidden}: {line.strip()}"
+                        )
+        for module, names in re.findall(r"from (edge_deploy[.\w]*) import ([^\n(]+|\([^)]*\))", source):
+            for name in names.strip("()").replace("\n", " ").split(","):
+                bare = name.strip().split(" as ")[0].strip()
+                if bare:
+                    engine_imports.add(f"{module}.{bare}")
+        engine_imports.update(re.findall(r"^import (edge_deploy[.\w]*)", source, re.M))
+    # Read-only helpers only: config/profile loading, probe endpoints, and the
+    # audit outbox path. Nothing that publishes, deploys, tags, or writes.
+    assert engine_imports <= {
+        "edge_deploy.__version__",
+        "edge_deploy.audit.default_outbox",
+        "edge_deploy.config.DEFAULT_OPERATOR_CONFIG_PATH",
+        "edge_deploy.config.load_operator_config",
+        "edge_deploy.config.load_tool_profile",
+        "edge_deploy.preflight.endpoint_from_node",
+        # The CI probe and the repo-path parser are the engine's own, so the
+        # console's prediction and the engine's gate cannot answer differently.
+        "edge_deploy.repository.github_ci_conclusions_via_api",
+        "edge_deploy.repository.github_repo_path",
+    }, engine_imports
+
+
+def test_every_console_action_is_an_allowlisted_engine_or_git_command() -> None:
+    """The only mutation surface is ACTION_SPECS: each entry becomes a fixed
+    argv list, never a shell string, and never a command of the console's own
+    invention."""
+    for spec in ACTION_SPECS.values():
+        args = spec.args(_SPEC_PARAMS)
+        assert isinstance(args, list) and all(isinstance(a, str) for a in args)
+        shown = display_command(spec, args)
+        if spec.kind == "git":
+            assert shown.startswith("git ")
+            assert args[0] in {"pull", "push"}
+        else:
+            assert shown.startswith("py -m edge_deploy ")
+            assert args[0] in {
+                "verify",
+                "publish-phase",
+                "deploy",
+                "tag-bitbucket",
+                "tag-github",
+                "release",
+                "abandon",
+                "status",
+                "preflight",
+                "transport-smoke",
+                "rollback",
+                "drift",
+            }
+        assert spec.cap in CAPABILITIES
+
+
+def test_page_and_allowlist_do_not_drift_apart() -> None:
+    """The buttons are written in the page and the commands in ACTION_SPECS.
+    Nothing else stops a renamed action from shipping with a dead button, or a
+    button from POSTing an id the server refuses."""
+    posted = set(re.findall(r'action:"([a-z_]+)"', PAGE))
+    posted.update(re.findall(r'\{action:"([a-z_]+)"', PAGE))
+    assert posted, "no action payloads found in the page"
+    assert posted <= set(ACTION_SPECS), posted - set(ACTION_SPECS)
+    # Every capability an action declares must have page wording for it.
+    postures = set(re.findall(r"^\s*(\w+):\s*\"[^\"]+\",?$", PAGE.split("const REQ_POSTURE = {", 1)[1]
+                              .split("};", 1)[0], re.M))
+    assert {spec.cap for spec in ACTION_SPECS.values()} <= postures
+
+
+def test_action_capabilities_match_the_engines_phase_posture_map() -> None:
+    """A console that mislabels the posture a command needs sends the operator
+    to change the firewall for no reason, or lets them think they are ready."""
+    from edge_deploy.posture import PHASE_CAPABILITIES
+
+    cap_for = {
+        frozenset({"github-read"}): "any",
+        frozenset({"bitbucket"}): "bb",
+        frozenset({"bitbucket", "edge"}): "both",
+        frozenset({"github-write"}): "gh",
+    }
+    for phase, action in (
+        ("verify", "verify"),
+        ("publish", "publish"),
+        ("deploy", "deploy"),
+        ("tag_bitbucket", "tag_bitbucket"),
+        ("tag_github", "tag_github"),
+    ):
+        assert ACTION_SPECS[action].cap == cap_for[PHASE_CAPABILITIES[phase]], action
+    # preflight/transport-smoke are not posture-gated by the engine and only
+    # talk to the node, so they need the Edge VPN — not Bitbucket as well.
+    assert ACTION_SPECS["preflight"].cap == "edge"
+    assert ACTION_SPECS["transport_smoke"].cap == "edge"
+
+
+def test_no_action_can_switch_the_workstation_posture() -> None:
+    """ADR-0013: posture stays manual. The console may only wait for the
+    operator to confirm a switch it did not make."""
+    for spec in ACTION_SPECS.values():
+        rendered = " ".join(spec.args(_SPEC_PARAMS)).lower()
+        assert "vpn" not in rendered
+        assert "firewall" not in rendered
+        assert "netsh" not in rendered and "rasdial" not in rendered
 
 
 def test_training_rail_is_simulated_without_live_hot_or_firewall_now_cues() -> None:
@@ -992,9 +1902,9 @@ def test_posture_prober_uses_write_roots_not_ledger_roots(tmp_path, monkeypatch)
             "detail": "probe",
         }
 
-    monkeypatch.setattr("edge_console.probe_github_write", fake_probe)
-    monkeypatch.setattr("edge_console._edge_endpoints", lambda: [])
-    monkeypatch.setattr("edge_console._probe_one", lambda host, port: True)
+    monkeypatch.setattr("edge_console.probes.probe_github_write", fake_probe)
+    monkeypatch.setattr("edge_console.probes._edge_endpoints", lambda: [])
+    monkeypatch.setattr("edge_console.probes._probe_one", lambda host, port: True)
     snap = PostureProber(demo=False, roots=[real]).snapshot()
     assert probed == [str(real)]
     assert snap["groups"]["github"]["aggregate"] == "fail"
@@ -1010,7 +1920,7 @@ def test_api_training_ledger_with_real_write_roots(tmp_path, monkeypatch) -> Non
     (real / ".git").mkdir()
 
     monkeypatch.setattr(
-        "edge_console.probe_github_write",
+        "edge_console.probes.probe_github_write",
         lambda root, runner=None, timeout=20.0: {
             "tool": Path(root).name,
             "root": str(root),
@@ -1018,19 +1928,10 @@ def test_api_training_ledger_with_real_write_roots(tmp_path, monkeypatch) -> Non
             "detail": "real write fail",
         },
     )
-    monkeypatch.setattr("edge_console._edge_endpoints", lambda: [])
-    monkeypatch.setattr("edge_console._probe_one", lambda host, port: False)
+    monkeypatch.setattr("edge_console.probes._edge_endpoints", lambda: [])
+    monkeypatch.setattr("edge_console.probes._probe_one", lambda host, port: False)
 
-    edge_console_mod.ConsoleHandler.roots = [training]
-    edge_console_mod.ConsoleHandler.prober = PostureProber(demo=False, roots=[real])
-    edge_console_mod.ConsoleHandler.tools_prober = ToolsProber([training], demo=False)
-    edge_console_mod.ConsoleHandler.demo = False
-    server = edge_console_mod.ThreadingHTTPServer(
-        ("127.0.0.1", 0), edge_console_mod.ConsoleHandler
-    )
-    port = server.server_address[1]
-    thread = Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    server, port = _serve([training], write_roots=[real])
     try:
         conn = HTTPConnection("127.0.0.1", port, timeout=5)
         conn.request("GET", "/api/runs")
@@ -1055,3 +1956,646 @@ def test_module_doc_does_not_claim_zero_dependency() -> None:
     doc = (edge_console_mod.__doc__ or "").lower()
     assert "zero-dependency" not in doc
     assert "zero-external-dependency" not in doc
+
+
+# ---------------------------------------------------------------------------
+# ADR-0018: the console runs the commands it used to ask the operator to copy
+# ---------------------------------------------------------------------------
+
+
+def _checkout(tmp_path: Path, tool: str = "autobench") -> Path:
+    root = tmp_path / tool
+    (root / "edge-deploy" / "runs").mkdir(parents=True)
+    (root / ".git").mkdir()
+    return root
+
+
+def _registry(roots: list[Path], script: str | None = None) -> ActionRegistry:
+    return ActionRegistry(
+        roots=roots,
+        argv_builder=_script_runner(script) if script else None,
+    )
+
+
+def test_registry_refuses_unknown_actions_and_unwatched_roots(tmp_path) -> None:
+    root = _checkout(tmp_path)
+    registry = _registry([root])
+
+    with pytest.raises(ActionError) as unknown:
+        registry.start({"action": "rm -rf /", "root": str(root)})
+    assert unknown.value.status == 404
+
+    with pytest.raises(ActionError) as elsewhere:
+        registry.start({"action": "status", "root": str(tmp_path)})
+    assert elsewhere.value.status == 403
+
+
+def test_registry_refuses_run_ids_that_are_not_runs(tmp_path) -> None:
+    root = _checkout(tmp_path)
+    registry = _registry([root])
+
+    for bogus in ("../../etc/passwd", "run; rm -rf /", "run id", ""):
+        with pytest.raises(ActionError):
+            registry.start({"action": "verify", "root": str(root), "run_id": bogus})
+
+    # Well-formed but absent is a 404, not a command.
+    with pytest.raises(ActionError) as missing:
+        registry.start(
+            {"action": "verify", "root": str(root), "run_id": "run-20260710T000000Z-aaaaaaa"}
+        )
+    assert missing.value.status == 404
+
+
+def test_registry_refuses_production_commands_against_a_training_ledger(tmp_path) -> None:
+    """ADR-0017: training ledgers are practice-only. Refusing in the UI is not
+    enough — the server refuses too."""
+    root = _checkout(tmp_path)
+    _write_state(
+        root / "edge-deploy" / "runs" / "run-train",
+        "run-train",
+        kind="training",
+        training=True,
+        phases=_pending_phases(),
+    )
+    registry = _registry([root])
+    with pytest.raises(ActionError) as refused:
+        registry.start({"action": "verify", "root": str(root), "run_id": "run-train"})
+    assert refused.value.status == 403
+    assert "training" in str(refused.value)
+
+
+def test_only_open_runs_can_be_acted_on(tmp_path) -> None:
+    """enter_phase refuses a closed run, but abandon does not — it would mark a
+    completed release abandoned. The page never offers it; the server refuses
+    it too, so a stale tab cannot rewrite finished history."""
+    root = _checkout(tmp_path)
+    for run_id, status in (("run-done", "complete"), ("run-gone", "abandoned")):
+        _write_state(
+            root / "edge-deploy" / "runs" / run_id, run_id, status=status, phases=_pending_phases()
+        )
+    registry = _registry([root])
+    for run_id in ("run-done", "run-gone"):
+        with pytest.raises(ActionError) as closed:
+            registry.start(
+                {"action": "abandon", "root": str(root), "run_id": run_id, "reason": "why"}
+            )
+        assert closed.value.status == 409
+        assert "only open runs" in str(closed.value)
+
+
+def test_registry_validates_node_names_and_abandon_reasons(tmp_path) -> None:
+    root = _checkout(tmp_path)
+    registry = _registry([root])
+    with pytest.raises(ActionError):
+        registry.start({"action": "preflight", "root": str(root), "node": "node03; rm -rf /"})
+    _write_state(
+        root / "edge-deploy" / "runs" / "run-20260710T000000Z-aaaaaaa",
+        "run-20260710T000000Z-aaaaaaa",
+        phases=_pending_phases(),
+    )
+    with pytest.raises(ActionError):
+        registry.start(
+            {
+                "action": "abandon",
+                "root": str(root),
+                "run_id": "run-20260710T000000Z-aaaaaaa",
+                "reason": "   ",
+            }
+        )
+
+
+def test_registry_runs_one_command_per_checkout_at_a_time(tmp_path) -> None:
+    root = _checkout(tmp_path)
+    registry = _registry([root], script="import time; time.sleep(5)")
+    first = registry.start({"action": "status", "root": str(root)})
+    try:
+        with pytest.raises(ActionError) as busy:
+            registry.start({"action": "status", "root": str(root)})
+        assert busy.value.status == 409
+    finally:
+        first.cancel()
+
+
+def test_runner_streams_output_and_reports_the_exit_code(tmp_path) -> None:
+    root = _checkout(tmp_path)
+    registry = _registry([root], script="print('hello from the engine'); raise SystemExit(3)")
+    runner = registry.start({"action": "status", "root": str(root)})
+    _await(lambda: runner.snapshot()["status"] == "exited", what="the command to exit")
+    payload = runner.output(0)
+    assert "hello from the engine" in payload["text"]
+    assert "py -m edge_deploy status" in payload["text"]  # the command is shown verbatim
+    assert payload["exit_code"] == 3
+
+
+def test_runner_surfaces_the_rsa_prompt_and_never_records_the_passcode(tmp_path) -> None:
+    """The engine's RSA prompt (edge_deploy.auth) is written without a newline;
+    the console must notice it, relay the answer to stdin, and keep the code out
+    of the transcript."""
+    root = _checkout(tmp_path)
+    script = (
+        "import sys\n"
+        "sys.stdout.write('[node05] Enter RSA PASSCODE: '); sys.stdout.flush()\n"
+        "code = sys.stdin.readline().strip()\n"
+        "print('authenticated' if code == '8675309' else 'rejected')\n"
+    )
+    registry = _registry([root], script=script)
+    runner = registry.start({"action": "status", "root": str(root)})
+
+    prompt = _await(lambda: runner.snapshot()["prompt"], what="the RSA prompt")
+    assert prompt["kind"] == "secret"
+    assert prompt["name"] == "rsa"
+    assert "node05" in prompt["title"]
+
+    runner.answer(prompt["id"], "8675309")
+    _await(lambda: runner.snapshot()["status"] == "exited", what="the command to exit")
+    transcript = runner.output(0)["text"]
+    assert "authenticated" in transcript
+    assert "8675309" not in transcript
+    assert "********" in transcript
+
+
+def test_runner_surfaces_the_guided_posture_boundary_as_an_acknowledgement(tmp_path) -> None:
+    """Posture switching stays manual: the console shows the boundary and only
+    forwards the operator's confirmation."""
+    root = _checkout(tmp_path)
+    script = (
+        "input('Switch firewall posture to [firewall-off], then press Enter to continue...')\n"
+        "print('posture confirmed')\n"
+    )
+    registry = _registry([root], script=script)
+    runner = registry.start({"action": "status", "root": str(root)})
+
+    prompt = _await(lambda: runner.snapshot()["prompt"], what="the posture prompt")
+    assert prompt["kind"] == "ack"
+    assert prompt["name"] == "posture"
+    assert "firewall-off" in prompt["title"]
+
+    runner.answer(prompt["id"], "")
+    _await(lambda: runner.snapshot()["status"] == "exited", what="the command to exit")
+    assert "posture confirmed" in runner.output(0)["text"]
+
+
+def test_runner_offers_an_answer_box_for_a_prompt_it_does_not_recognise(tmp_path) -> None:
+    """An unrecognised question must never silently hang the run."""
+    root = _checkout(tmp_path)
+    script = "import sys; sys.stdout.write('Which node should I skip? '); sys.stdout.flush(); sys.stdin.readline()"
+    registry = _registry([root], script=script)
+    runner = registry.start({"action": "status", "root": str(root)})
+
+    def poll():
+        runner.tick()
+        return runner.snapshot()["prompt"]
+
+    prompt = _await(poll, timeout=25.0, what="the generic prompt")
+    assert prompt["kind"] == "text"
+    assert prompt["name"] == "unknown"
+    assert "Which node should I skip?" in prompt["title"]
+    runner.answer(prompt["id"], "node04")
+    _await(lambda: runner.snapshot()["status"] == "exited", what="the command to exit")
+
+
+def test_an_empty_secret_is_not_transcribed_as_a_passcode(tmp_path) -> None:
+    """The engine reads an empty answer as "no code given". The transcript must
+    not show asterisks as though one was typed, and the page keeps Send off
+    until the field has something in it."""
+    root = _checkout(tmp_path)
+    script = (
+        "import sys\n"
+        "sys.stdout.write('[node03] Enter RSA PASSCODE: '); sys.stdout.flush()\n"
+        "print('got: ' + repr(sys.stdin.readline()))\n"
+    )
+    registry = _registry([root], script=script)
+    runner = registry.start({"action": "status", "root": str(root)})
+    prompt = _await(lambda: runner.snapshot()["prompt"], what="the RSA prompt")
+    runner.answer(prompt["id"], "")
+    _await(lambda: runner.snapshot()["status"] == "exited", what="the command to exit")
+    assert "********" not in runner.output(0)["text"]
+
+    assert 'data-answer="secret" disabled' in PAGE
+    assert 'data-answer="text" disabled' in PAGE
+
+
+def test_page_keeps_a_half_typed_answer_focused_across_re_renders() -> None:
+    """The stage re-renders whenever release-progress.json moves, which is
+    exactly while a passcode is being typed. Re-parenting the terminal must not
+    silently drop the caret out of the field."""
+    body = PAGE.split("function placeTerminals(){", 1)[1].split("\n}\n", 1)[0]
+    assert "document.activeElement" in body
+    assert "selectionStart" in body
+    assert "setSelectionRange" in body
+    assert "scrollTop" in body
+
+
+def test_a_pending_prompt_does_not_satisfy_every_long_poll(tmp_path) -> None:
+    """Regression: the poll used to return instantly for as long as a prompt
+    was open, so the page spun through the whole time the operator spent
+    finding their RSA token. A prompt the caller has already seen must not wake
+    the poll; one it has not seen still must."""
+    root = _checkout(tmp_path)
+    script = (
+        "import sys\n"
+        "sys.stdout.write('[node05] Enter RSA PASSCODE: '); sys.stdout.flush()\n"
+        "sys.stdin.readline()\n"
+    )
+    registry = _registry([root], script=script)
+    runner = registry.start({"action": "status", "root": str(root)})
+    prompt = _await(lambda: runner.snapshot()["prompt"], what="the RSA prompt")
+    cursor = runner.output(0)["cursor"]
+
+    unseen = time.monotonic()
+    runner.output(cursor, wait=5.0)
+    assert time.monotonic() - unseen < 1.0, "an unseen prompt must return at once"
+
+    seen = time.monotonic()
+    runner.output(cursor, wait=1.0, seen_prompt=prompt["id"])
+    assert time.monotonic() - seen >= 0.9, "a seen prompt must not wake the poll"
+    runner.cancel()
+
+
+def test_an_unrecognised_prompts_answer_is_masked_like_a_secret(tmp_path) -> None:
+    """The generic answer box exists because the console cannot know every
+    prompt — which means it cannot know the answer is not a password."""
+    root = _checkout(tmp_path)
+    script = "import sys; sys.stdout.write('vault passphrase: '); sys.stdout.flush(); sys.stdin.readline()"
+    registry = _registry([root], script=script)
+    runner = registry.start({"action": "status", "root": str(root)})
+
+    def poll():
+        runner.tick()
+        return runner.snapshot()["prompt"]
+
+    prompt = _await(poll, timeout=25.0, what="the generic prompt")
+    assert prompt["kind"] == "text"
+    runner.answer(prompt["id"], "correct-horse-battery")
+    _await(lambda: runner.snapshot()["status"] == "exited", what="the command to exit")
+    assert "correct-horse-battery" not in runner.output(0)["text"]
+
+
+def test_short_secrets_are_masked_too(tmp_path) -> None:
+    root = _checkout(tmp_path)
+    script = (
+        "import sys\n"
+        "sys.stdout.write('[node03] Enter RSA PASSCODE: '); sys.stdout.flush()\n"
+        "code = sys.stdin.readline().strip()\n"
+        "print('sshd echoed ' + code)\n"
+    )
+    registry = _registry([root], script=script)
+    runner = registry.start({"action": "status", "root": str(root)})
+    prompt = _await(lambda: runner.snapshot()["prompt"], what="the RSA prompt")
+    runner.answer(prompt["id"], "42")
+    _await(lambda: runner.snapshot()["status"] == "exited", what="the command to exit")
+    transcript = runner.output(0)["text"]
+    assert "sshd echoed ********" in transcript
+    assert "sshd echoed 42" not in transcript
+
+
+def test_an_answer_cannot_smuggle_extra_stdin_lines(tmp_path) -> None:
+    """One answer is one line: a newline would pre-answer the next question."""
+    root = _checkout(tmp_path)
+    script = "import sys; sys.stdout.write('[node03] Enter RSA PASSCODE: '); sys.stdout.flush(); sys.stdin.readline()"
+    registry = _registry([root], script=script)
+    runner = registry.start({"action": "status", "root": str(root)})
+    prompt = _await(lambda: runner.snapshot()["prompt"], what="the RSA prompt")
+    with pytest.raises(ActionError):
+        runner.answer(prompt["id"], "1234\ny")
+    runner.cancel()
+
+
+def test_kerberos_and_yes_no_prompts_are_recognised(tmp_path) -> None:
+    root = _checkout(tmp_path)
+    for script, kind, name in (
+        (
+            "import sys; sys.stdout.write('[node03] Kerberos password: '); "
+            "sys.stdout.flush(); sys.stdin.readline()",
+            "secret",
+            "kerberos",
+        ),
+        (
+            "import sys; sys.stdout.write('Discard onboarding evidence only? [y/N] '); "
+            "sys.stdout.flush(); sys.stdin.readline()",
+            "choice",
+            "confirm",
+        ),
+    ):
+        registry = _registry([root], script=script)
+        runner = registry.start({"action": "status", "root": str(root)})
+        prompt = _await(lambda: runner.snapshot()["prompt"], what=f"the {name} prompt")
+        assert (prompt["kind"], prompt["name"]) == (kind, name)
+        runner.answer(prompt["id"], "y" if kind == "choice" else "secret")
+        _await(lambda: runner.snapshot()["status"] == "exited", what="the command to exit")
+
+
+def test_a_second_command_is_refused_while_the_first_is_still_spawning(tmp_path) -> None:
+    """The runner is registered before Popen returns; that window must still
+    count as busy or the one-command-per-checkout rule has a hole in it."""
+    root = _checkout(tmp_path)
+    registry = _registry([root], script="import time; time.sleep(5)")
+    first = registry.start({"action": "status", "root": str(root)})
+    try:
+        first.status = "starting"  # re-enter the spawn window deterministically
+        with pytest.raises(ActionError) as busy:
+            registry.start({"action": "status", "root": str(root)})
+        assert busy.value.status == 409
+    finally:
+        first.status = "running"
+        first.cancel()
+
+
+def test_cancel_before_the_process_exists_is_not_lost(tmp_path) -> None:
+    """Stop is clickable as soon as the action is listed, which is before Popen
+    has returned. Dropping that cancel would leave the operator believing they
+    stopped a command that is in fact still running."""
+    root = _checkout(tmp_path)
+    runner = ActionRunner(
+        action_id="cancel-window",
+        spec=ACTION_SPECS["status"],
+        argv=[sys.executable, "-u", "-c", "import time; time.sleep(30)"],
+        cwd=root,
+        command="py -m edge_deploy status",
+        root=str(root),
+        run_id=None,
+        tool=None,
+    )
+    runner.cancel()
+    runner.start()
+    _await(lambda: runner.snapshot()["status"] == "exited", what="the command to stop")
+    assert "cancelled by operator" in runner.output(0)["text"]
+
+
+def test_answering_a_stale_prompt_is_refused(tmp_path) -> None:
+    root = _checkout(tmp_path)
+    registry = _registry([root], script="print('done')")
+    runner = registry.start({"action": "status", "root": str(root)})
+    _await(lambda: runner.snapshot()["status"] == "exited", what="the command to exit")
+    with pytest.raises(ActionError) as stale:
+        runner.answer("nope-p1", "value")
+    assert stale.value.status == 409
+
+
+def test_output_long_poll_returns_new_text_from_a_cursor(tmp_path) -> None:
+    root = _checkout(tmp_path)
+    registry = _registry(
+        [root], script="import time; print('first'); time.sleep(0.4); print('second')"
+    )
+    runner = registry.start({"action": "status", "root": str(root)})
+    first = runner.output(0, wait=5.0)
+    assert first["text"]
+    second = runner.output(first["cursor"], wait=5.0)
+    assert second["text"] not in ("", first["text"])
+    assert second["cursor"] >= first["cursor"]
+
+
+# ---------------------------------------------------------------------------
+# HTTP: only this page, and only when it is allowed to act
+# ---------------------------------------------------------------------------
+
+
+def test_actions_require_the_page_token(tmp_path) -> None:
+    root = _checkout(tmp_path)
+    server, port = _serve([root], registry=_registry([root], script="print('ok')"))
+    try:
+        status, body = _request(port, "POST", "/api/actions", {"action": "status", "root": str(root)})
+        assert status == 403
+        assert "token" in body["error"]
+
+        status, _ = _request(
+            port,
+            "POST",
+            "/api/actions",
+            {"action": "status", "root": str(root)},
+            **{"X-Edge-Console-Token": "test-token"},
+        )
+        assert status == 202
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_read_only_console_refuses_every_action(tmp_path) -> None:
+    root = _checkout(tmp_path)
+    server, port = _serve([root], read_only=True)
+    try:
+        status, payload = _request(port, "GET", "/api/runs")
+        assert payload["read_only"] is True
+        status, body = _request(
+            port,
+            "POST",
+            "/api/actions",
+            {"action": "status", "root": str(root)},
+            **{"X-Edge-Console-Token": "test-token"},
+        )
+        assert status == 403
+        assert "read-only" in body["error"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_answer_and_cancel_also_require_the_page_token(tmp_path) -> None:
+    root = _checkout(tmp_path)
+    server, port = _serve([root], registry=_registry([root], script="import time; time.sleep(5)"))
+    auth = {"X-Edge-Console-Token": "test-token"}
+    try:
+        _, started = _request(
+            port, "POST", "/api/actions", {"action": "status", "root": str(root)}, **auth
+        )
+        for path, body in (
+            (f"/api/actions/{started['id']}/answer", {"prompt_id": "x", "value": "y"}),
+            (f"/api/actions/{started['id']}/cancel", {}),
+        ):
+            status, payload = _request(port, "POST", path, body)
+            assert status == 403, path
+            assert "token" in payload["error"]
+        status, _ = _request(port, "POST", f"/api/actions/{started['id']}/cancel", {}, **auth)
+        assert status == 200
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_non_loopback_host_is_refused(tmp_path) -> None:
+    """The DNS-rebinding guard: a valid token from a foreign origin is not
+    enough — and it covers the reads (the page token, the ledgers, the
+    transcripts), not just the writes."""
+    root = _checkout(tmp_path)
+    server, port = _serve([root], registry=_registry([root], script="print('ok')"))
+    foreign = {"Host": "attacker.example.com"}
+    try:
+        status, payload = _request(
+            port,
+            "POST",
+            "/api/actions",
+            {"action": "status", "root": str(root)},
+            **{"X-Edge-Console-Token": "test-token", **foreign},
+        )
+        assert status == 403
+        assert "Host" in payload["error"]
+
+        # Reads must be refused too: a rebinded page could otherwise scrape the
+        # token off `/` and the run ledgers off `/api/runs`.
+        for path in ("/", "/api/runs", "/api/tools", "/api/posture", "/api/actions"):
+            status, _ = _request(port, "GET", path, **foreign)
+            assert status == 403, path
+        # A loopback Host still works.
+        status, _ = _request(port, "GET", "/api/runs", **{"Host": "127.0.0.1"})
+        assert status == 200
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_a_rejected_post_does_not_desync_the_connection(tmp_path) -> None:
+    """Regression: an unread request body was parsed as the next request line,
+    so the poll right after a stale-token click got a nonsense response."""
+    root = _checkout(tmp_path)
+    server, port = _serve([root], registry=_registry([root], script="print('ok')"))
+    try:
+        conn = HTTPConnection("127.0.0.1", port, timeout=10)
+        body = json.dumps({"action": "status", "root": str(root)}).encode()
+        conn.request("POST", "/api/actions", body=body, headers={"Content-Type": "application/json"})
+        rejected = conn.getresponse()
+        assert rejected.status == 403
+        rejected.read()
+        conn.request("GET", "/api/runs")
+        response = conn.getresponse()
+        assert response.status == 200, "the next request on the same connection must be understood"
+        assert json.loads(response.read().decode())["runs"] == []
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_oversized_action_bodies_are_refused(tmp_path) -> None:
+    root = _checkout(tmp_path)
+    server, port = _serve([root], registry=_registry([root], script="print('ok')"))
+    try:
+        status, payload = _request(
+            port,
+            "POST",
+            "/api/actions",
+            {"action": "status", "root": str(root), "reason": "x" * 70_000},
+            **{"X-Edge-Console-Token": "test-token"},
+        )
+        assert status == 413
+        assert "too large" in payload["error"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_release_commands_are_refused_outside_a_git_checkout(tmp_path) -> None:
+    """Training workspaces are deliberately not git checkouts (ADR-0017)."""
+    training = tmp_path / "training" / "autobench"
+    (training / "edge-deploy" / "runs").mkdir(parents=True)
+    server, port = _serve([training], registry=_registry([training], script="print('ok')"))
+    try:
+        status, body = _request(
+            port,
+            "POST",
+            "/api/actions",
+            {"action": "release", "root": str(training)},
+            **{"X-Edge-Console-Token": "test-token"},
+        )
+        assert status == 403
+        assert "git checkout" in body["error"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_http_action_round_trip_streams_output_and_relays_a_secret(tmp_path) -> None:
+    root = _checkout(tmp_path)
+    script = (
+        "import sys\n"
+        "sys.stdout.write('[node03] Enter RSA PASSCODE: '); sys.stdout.flush()\n"
+        "sys.stdin.readline()\n"
+        "print('rolled out')\n"
+    )
+    server, port = _serve([root], registry=_registry([root], script=script))
+    auth = {"X-Edge-Console-Token": "test-token"}
+    try:
+        status, started = _request(
+            port, "POST", "/api/actions", {"action": "status", "root": str(root)}, **auth
+        )
+        assert status == 202
+        action_id = started["id"]
+
+        def prompted():
+            _, payload = _request(port, "GET", f"/api/actions/{action_id}/output?cursor=0&wait=5")
+            return payload if payload.get("prompt") else None
+
+        payload = _await(prompted, what="the prompt over HTTP")
+        assert payload["prompt"]["kind"] == "secret"
+        assert "[node03] Enter RSA PASSCODE:" in payload["text"]
+
+        status, _ = _request(
+            port,
+            "POST",
+            f"/api/actions/{action_id}/answer",
+            {"prompt_id": payload["prompt"]["id"], "value": "424242"},
+            **auth,
+        )
+        assert status == 200
+
+        def finished():
+            _, done = _request(port, "GET", f"/api/actions/{action_id}/output?cursor=0&wait=5")
+            return done if done["status"] == "exited" else None
+
+        done = _await(finished, what="the command to exit")
+        assert "rolled out" in done["text"]
+        assert "424242" not in done["text"]
+
+        _, listing = _request(port, "GET", "/api/actions")
+        assert [a["id"] for a in listing["actions"]] == [action_id]
+        assert {entry["id"] for entry in listing["catalog"]} == set(ACTION_SPECS)
+
+        # A reload re-reads the whole transcript from cursor 0 without waiting,
+        # which is how a second tab (or a refreshed one) catches up.
+        _, replayed = _request(port, "GET", f"/api/actions/{action_id}/output?cursor=0&wait=0")
+        assert replayed["text"] == done["text"]
+        assert "pump(a.id, false)" in PAGE  # the page takes that path when not following
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# The offline simulator behind --demo
+# ---------------------------------------------------------------------------
+
+
+def test_demo_simulator_completes_a_guided_release_through_both_operator_gates() -> None:
+    """--demo must exercise the same shapes the real engine produces: an RSA
+    prompt per node, the guided firewall-off boundary, and a completed ledger."""
+    autobench, _robocop = build_demo_checkouts()
+    run_id = "run-20260707T131512Z-9c4f2ae"
+    completed = subprocess.run(
+        [sys.executable, "-u", str(DEMO_ENGINE_PATH), "engine", "release", "--guided", "--run", run_id],
+        cwd=str(autobench),
+        input="1234567\n7654321\n\n",
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, "EDGE_CONSOLE_DEMO_SPEED": "0", "PYTHONUNBUFFERED": "1"},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.count("Enter RSA PASSCODE: ") == 2
+    assert "Switch firewall posture to [firewall-off]" in completed.stdout
+    assert f"release complete: {run_id}" in completed.stdout
+
+    state = json.loads(
+        (autobench / "edge-deploy" / "runs" / run_id / "state.json").read_text(encoding="utf-8")
+    )
+    assert state["status"] == "complete"
+    assert all(node["state"] == "passed" for node in state["phases"]["deploy"].values())
+    assert state["phases"]["tag_github"]["state"] == "passed"
+    assert not (autobench / "edge-deploy" / "runs" / run_id / "run.lock").exists()
+
+
+def test_demo_simulator_never_touches_the_real_engine() -> None:
+    """The simulator runs from inside a fabricated checkout, so it must import
+    neither the engine nor the console — exactly like the real engine, which
+    the console also invokes by path."""
+    source = DEMO_ENGINE_PATH.read_text(encoding="utf-8")
+    imports = re.findall(r"^\s*(?:from|import)\s+([.\w]+)", source, re.M)
+    assert not [name for name in imports if name.split(".")[0] in {"edge_deploy", "edge_console"}]

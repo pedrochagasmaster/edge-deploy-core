@@ -1068,6 +1068,8 @@ def test_console_launch_uses_popen_seam_nonblocking(tmp_path: Path, monkeypatch)
     cmd, kwargs = calls[0]
     assert any("edge_console" in str(c) for c in cmd)
     assert "--no-browser" in cmd
+    # ADR-0017: onboarding shows training ledgers only — no command buttons.
+    assert "--read-only" in cmd
     assert "--root" in cmd
     assert str(roots[0]) in cmd
     assert "--github-write-root" in cmd
