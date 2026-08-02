@@ -998,6 +998,15 @@ def main(argv: list[str] | None = None) -> int:
     except FileNotFoundError:
         print(f"Operator config not found: {args.config}", file=sys.stderr)
         return 2
+    except (OSError, ValueError) as exc:
+        # A malformed config is an operator-fixable mistake; say which file and
+        # what is wrong with it rather than raising a parser traceback.
+        print(
+            f"Operator config could not be read ({args.config}): "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return 2
 
     try:
         if args.command == "release":
@@ -1031,6 +1040,9 @@ def main(argv: list[str] | None = None) -> int:
         PostureError,
         KeyError,
         ValueError,
+        # A missing tool profile or an unreadable artifact is a setup problem,
+        # and the operator is better served by one line than a traceback.
+        OSError,
         subprocess.CalledProcessError,
     ) as exc:
         print(f"{args.command} failed: {type(exc).__name__}: {exc}", file=sys.stderr)

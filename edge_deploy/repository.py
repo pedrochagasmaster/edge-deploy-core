@@ -47,7 +47,12 @@ def _normalize_url(value: str) -> str:
 
 def _runner(root: Path) -> CommandRunner:
     def run(args: Sequence[str]) -> str:
-        completed = subprocess.run(args, cwd=root, capture_output=True, text=True)
+        try:
+            completed = subprocess.run(args, cwd=root, capture_output=True, text=True)
+        except OSError as exc:
+            # A missing `gh` or `git` is a setup problem with a clear remedy,
+            # not a traceback for the operator to decode mid-release.
+            raise RepositoryError(f"{args[0]} could not be run: {exc}") from exc
         if completed.returncode:
             detail = completed.stderr.strip() or completed.stdout.strip()
             raise RepositoryError(f"{args[0]} failed: {detail}")
