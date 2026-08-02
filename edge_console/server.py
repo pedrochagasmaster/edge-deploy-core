@@ -109,7 +109,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
     def _authorize(self) -> None:
         """Loopback host plus the page token: no other origin can act."""
         self._require_loopback_host()
-        if self.headers.get("X-Edge-Console-Token") != self.token:
+        if not secrets.compare_digest(self.headers.get("X-Edge-Console-Token") or "", self.token):
             raise ActionError("missing or stale console token; reload the page", status=403)
 
     # -- reads -------------------------------------------------------------
