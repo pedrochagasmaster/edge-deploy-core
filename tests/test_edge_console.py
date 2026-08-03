@@ -1911,6 +1911,22 @@ def test_a_guided_release_from_the_decision_card_matches_by_checkout_root() -> N
     assert 'class="station next"' in other
 
 
+def test_a_run_id_match_never_cues_another_checkouts_run() -> None:
+    """Run ids are unique only inside their own ledger: two watched checkouts
+    (a training and a real one, say) can mint the same id in the same second,
+    so a matching run_id from a different root must light nothing here."""
+    run = _sample_run(kind="release", training=None, status="open", run_id="run-20260724T000000Z-xroot01")
+    elsewhere = _render_run_html(
+        run,
+        actions=[_console_action("verify", run["state"]["run_id"], root="/tmp/other/autobench")],
+    )
+    assert 'class="station live"' not in elsewhere
+    assert 'class="station next"' in elsewhere
+    # Same action from the run's own checkout still lights its station.
+    here = _render_run_html(run, actions=[_console_action("verify", run["state"]["run_id"])])
+    assert _live_station_phase(here) == "verify"
+
+
 def test_engine_progress_stays_authoritative_over_console_actions() -> None:
     """When release-progress.json does speak, it wins over the action list."""
     run = _sample_run(

@@ -1001,7 +1001,11 @@ function livePhase(run){
 // still claims the phase is only "◀ next" — and the card even blames the
 // console's own lock. run_id matches first; a guided release started from a
 // decision card has no run_id yet, so it falls back to the checkout root and
-// lights the phase the run is about to execute.
+// lights the phase the run is about to execute. The root is checked either
+// way: a run id is unique only inside its own ledger (ledger.py dedups per
+// runs_root, and training's fabricated sha makes the same id in the same
+// second across two watched checkouts likely), so it must never cue a card
+// from another checkout.
 const ACTION_STATION = {
   verify: "verify", publish: "publish", deploy: "deploy",
   tag_bitbucket: "tag_bitbucket", tag_github: "tag_github",
@@ -1010,7 +1014,7 @@ function actionLivePhase(run){
   if(run.state.status !== "open" || isTrainingRun(run.state)) return null;
   for(const a of actionsById.values()){
     if(a.status !== "running" && a.status !== "starting") continue;
-    if(a.run_id ? a.run_id !== run.state.run_id
+    if(a.run_id ? (a.run_id !== run.state.run_id || a.root !== run.root)
                 : (a.action !== "release" || a.root !== run.root)) continue;
     if(a.action === "release") return nextPhase(run);
     // rollback deploys a brand-new run, and abandon/status touch no phase.
@@ -1668,11 +1672,12 @@ const notifiedActionIds = new Set();
 const runningActionIds = new Set();
 
 function fireNotification(title, body, tag, requireInteraction){
-  if(!notifyEnabled() || document.hasFocus()) return;
+  if(!notifyEnabled() || document.hasFocus()) return false;
   try{
     const n = new Notification(title, {body, tag, requireInteraction});
     n.onclick = () => { window.focus(); n.close(); };
-  }catch(_e){ /* permission revoked mid-session, or no notification service */ }
+    return true;
+  }catch(_e){ return false; }  // permission revoked mid-session, or no notification service
 }
 
 // Called from renderTerm — the one place every action snapshot flows through —
@@ -1693,17 +1698,21 @@ function maybeNotify(a, t){
   }
   const p = activePrompt(a, t);
   if(!p || notifiedPromptIds.has(p.id)) return;
-  notifiedPromptIds.add(p.id);
   // The prompt's raw bytes are deliberately excluded: they are the engine's
   // own output, and what a notification service may persist is not the page's
   // call to make. The operator's answer never touches this path at all.
-  fireNotification(
+  if(fireNotification(
     `engine is waiting — ${p.title}`,
     [a.label || a.action, a.run_id, p.detail].filter(Boolean).join(" · "),
     `edge-console-prompt-${p.id}`,
     // Secrets and posture acks block a release, so they stay on screen until
     // dismissed; a passing question or failure clears on its own.
-    p.kind === "secret" || p.kind === "ack");
+    p.kind === "secret" || p.kind === "ack"))
+    // Mark the prompt only when its notification actually went out. One that
+    // arrived while the page was focused (or before opt-in) is still owed:
+    // the operator may look away while the engine keeps waiting, and that
+    // unfocused case is the whole reason notifications exist.
+    notifiedPromptIds.add(p.id);
 }
 
 /* ---------- talking to the console ---------- */
@@ -1951,11 +1960,18 @@ function withStageTransition(fn){
     && !window.matchMedia("(prefers-reduced-motion: reduce)").matches
     && typeof document.startViewTransition === "function";
   if(!animate){ fn(); lastLayoutSig = sig; return; }
+  // The update callback is a later task, not synchronous: record the layout
+  // now, or a synchronous render landing in between gets its signature
+  // regressed when the deferred callback finally runs.
+  lastLayoutSig = sig;
   stageTransitionRunning = true;
   // A skipped transition rejects .finished — clear the flag either way, so a
-  // dropped animation never disables every later one.
+  // dropped animation never disables every later one. .ready rejects on the
+  // same skips; swallow it so the console stays quiet.
   const clear = () => { stageTransitionRunning = false; };
-  document.startViewTransition(() => { fn(); lastLayoutSig = sig; }).finished.then(clear, clear);
+  const transition = document.startViewTransition(fn);
+  transition.ready.catch(() => {});
+  transition.finished.then(clear, clear);
 }
 
 /* ---------- polling ---------- */
@@ -2052,18 +2068,20 @@ async function pollActions(){
 document.addEventListener("click", async ev => {
   const notifyBtn = ev.target.closest("#notify-toggle");
   if(notifyBtn){
+    // notifyEnabled() re-reads storage on every call, so with storage disabled
+    // the choice cannot stick and the toggle stays off — fail closed, quietly.
     if(notifyEnabled()){
-      try{ localStorage.setItem(NOTIFY_STORAGE_KEY, "off"); }catch(_e){ /* off for this session then */ }
+      try{ localStorage.setItem(NOTIFY_STORAGE_KEY, "off"); }catch(_e){ /* storage disabled */ }
       renderNotifyToggle();
     }else if(Notification.permission === "granted"){
-      try{ localStorage.setItem(NOTIFY_STORAGE_KEY, "on"); }catch(_e){ /* on for this session then */ }
+      try{ localStorage.setItem(NOTIFY_STORAGE_KEY, "on"); }catch(_e){ /* storage disabled */ }
       renderNotifyToggle();
     }else if(Notification.permission === "default"){
       // Browsers grant notification permission only from a user gesture, so
       // this click is the one place the page ever asks.
       Notification.requestPermission().then(perm => {
         if(perm === "granted"){
-          try{ localStorage.setItem(NOTIFY_STORAGE_KEY, "on"); }catch(_e){ /* on for this session then */ }
+          try{ localStorage.setItem(NOTIFY_STORAGE_KEY, "on"); }catch(_e){ /* storage disabled */ }
         }
         renderNotifyToggle();
       });
