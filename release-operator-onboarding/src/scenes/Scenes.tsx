@@ -193,7 +193,7 @@ export const BootstrapScene: React.FC = () => (
       delay={16}
       lines={[
         "git clone …/edge-deploy-core.git && cd edge-deploy-core",
-        "git checkout v1.5.4",
+        "git checkout v1.6.0",
         'py -m pip install -e ".[dev]"',
       ]}
     />

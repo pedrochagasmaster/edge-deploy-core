@@ -15,7 +15,7 @@ entire onboard flow — do not switch to `firewall-off` for routine onboarding.
 ```powershell
 git clone https://github.com/pedrochagasmaster/edge-deploy-core.git
 cd edge-deploy-core
-git checkout v1.5.4
+git checkout v1.6.0
 uv sync --extra dev
 ```
 

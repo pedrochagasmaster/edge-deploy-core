@@ -162,14 +162,14 @@ def test_refuse_unexpected_existing_directory(tmp_path: Path) -> None:
 def test_engine_pin_mismatch_fails_before_install(tmp_path: Path) -> None:
     a = tmp_path / "autobench"
     b = tmp_path / "robocop"
-    for root, tag in ((a, "v1.5.4"), (b, "v1.4.0")):
+    for root, tag in ((a, "v1.6.0"), (b, "v1.4.0")):
         root.mkdir()
         (root / "pyproject.toml").write_text(
             f'dependencies = ["edge-deploy-core @ git+https://example/@{tag}"]\n',
             encoding="utf-8",
         )
     with pytest.raises(RuntimeError, match="engine pin"):
-        assert_engine_pins_compatible([a, b], expected_tag="v1.5.4")
+        assert_engine_pins_compatible([a, b], expected_tag="v1.6.0")
 
 
 def test_pin_mismatch_causes_zero_install_calls(tmp_path: Path) -> None:
