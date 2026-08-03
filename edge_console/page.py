@@ -284,14 +284,17 @@ button.copy:focus-visible{outline:2px solid var(--gh);outline-offset:2px}
 .checklist .ctext{grid-column:2;grid-row:1}
 /* Button, command and badge in three columns shared by every action row: a
    fixed button column sized for the longest labels, a command column that
-   scrolls sideways instead of wrapping, and a right-aligned badge column. */
-.checkact{grid-column:2;display:grid;grid-template-columns:12rem minmax(0,1fr) auto;align-items:center;gap:6px 10px;margin-top:6px}
-.checkact button.run{justify-self:start}
-.checkact code{font-family:var(--mono);font-size:10.5px;color:var(--faint);background:var(--sunk);border:1px solid var(--line-soft);border-radius:var(--r-sm);padding:4px 9px;overflow-x:auto;white-space:nowrap;min-width:0;scrollbar-width:thin}
-.checkact .need{justify-self:end}
-.checkact .blocked-why{justify-self:end;font-size:10px;color:var(--fail);max-width:26ch;text-align:right;line-height:1.4}
-/* The optional readiness marker tucks under the badge, same right edge. */
-.checkact .readiness{grid-column:3;justify-self:end}
+   scrolls sideways instead of wrapping, and a right-aligned badge column.
+   All three share one height so their tops, middles and bottoms line up —
+   mixed padding previously left the taller button sitting above the snippet. */
+.checkact{--checkact-h:32px;grid-column:2;display:grid;grid-template-columns:12rem minmax(0,1fr) auto;align-items:center;column-gap:10px;row-gap:4px;margin-top:6px}
+.checkact button.run{justify-self:start;align-self:center;margin:0;height:var(--checkact-h);padding:0 14px;display:inline-flex;align-items:center;box-sizing:border-box}
+.checkact code{font-family:var(--mono);font-size:10.5px;color:var(--faint);background:var(--sunk);border:1px solid var(--line-soft);border-radius:var(--r-sm);height:var(--checkact-h);padding:0 9px;display:flex;align-items:center;overflow-x:auto;white-space:nowrap;min-width:0;box-sizing:border-box;scrollbar-width:thin}
+.checkact .need{justify-self:end;align-self:center;margin:0;height:var(--checkact-h);padding:0 8px;display:inline-flex;align-items:center;box-sizing:border-box}
+.checkact .blocked-why{justify-self:end;align-self:center;font-size:10px;color:var(--fail);max-width:26ch;text-align:right;line-height:1.4}
+/* Readiness sits on a second row under the badge so it cannot stretch the
+   action row and re-center the button against a taller column. */
+.checkact .readiness{grid-column:3;grid-row:2;justify-self:end}
 .cta{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:15px 18px 17px 47px;border-top:1px solid var(--line-soft);background:linear-gradient(180deg,rgba(131,228,170,.04),transparent)}
 .cta .actcmd{margin-top:0;flex:0 1 auto}
 .ctawhy{font-size:11.5px;color:var(--faint);flex:1 1 200px;line-height:1.5}
