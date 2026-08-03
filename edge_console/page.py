@@ -1438,7 +1438,7 @@ function promptHtml(a, t){
     return `<div class="prompt secret" role="alert" data-prompt="${esc(p.id)}" data-action="${esc(a.id)}">
       ${head}
       <div class="pform">
-        <input type="password" class="secretbox" autocomplete="off" autocapitalize="off"
+        <input type="password" class="secretbox" name="one-time-code" autocomplete="one-time-code" autocapitalize="off"
           spellcheck="false" aria-label="${esc(p.title)}" placeholder="passcode">
         <button class="run primary" data-answer="secret" disabled>Send to the engine</button>
       </div>
