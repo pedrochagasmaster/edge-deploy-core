@@ -268,21 +268,31 @@ button.copy:focus-visible{outline:2px solid var(--gh);outline-offset:2px}
 .ev span.warn{color:var(--warn)}
 .ev span.ok{color:var(--pass)}
 .checklist{list-style:none;margin:0;padding:12px 18px 6px}
-.checklist li{display:flex;gap:11px;align-items:center;flex-wrap:wrap;padding:6px 0;font-size:12.5px;color:var(--dim);line-height:1.5}
-.checklist li::before{content:"○";color:var(--faint);flex:none;width:18px;height:18px;font-size:11px;line-height:16px;text-align:center;border:1px solid var(--line);border-radius:50%;background:var(--sunk)}
+/* Two-line stack per item: icon + text on line one, the action group on line
+   two. Wrapping flex let each row's actions land wherever the text ended, so
+   buttons and commands never lined up from row to row. */
+.checklist li{display:grid;grid-template-columns:18px minmax(0,1fr);column-gap:11px;align-items:start;padding:7px 0;font-size:12.5px;color:var(--dim);line-height:1.5}
+.checklist li::before{content:"○";grid-column:1;grid-row:1;color:var(--faint);width:18px;height:18px;font-size:11px;line-height:16px;text-align:center;border:1px solid var(--line);border-radius:50%;background:var(--sunk)}
 .checklist li.ok::before{content:"✓";color:var(--pass);border-color:rgba(127,214,156,.5);background:var(--pass-tint)}
 .checklist li.blocked::before{content:"!";color:var(--fail);font-weight:700;border-color:rgba(232,115,106,.5);background:var(--fail-tint)}
 .checklist li.manual::before{content:"◈";color:var(--warn);border-color:rgba(221,173,97,.5);background:var(--warn-tint)}
 .checklist li b{color:var(--ink);font-weight:600}
-.checklist li .grow{flex:1 1 40px}
-/* One flex item for the whole sentence: otherwise each run of text between
+/* The grid owns the columns now, so the old flex spacer must not lay out. */
+.checklist li .grow{display:none}
+/* One grid item for the whole sentence: otherwise each run of text between
    <b> tags becomes its own item and the row breaks in odd places. */
-.checklist .ctext{flex:1 1 280px}
-/* Button, command and posture belong together: let the group wrap as a unit
-   rather than stranding a lone readiness marker on the next line. */
-.checkact{display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
-.checkact code{font-family:var(--mono);font-size:10.5px;color:var(--faint)}
-.cta{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:15px 18px 17px;border-top:1px solid var(--line-soft);background:linear-gradient(180deg,rgba(131,228,170,.04),transparent)}
+.checklist .ctext{grid-column:2;grid-row:1}
+/* Button, command and badge in three columns shared by every action row: a
+   fixed button column sized for the longest labels, a command column that
+   scrolls sideways instead of wrapping, and a right-aligned badge column. */
+.checkact{grid-column:2;display:grid;grid-template-columns:12rem minmax(0,1fr) auto;align-items:center;gap:6px 10px;margin-top:6px}
+.checkact button.run{justify-self:start}
+.checkact code{font-family:var(--mono);font-size:10.5px;color:var(--faint);background:var(--sunk);border:1px solid var(--line-soft);border-radius:var(--r-sm);padding:4px 9px;overflow-x:auto;white-space:nowrap;min-width:0;scrollbar-width:thin}
+.checkact .need{justify-self:end}
+.checkact .blocked-why{justify-self:end;font-size:10px;color:var(--fail);max-width:26ch;text-align:right;line-height:1.4}
+/* The optional readiness marker tucks under the badge, same right edge. */
+.checkact .readiness{grid-column:3;justify-self:end}
+.cta{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:15px 18px 17px 47px;border-top:1px solid var(--line-soft);background:linear-gradient(180deg,rgba(131,228,170,.04),transparent)}
 .cta .actcmd{margin-top:0;flex:0 1 auto}
 .ctawhy{font-size:11.5px;color:var(--faint);flex:1 1 200px;line-height:1.5}
 .inflight{padding:2px 18px 15px;font-family:var(--mono);font-size:11.5px;color:var(--pass)}
@@ -304,9 +314,9 @@ button.copy:focus-visible{outline:2px solid var(--gh);outline-offset:2px}
 .termout:empty{display:none}
 .termout:focus-visible{outline:2px solid var(--gh);outline-offset:-2px}
 /* Thin, quiet scrollbars on every scrollable pane (webkit). */
-.termout::-webkit-scrollbar,.events::-webkit-scrollbar,.actcmd code::-webkit-scrollbar,.termhead code::-webkit-scrollbar,.nextcmd code::-webkit-scrollbar,.praw::-webkit-scrollbar{width:9px;height:9px}
-.termout::-webkit-scrollbar-thumb,.events::-webkit-scrollbar-thumb,.actcmd code::-webkit-scrollbar-thumb,.termhead code::-webkit-scrollbar-thumb,.nextcmd code::-webkit-scrollbar-thumb,.praw::-webkit-scrollbar-thumb{background:var(--line-strong);border-radius:999px;border:2px solid var(--sunk)}
-.termout::-webkit-scrollbar-track,.events::-webkit-scrollbar-track,.actcmd code::-webkit-scrollbar-track,.termhead code::-webkit-scrollbar-track,.nextcmd code::-webkit-scrollbar-track,.praw::-webkit-scrollbar-track{background:transparent}
+.termout::-webkit-scrollbar,.events::-webkit-scrollbar,.actcmd code::-webkit-scrollbar,.checkact code::-webkit-scrollbar,.termhead code::-webkit-scrollbar,.nextcmd code::-webkit-scrollbar,.praw::-webkit-scrollbar{width:9px;height:9px}
+.termout::-webkit-scrollbar-thumb,.events::-webkit-scrollbar-thumb,.actcmd code::-webkit-scrollbar-thumb,.checkact code::-webkit-scrollbar-thumb,.termhead code::-webkit-scrollbar-thumb,.nextcmd code::-webkit-scrollbar-thumb,.praw::-webkit-scrollbar-thumb{background:var(--line-strong);border-radius:999px;border:2px solid var(--sunk)}
+.termout::-webkit-scrollbar-track,.events::-webkit-scrollbar-track,.actcmd code::-webkit-scrollbar-track,.checkact code::-webkit-scrollbar-track,.termhead code::-webkit-scrollbar-track,.nextcmd code::-webkit-scrollbar-track,.praw::-webkit-scrollbar-track{background:transparent}
 
 /* ---------- prompt dock ---------- */
 .prompt{border-top:1px solid rgba(221,173,97,.4);padding:16px 18px 18px;background:linear-gradient(180deg,rgba(221,173,97,.1),rgba(221,173,97,.05))}
