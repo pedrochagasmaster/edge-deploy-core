@@ -145,7 +145,6 @@ def build_parser() -> argparse.ArgumentParser:
     rollout_parser.add_argument("--reuse-session", action="store_true", help="Require a pre-authenticated pane")
 
     drift_parser = subparsers.add_parser("drift", help="Compare runtime-critical files against a commit")
-    drift_parser.add_argument("--tool", required=True)
     drift_parser.add_argument("--node", required=True)
     drift_parser.add_argument("--commit", required=True)
     drift_parser.add_argument("--json-report")
@@ -896,13 +895,13 @@ def _cmd_rollout(args: argparse.Namespace, operator: OperatorConfig) -> int:
 
 
 def _cmd_drift(args: argparse.Namespace, operator: OperatorConfig) -> int:
+    repo_root = Path.cwd().resolve()
     node = operator.node(args.node)
-    tool_path = operator.tool_path(args.tool)
-    profile = load_tool_profile(Path(tool_path))
+    profile = load_tool_profile(repo_root)
     driver = transport_for_node(node, profile, retries=2)
     try:
         _authenticate_standalone_transport(driver, node, args.reuse_session)
-        report = drift.check_drift(driver, profile, node, commit=args.commit, local_root=tool_path)
+        report = drift.check_drift(driver, profile, node, commit=args.commit, local_root=repo_root)
     finally:
         _safe_stop_transport(driver)
     _emit(report, args.json_report)

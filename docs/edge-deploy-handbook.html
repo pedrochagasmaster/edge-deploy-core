@@ -639,7 +639,7 @@ py -m edge_console --root D:\autobench --root D:\robocop</code></pre>
         <details>
           <summary>Drift detected on a node</summary>
           <p>Something on the node no longer matches the released snapshot. Investigate before releasing on top:
-          <code>py -m edge_deploy drift --tool &lt;tool&gt; --node &lt;node&gt; --commit &lt;sha&gt;</code> lists
+          <code>py -m edge_deploy drift --node &lt;node&gt; --commit &lt;sha&gt;</code> lists
           the differing files. A drifted node is a finding, not an automatic rollback.</p>
         </details>
 

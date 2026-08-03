@@ -1312,9 +1312,9 @@ function checklistHtml(t){
     if(t.deployed && t.deployed.sha)
       item("", `Optional: check the node still matches what was last deployed.`,
         btn(`Drift ${node}`,
-            {action:"drift", root:t.root, tool:t.tool, node, commit:t.deployed.sha},
+            {action:"drift", root:t.root, node, commit:t.deployed.sha},
             // Full SHA, so the shown command is exactly what the button runs.
-            `py -m edge_deploy drift --tool ${t.tool} --node ${node} --commit ${t.deployed.sha}`,
+            `py -m edge_deploy drift --node ${node} --commit ${t.deployed.sha}`,
             "both"));
   }
   return `<ol class="checklist">${items.join("")}</ol>`;

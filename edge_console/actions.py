@@ -136,7 +136,6 @@ def _rollback_args(params: dict) -> list[str]:
 def _drift_args(params: dict) -> list[str]:
     return [
         "drift",
-        "--tool", params["tool"],
         "--node", params["node"],
         "--commit", params["commit"],
     ]
@@ -220,7 +219,7 @@ ACTION_SPECS: dict[str, ActionSpec] = {
             kind="engine",
             cap="both",
             args=_drift_args,
-            params=("tool", "node", "commit"),
+            params=("node", "commit"),
             summary="Compare a node's runtime-critical files against a known commit.",
         ),
         ActionSpec(
