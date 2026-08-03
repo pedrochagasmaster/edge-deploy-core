@@ -436,6 +436,7 @@ class ActionRunner:
         self._prompt_seq = 0
         self._cancel_requested = False
         self._stopper: threading.Thread | None = None
+        self._pump_thread: threading.Thread | None = None
         self._secrets: list[str] = []
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
@@ -476,7 +477,12 @@ class ActionRunner:
             return
         self.status = "running"
         self._append(f"[console] {self.command}\n[console] cwd {self.cwd}\n\n")
-        threading.Thread(target=self._pump, name=f"action-{self.id}", daemon=True).start()
+        self._pump_thread = threading.Thread(
+            target=self._pump,
+            name=f"action-{self.id}",
+            daemon=True,
+        )
+        self._pump_thread.start()
         if self._cancel_requested:
             # Stop was pressed while the process was still being spawned.
             self.cancel()
@@ -543,10 +549,14 @@ class ActionRunner:
         self._stopper.start()
 
     def wait_for_stop(self, timeout: float) -> None:
-        """Block until a cancel has finished escalating (or the timeout)."""
+        """Block until cancellation and output collection have both finished."""
+        deadline = time.monotonic() + timeout
         stopper = self._stopper
         if stopper is not None:
             stopper.join(timeout=timeout)
+        pump_thread = self._pump_thread
+        if pump_thread is not None:
+            pump_thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
     def _escalate(self, proc: subprocess.Popen) -> None:
         try:

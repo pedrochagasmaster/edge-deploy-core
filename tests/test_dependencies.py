@@ -5,10 +5,10 @@ import zipfile
 from pathlib import Path
 
 import pytest
+from conftest import FakeTmuxDriver
 
 from edge_deploy.config import DependencyBundleConfig, ToolProfile
 from edge_deploy.dependencies import BundleError, create_dependency_bundle, deliver_dependency_bundle
-from tests.conftest import FakeTmuxDriver
 
 
 def _config() -> DependencyBundleConfig:
