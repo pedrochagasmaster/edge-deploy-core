@@ -63,9 +63,11 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
-            # A reload or a closed tab drops a long poll mid-flight; that is
-            # routine, not something to spill a traceback over.
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # A reload or a closed tab drops a response mid-flight; that is
+            # routine, not something to spill a traceback over. Windows reports
+            # the abort as ConnectionAbortedError (WinError 10053); Unix uses
+            # BrokenPipeError / ConnectionResetError.
             self.close_connection = True
 
     def _send_json(self, payload: dict, status: int = 200) -> None:

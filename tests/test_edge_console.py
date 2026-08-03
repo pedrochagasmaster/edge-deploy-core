@@ -2413,6 +2413,28 @@ def test_answer_and_cancel_also_require_the_page_token(tmp_path) -> None:
         server.server_close()
 
 
+def test_send_swallows_client_disconnects() -> None:
+    """A closed tab mid-response must not dump a traceback.
+
+    Windows reports the abort as ConnectionAbortedError (WinError 10053);
+    Unix uses BrokenPipeError / ConnectionResetError. All three are routine
+    when the browser cancels a poll or the operator reloads.
+    """
+    for exc_type in (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+        handler = object.__new__(edge_console_mod.ConsoleHandler)
+        handler.close_connection = False
+        handler.send_response = lambda *_a, **_k: None
+        handler.send_header = lambda *_a, **_k: None
+        handler.end_headers = lambda *_a, **_k: None
+
+        def boom(_body, *, _exc=exc_type):
+            raise _exc()
+
+        handler.wfile = SimpleNamespace(write=boom)
+        handler._send(200, "text/plain; charset=utf-8", b"hi")
+        assert handler.close_connection is True, exc_type
+
+
 def test_non_loopback_host_is_refused(tmp_path) -> None:
     """The DNS-rebinding guard: a valid token from a foreign origin is not
     enough — and it covers the reads (the page token, the ledgers, the
