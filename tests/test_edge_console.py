@@ -43,6 +43,7 @@ from edge_console.actions import (  # noqa: E402
     display_command,
 )
 from edge_console.demo import DEMO_ENGINE_PATH  # noqa: E402
+from edge_console.engine_exec import build_engine_exec_context  # noqa: E402
 from edge_console.probes import (  # noqa: E402
     _ci_verdict,
     _tool_name,
@@ -146,10 +147,9 @@ def _serve(
     handler.roots = roots
     handler.prober = PostureProber(demo=False, roots=write_roots or roots)
     handler.tools_prober = ToolsProber(roots, demo=False)
-    # demo=True keeps the readiness probe from shelling out during tests.
-    handler.readiness = ReadinessProber(
-        engine_python=sys.executable, demo=True, demo_engine_sha="d" * 64
-    )
+    # demo=True keeps the readiness probe from shelling out during tests, and
+    # short-circuits before the engine exec context would be consulted.
+    handler.readiness = ReadinessProber(demo=True, demo_engine_sha="d" * 64)
     handler.registry = registry
     handler.demo = False
     handler.read_only = read_only
@@ -1423,17 +1423,16 @@ def test_drift_builds_an_allowlisted_command_and_rejects_bad_input(tmp_path) -> 
     root = _checkout(tmp_path)
     registry = _registry([root], script="print('ok')")
     runner = registry.start(
-        {"action": "drift", "root": str(root), "tool": "autobench", "node": "node03",
+        {"action": "drift", "root": str(root), "node": "node03",
          "commit": "9c4f2ae8d1b06f3a7c5e2d4b8a1f0c9e6d3b7a52"}
     )
     assert runner.command == (
-        "py -m edge_deploy drift --tool autobench --node node03 "
+        "py -m edge_deploy drift --node node03 "
         "--commit 9c4f2ae8d1b06f3a7c5e2d4b8a1f0c9e6d3b7a52"
     )
     for bad in (
-        {"tool": "Autobench!", "node": "node03", "commit": "a" * 40},
-        {"tool": "autobench", "node": "node03; rm", "commit": "a" * 40},
-        {"tool": "autobench", "node": "node03", "commit": "nothex"},
+        {"node": "node03; rm", "commit": "a" * 40},
+        {"node": "node03", "commit": "nothex"},
     ):
         with pytest.raises(ActionError):
             registry.start({"action": "drift", "root": str(root), **bad})
@@ -1588,14 +1587,14 @@ def test_run_blockers_carry_the_checkout_gate_onto_open_runs() -> None:
 def test_engine_identity_is_read_from_the_interpreter_that_will_run_the_command() -> None:
     """--engine-python can point at another interpreter, so importing the hash
     in this process would answer a question nobody asked."""
-    identity = probe_engine_identity(sys.executable)
+    identity = probe_engine_identity(build_engine_exec_context(python=sys.executable))
     assert identity["status"] == "ok"
     assert len(identity["content_sha256"]) == 64
     from edge_deploy.ledger import engine_identity
 
     assert identity["content_sha256"] == engine_identity()["content_sha256"]
 
-    broken = probe_engine_identity("/nonexistent/python")
+    broken = probe_engine_identity(build_engine_exec_context(python="/nonexistent/python"))
     assert broken["status"] == "unknown"
     assert "detail" in broken
 

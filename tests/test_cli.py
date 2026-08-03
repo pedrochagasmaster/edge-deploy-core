@@ -239,7 +239,7 @@ def test_parser_parses_rollout_args() -> None:
 
 
 def test_parser_parses_drift_and_preflight() -> None:
-    drift_args = cli.build_parser().parse_args(["drift", "--tool", "t", "--node", "n", "--commit", "c"])
+    drift_args = cli.build_parser().parse_args(["drift", "--node", "n", "--commit", "c"])
     preflight_args = cli.build_parser().parse_args(["preflight", "--node", "n"])
 
     assert drift_args.command == "drift"
