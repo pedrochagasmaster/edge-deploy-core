@@ -75,11 +75,10 @@ header{border-bottom:1px solid var(--line-soft);background:var(--void);position:
 }
 .masthead{max-width:1140px;margin:0 auto;padding:18px 24px 14px;display:flex;flex-wrap:wrap;gap:18px 28px;align-items:flex-end;justify-content:space-between}
 .wordmark{position:relative;font-family:var(--mono);font-size:16px;letter-spacing:.2em;font-weight:600;line-height:1.15;padding-left:34px}
-.wordmark::before{content:"";position:absolute;left:0;top:2px;width:22px;height:22px;border-radius:7px;border:1px solid transparent;
-  background:linear-gradient(var(--panel2),var(--panel2)) padding-box,linear-gradient(135deg,var(--edge),var(--gh)) border-box;
+.wordmark::before{content:"";position:absolute;left:0;top:50%;transform:translateY(-50%);width:22px;height:22px;border-radius:7px;border:1px solid transparent;
+  background:radial-gradient(circle 8px at center,var(--edge),var(--gh) 3.5px,rgba(98,203,175,.6) 4px,rgba(98,203,175,.22) 6px,rgba(98,203,175,0) 8px),
+    linear-gradient(var(--panel2),var(--panel2)) padding-box,linear-gradient(135deg,var(--edge),var(--gh)) border-box;
   box-shadow:0 0 16px rgba(98,203,175,.28)}
-.wordmark::after{content:"";position:absolute;left:7px;top:9px;width:8px;height:8px;border-radius:50%;
-  background:linear-gradient(135deg,var(--edge),var(--gh));box-shadow:0 0 8px rgba(98,203,175,.7)}
 .wordmark small{display:block;letter-spacing:.32em;font-size:9.5px;color:var(--dim);font-weight:400;margin-top:4px;text-transform:uppercase}
 .posture{display:flex;gap:10px;align-items:stretch;flex-wrap:wrap}
 .pgroup{min-width:132px;background:var(--panel);border:1px solid var(--line-soft);border-radius:var(--r-md);padding:9px 12px 8px;box-shadow:0 1px 2px rgba(0,0,0,.35)}
