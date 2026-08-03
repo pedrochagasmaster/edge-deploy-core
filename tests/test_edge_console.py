@@ -204,7 +204,13 @@ def _require_node() -> None:
         pytest.skip("node is required to execute the page's JavaScript")
 
 
-def _render_run_html(run: dict, *, tcp_caps: dict | None = None, opts: dict | None = None) -> str:
+def _render_run_html(
+    run: dict,
+    *,
+    tcp_caps: dict | None = None,
+    actions: list[dict] | None = None,
+    opts: dict | None = None,
+) -> str:
     """Evaluate PAGE's runHtml() in Node so tests assert real card output."""
     _require_node()
     script = _page_script_through_run_html()
@@ -212,6 +218,8 @@ def _render_run_html(run: dict, *, tcp_caps: dict | None = None, opts: dict | No
         fh.write(script)
         if tcp_caps is not None:
             fh.write(f"\ntcpCaps = {json.dumps(tcp_caps)};\n")
+        for action in actions or []:
+            fh.write(f"\nactionsById.set({json.dumps(action['id'])}, {json.dumps(action)});\n")
         fh.write("\nprocess.stdout.write(runHtml(")
         fh.write(json.dumps(run))
         fh.write(f", {json.dumps(opts or {})}));\n")
@@ -1848,6 +1856,114 @@ def test_open_training_all_phases_passed_awaits_completion_not_finished() -> Non
 
 
 # ---------------------------------------------------------------------------
+# The rail's "running" cue: a console-launched command lights its station
+# ---------------------------------------------------------------------------
+
+
+def _console_action(action: str, run_id: str | None, root: str = "/tmp/training/autobench") -> dict:
+    return {
+        "id": f"action-{action}-1",
+        "action": action,
+        "root": root,
+        "run_id": run_id,
+        "status": "running",
+        "started_at": 1783000000.0,
+    }
+
+
+def _live_station_phase(html: str) -> str | None:
+    match = re.search(r'class="station live"[^>]*>.*?<h4>([^<]+)</h4>', html, re.S)
+    return match.group(1) if match else None
+
+
+def test_a_running_verify_lights_the_verify_station_not_next() -> None:
+    """Only deploy writes release-progress.json, so a console-launched verify
+    used to stream in the terminal while the rail still said '◀ next' — and
+    the card blamed the console's own lock at the same time."""
+    run = _sample_run(kind="release", training=None, status="open", run_id="run-20260724T000000Z-verify01")
+    html = _render_run_html(run, actions=[_console_action("verify", run["state"]["run_id"])])
+    assert _live_station_phase(html) == "verify"
+    assert 'class="station next"' not in html
+
+
+def test_a_running_guided_release_lights_the_phase_the_run_resumes_at() -> None:
+    run = _sample_run(
+        kind="release", training=None, status="open",
+        run_id="run-20260724T000000Z-release1", phases=_phases_through("deploy"),
+    )
+    html = _render_run_html(run, actions=[_console_action("release", run["state"]["run_id"])])
+    assert _live_station_phase(html) == "deploy"
+    assert 'class="station next"' not in html
+
+
+def test_a_guided_release_from_the_decision_card_matches_by_checkout_root() -> None:
+    """The decision card's start button carries no run_id yet — the run may
+    not even exist — so the cue falls back to the checkout root."""
+    run = _sample_run(
+        kind="release", training=None, status="open",
+        run_id="run-20260724T000000Z-release2", phases=_phases_through("publish"),
+    )
+    html = _render_run_html(run, actions=[_console_action("release", None)])
+    assert _live_station_phase(html) == "publish"
+    # A release running in a different checkout lights nothing here.
+    other = _render_run_html(run, actions=[_console_action("release", None, root="/tmp/other/robocop")])
+    assert 'class="station live"' not in other
+    assert 'class="station next"' in other
+
+
+def test_engine_progress_stays_authoritative_over_console_actions() -> None:
+    """When release-progress.json does speak, it wins over the action list."""
+    run = _sample_run(
+        kind="release", training=None, status="open",
+        run_id="run-20260724T000000Z-progress", phases=_phases_through("deploy"),
+    )
+    run["progress"] = {
+        "updated_at": "2026-07-24T00:01:00+00:00",
+        "active": {"phase": "rollout", "label": "rollout autobench/node03"},
+    }
+    html = _render_run_html(run, actions=[_console_action("tag_bitbucket", run["state"]["run_id"])])
+    assert _live_station_phase(html) == "deploy"
+
+
+def test_status_and_abandon_never_light_a_station() -> None:
+    run = _sample_run(kind="release", training=None, status="open", run_id="run-20260724T000000Z-nolight1")
+    html = _render_run_html(
+        run,
+        actions=[
+            _console_action("status", None),
+            _console_action("abandon", run["state"]["run_id"]),
+        ],
+    )
+    assert 'class="station live"' not in html
+    assert 'class="station next"' in html
+
+
+def test_a_training_run_never_gets_the_running_cue() -> None:
+    run = _sample_run(
+        kind="training", training=True, status="open",
+        run_id="run-20260724T000000Z-train99", phases=_phases_through("verify"),
+    )
+    html = _render_run_html(run, actions=[_console_action("verify", run["state"]["run_id"])])
+    assert 'class="station live"' not in html
+    assert 'class="station next"' not in html  # the training rule is unchanged
+
+
+def test_without_a_running_action_the_next_cue_is_unchanged() -> None:
+    run = _sample_run(
+        kind="release", training=None, status="open",
+        run_id="run-20260724T000000Z-plain001", phases=_phases_through("tag_github"),
+    )
+    html = _render_run_html(run, tcp_caps={"bb": False, "edge": False})
+    assert 'class="station next"' in html
+    assert 'class="station live"' not in html
+    # An action that already finished lights nothing either.
+    finished = {**_console_action("tag_github", run["state"]["run_id"]), "status": "exited"}
+    done = _render_run_html(run, tcp_caps={"bb": False, "edge": False}, actions=[finished])
+    assert 'class="station live"' not in done
+    assert 'class="station next"' in done
+
+
+# ---------------------------------------------------------------------------
 # Final-review: --github-write-root separation
 # ---------------------------------------------------------------------------
 
@@ -2183,6 +2299,128 @@ def test_page_keeps_a_half_typed_answer_focused_across_re_renders() -> None:
     assert "selectionStart" in body
     assert "setSelectionRange" in body
     assert "scrollTop" in body
+
+
+def test_view_transitions_are_gated_and_reduced_motion_covers_every_animation() -> None:
+    """Cards animate only through the View Transitions API, only when the
+    coarse layout moves — a live run re-renders on every 2s poll, and animating
+    each of those would flicker — and never offscreen, under reduced motion, or
+    where the API is missing."""
+    assert "withStageTransition" in PAGE
+    assert "layoutSignature" in PAGE
+    assert "document.startViewTransition" in PAGE
+    assert "document.hidden" in PAGE
+    assert 'matchMedia("(prefers-reduced-motion: reduce)")' in PAGE
+    # One user-visible data change, one transition: the poll sites wrap the
+    # stage and history renders together (definition + two call sites).
+    assert PAGE.count("withStageTransition(") >= 3
+    # Stable, sanitized, per-card transition names on both card kinds.
+    assert 'view-transition-name:${vtName("run"' in PAGE
+    assert 'view-transition-name:${vtName("decision"' in PAGE
+    # Enter/exit styling lives on the view-transition pseudo-elements; cards
+    # present in both snapshots keep the default cross-fade.
+    assert "::view-transition-group(*)" in PAGE
+    assert "::view-transition-new(*):only-child" in PAGE
+    assert "::view-transition-old(*):only-child" in PAGE
+    # The CSS-only entrances (prompt dock, toast, terminal) and every earlier
+    # keyframe must go still under reduced motion: the generic block zeroes
+    # animations now, not just transitions.
+    generic = PAGE.split("*,*::before,*::after{", 1)[1].split("}", 1)[0]
+    assert "transition-duration:.01ms !important" in generic
+    assert "animation-duration:.01ms !important" in generic
+    assert "animation-iteration-count:1 !important" in generic
+    for name in ("promptin", "toastin", "termin"):
+        assert f"@keyframes {name}" in PAGE
+
+
+# ---------------------------------------------------------------------------
+# Desktop notifications: opt-in, unfocused-only, de-duplicated, secret-free
+# ---------------------------------------------------------------------------
+
+
+def test_notify_toggle_lives_in_the_masthead_and_starts_hidden() -> None:
+    """The toggle is static masthead markup — nothing a poll re-renders — and
+    stays hidden unless the browser has the Notification API at all."""
+    head = PAGE.split('<div class="masthead">', 1)[1].split('id="pstrip"', 1)[0]
+    toggle = head.split('<button id="notify-toggle"', 1)[1].split(">", 1)[0]
+    assert "hidden" in toggle
+    assert 'class="notify-toggle"' in toggle
+    assert 'typeof Notification !== "undefined"' in PAGE
+
+
+def test_notify_toggle_states_and_versioned_persistence() -> None:
+    """Off by default, on after the operator opts in, and an explained
+    disabled state when the browser itself has blocked notifications — the
+    choice persists under a versioned key, the history filter's pattern."""
+    assert 'const NOTIFY_STORAGE_KEY = "edge-console-notify-v1"' in PAGE
+    assert "localStorage.getItem(NOTIFY_STORAGE_KEY)" in PAGE
+    assert PAGE.count("localStorage.setItem(NOTIFY_STORAGE_KEY") >= 2  # both "on" and "off"
+    assert 'Notification.permission === "denied"' in PAGE
+    assert "site settings" in PAGE
+
+
+def test_notifications_are_gated_on_page_focus() -> None:
+    """The prompt dock and the toast already cover a page the operator is
+    looking at; a notification exists for the unfocused case only."""
+    body = PAGE.split("function fireNotification(", 1)[1].split("\n}\n", 1)[0]
+    assert "document.hasFocus()" in body
+    assert "notifyEnabled()" in body
+
+
+def test_request_permission_is_only_called_from_the_click_handler() -> None:
+    """Browsers grant notification permission from a user gesture only, so the
+    one requestPermission call must live inside the page's click handler."""
+    assert PAGE.count("requestPermission") == 1
+    before_handler = PAGE.split('document.addEventListener("click"', 1)[0]
+    assert "requestPermission" not in before_handler
+
+
+def test_notifications_never_carry_raw_prompt_bytes() -> None:
+    """The prompt's raw bytes are the engine's own output and the operator's
+    answer is a secret: neither may leave the page through a notification."""
+    body = PAGE.split("function maybeNotify(a, t){", 1)[1].split("\n}\n", 1)[0]
+    assert ".raw" not in body
+    assert "p.title" in body
+    assert "p.detail" in body
+
+
+def test_notification_dedup_and_live_transition_sets() -> None:
+    """At most one notification per prompt id and per action completion, and
+    only a completion this page watched happen counts — anything already
+    finished when the page loaded was never in the running set."""
+    assert "const notifiedPromptIds = new Set();" in PAGE
+    assert "const notifiedActionIds = new Set();" in PAGE
+    assert "const runningActionIds = new Set();" in PAGE
+
+
+def test_prompt_notifications_recheck_the_still_owed_answer() -> None:
+    """A prompt the operator has answered since is not owed a notification:
+    the fire-time state comes from activePrompt, reached from the one place
+    every action snapshot flows through."""
+    body = PAGE.split("function maybeNotify(a, t){", 1)[1].split("\n}\n", 1)[0]
+    assert "activePrompt(a, t)" in body
+    term = PAGE.split("function renderTerm(id){", 1)[1].split("\n}\n", 1)[0]
+    assert "maybeNotify(a, t)" in term
+
+
+def test_blocking_prompts_stick_and_notifications_coalesce() -> None:
+    """Secrets and posture acks block a release, so they stay on screen until
+    dismissed; a failure clears on its own. tag coalesces repeats, and a click
+    returns the operator to the page."""
+    assert 'p.kind === "secret" || p.kind === "ack"' in PAGE
+    fire = PAGE.split("function fireNotification(", 1)[1].split("\n}\n", 1)[0]
+    assert "requireInteraction" in fire
+    assert "tag" in fire
+    assert "window.focus()" in fire
+
+
+def test_notification_code_stays_below_the_runhtml_marker() -> None:
+    """Tests execute everything above the marker in Node, where Notification,
+    document, and localStorage do not exist."""
+    above = _page_script_through_run_html()
+    assert "Notification" not in above
+    assert "maybeNotify" not in above
+    assert "NOTIFY_STORAGE_KEY" not in above
 
 
 def test_a_pending_prompt_does_not_satisfy_every_long_poll(tmp_path) -> None:

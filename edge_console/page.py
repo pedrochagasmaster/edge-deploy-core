@@ -101,6 +101,16 @@ header{border-bottom:1px solid var(--line-soft);background:var(--void);position:
 .pnote{max-width:1140px;margin:0 auto;padding:0 24px 13px;font-size:11.5px;color:var(--dim)}
 .pnote b{color:var(--ink);font-weight:600}
 .probed{color:var(--faint)}
+/* The notifications opt-in borrows the pchip/copy language: mono, quiet
+   border, sunk background. "on" takes the posture strip's green; "blocked"
+   (a browser-level denial the page cannot undo) gets the dashed maybe
+   treatment. margin-left:auto keeps wordmark left and posture right exactly
+   as without it. */
+.notify-toggle{margin-left:auto;font-family:var(--mono);font-size:10px;letter-spacing:.08em;background:var(--sunk);border:1px solid var(--line);color:var(--faint);border-radius:999px;padding:5px 12px;cursor:pointer;flex:none;transition:color .14s ease,border-color .14s ease,background .14s ease,box-shadow .14s ease}
+.notify-toggle:hover:not(:disabled){color:var(--ink);border-color:var(--faint)}
+.notify-toggle:focus-visible{outline:2px solid var(--gh);outline-offset:2px}
+.notify-toggle.on{color:var(--go);background:var(--pass-tint);border-color:rgba(127,214,156,.5);box-shadow:0 0 12px rgba(127,214,156,.14)}
+.notify-toggle:disabled{border-style:dashed;border-color:var(--dim);color:var(--dim);cursor:not-allowed}
 
 /* ---------- banners ---------- */
 .banner{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:14px;padding:10px 15px;border-radius:var(--r-md);font-size:12px;border:1px solid var(--line);background:var(--panel);color:var(--dim);box-shadow:0 1px 2px rgba(0,0,0,.35);line-height:1.5}
@@ -300,7 +310,10 @@ button.copy:focus-visible{outline:2px solid var(--gh);outline-offset:2px}
 .inflight{padding:2px 18px 15px;font-family:var(--mono);font-size:11.5px;color:var(--pass)}
 
 /* ---------- terminal ---------- */
-.term{border-top:1px solid var(--line-soft);background:var(--sunk)}
+/* The element is persistent — re-parented between slots, never recreated — so
+   its entry animation runs only when an action's terminal is first placed. */
+.term{border-top:1px solid var(--line-soft);background:var(--sunk);animation:termin .2s ease-out}
+@keyframes termin{from{opacity:0}to{opacity:1}}
 .termhead{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:9px 16px;border-bottom:1px solid var(--line-soft);background:rgba(255,255,255,.02)}
 .termhead .tdot{width:8px;height:8px;border-radius:50%;flex:none;background:var(--go);box-shadow:0 0 9px rgba(131,228,170,.8);animation:oppulse 1.6s ease-in-out infinite}
 .term.done .termhead .tdot{background:var(--pass);box-shadow:0 0 6px rgba(127,214,156,.6);animation:none}
@@ -321,7 +334,10 @@ button.copy:focus-visible{outline:2px solid var(--gh);outline-offset:2px}
 .termout::-webkit-scrollbar-track,.events::-webkit-scrollbar-track,.actcmd code::-webkit-scrollbar-track,.checkact code::-webkit-scrollbar-track,.termhead code::-webkit-scrollbar-track,.nextcmd code::-webkit-scrollbar-track,.praw::-webkit-scrollbar-track{background:transparent}
 
 /* ---------- prompt dock ---------- */
-.prompt{border-top:1px solid rgba(221,173,97,.4);padding:16px 18px 18px;background:linear-gradient(180deg,rgba(221,173,97,.1),rgba(221,173,97,.05))}
+/* Fresh HTML each time a prompt arrives, so an entry keyframe is enough; the
+   autofocus already lands while it settles and typing is never delayed. */
+.prompt{border-top:1px solid rgba(221,173,97,.4);padding:16px 18px 18px;background:linear-gradient(180deg,rgba(221,173,97,.1),rgba(221,173,97,.05));animation:promptin .18s ease-out}
+@keyframes promptin{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 .prompt.secret{border-top-color:rgba(131,228,170,.45);background:linear-gradient(180deg,rgba(131,228,170,.1),rgba(131,228,170,.045))}
 /* The hazard stripes mark the one hard posture wall, but they must not cost
    the operator any legibility: they sit as a low-alpha layer over the panel. */
@@ -379,12 +395,27 @@ details.log summary:focus-visible{outline:2px solid var(--gh);outline-offset:-2p
 .nextcmd code{font-family:var(--mono);font-size:11.5px;color:var(--dim);background:var(--sunk);border:1px solid var(--line-soft);border-radius:7px;padding:7px 11px;flex:1 1 320px;overflow-x:auto;white-space:nowrap;scrollbar-width:thin}
 .empty{border:1px dashed #2b3642;border-radius:var(--r-md);margin-top:20px;padding:36px 28px;text-align:center;color:var(--dim);background:rgba(255,255,255,.012);font-size:13px;line-height:1.6}
 .empty code{font-family:var(--mono);font-size:12px;color:var(--ink)}
-.toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);background:var(--panel2);border:1px solid rgba(232,115,106,.55);border-left:3px solid var(--fail);color:#f0b9b4;border-radius:var(--r-md);padding:11px 18px;font-size:12.5px;z-index:60;max-width:80vw;box-shadow:0 18px 44px -18px rgba(0,0,0,.85)}
+.toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);background:var(--panel2);border:1px solid rgba(232,115,106,.55);border-left:3px solid var(--fail);color:#f0b9b4;border-radius:var(--r-md);padding:11px 18px;font-size:12.5px;z-index:60;max-width:80vw;box-shadow:0 18px 44px -18px rgba(0,0,0,.85);animation:toastin .18s ease-out}
+/* The rise must keep the -50% centering, or the toast jumps sideways mid-animation. */
+@keyframes toastin{from{opacity:0;transform:translate(-50%,10px)}to{opacity:1;transform:translate(-50%,0)}}
 footer{margin-top:40px;padding-top:18px;border-top:1px solid var(--line-soft);font-size:11.5px;color:var(--faint);line-height:1.65;max-width:100ch}
 footer code{font-family:var(--mono);font-size:10.5px;color:var(--dim)}
 
+/* ---------- view transitions: cards arrive and leave without popping ---------- */
+/* Every card carries a stable view-transition-name (set inline by runHtml /
+   decisionHtml), so a re-render cross-fades matching cards in place by
+   default. Only the one-sided cases need styling here: a card present just in
+   the new snapshot is entering, just in the old is leaving. withStageTransition
+   never starts one while the layout is unchanged, offscreen, or reduced-motion. */
+::view-transition-group(*){animation-duration:.2s;animation-timing-function:ease-out}
+::view-transition-new(*):only-child{animation-name:vtcardin}
+::view-transition-old(*):only-child{animation-name:vtcardout}
+@keyframes vtcardin{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+@keyframes vtcardout{from{opacity:1;transform:none}to{opacity:0}}
+
 @media (prefers-reduced-motion: reduce){
-  *,*::before,*::after{transition-duration:.01ms !important}
+  /* The view transitions are skipped in JS; this stills every keyframe too. */
+  *,*::before,*::after{transition-duration:.01ms !important;animation-duration:.01ms !important;animation-iteration-count:1 !important}
 }
 
 @media (max-width:760px){
@@ -409,6 +440,7 @@ footer code{font-family:var(--mono);font-size:10.5px;color:var(--dim)}
 <header>
   <div class="masthead">
     <div class="wordmark">EDGE&nbsp;DEPLOY<small>release console</small></div>
+    <button id="notify-toggle" class="notify-toggle" type="button" aria-pressed="false" hidden>notify</button>
     <div class="posture" id="posture" aria-live="polite"></div>
   </div>
   <div class="pstrip" id="pstrip" aria-label="inferred workstation posture"></div>
@@ -508,6 +540,13 @@ function shortDate(iso){
   return String(iso).replace(/T(\d\d:\d\d).*$/, " $1Z");
 }
 function plural(n, word){ return `${n} ${word}${n === 1 ? "" : "s"}`; }
+
+// A view-transition-name must be one valid CSS custom-ident, unique across the
+// page. Run ids and tool roots are unique already, so folding them to
+// [a-z0-9-] and prefixing by card kind keeps the two namespaces apart.
+function vtName(prefix, raw){
+  return prefix + "-" + String(raw || "").toLowerCase().replace(/[^a-z0-9]+/g, "-");
+}
 
 // Matches edge_deploy.ledger.is_training_ledger: either marker, strict true.
 function isTrainingRun(st){
@@ -956,9 +995,35 @@ function livePhase(run){
   return ["rollout", "auth", "deploy", "verify", "publish"].includes(p) ? "deploy" : null;
 }
 
+// The console's own running commands, as a fallback when release-progress.json
+// says nothing: only deploy writes a progress tracker, so a console-launched
+// verify, publish or tag would otherwise stream in the terminal while the rail
+// still claims the phase is only "◀ next" — and the card even blames the
+// console's own lock. run_id matches first; a guided release started from a
+// decision card has no run_id yet, so it falls back to the checkout root and
+// lights the phase the run is about to execute.
+const ACTION_STATION = {
+  verify: "verify", publish: "publish", deploy: "deploy",
+  tag_bitbucket: "tag_bitbucket", tag_github: "tag_github",
+};
+function actionLivePhase(run){
+  if(run.state.status !== "open" || isTrainingRun(run.state)) return null;
+  for(const a of actionsById.values()){
+    if(a.status !== "running" && a.status !== "starting") continue;
+    if(a.run_id ? a.run_id !== run.state.run_id
+                : (a.action !== "release" || a.root !== run.root)) continue;
+    if(a.action === "release") return nextPhase(run);
+    // rollback deploys a brand-new run, and abandon/status touch no phase.
+    if(ACTION_STATION[a.action]) return ACTION_STATION[a.action];
+  }
+  return null;
+}
+
 function railHtml(run){
   const next = nextPhase(run);
-  const live = livePhase(run);
+  // The engine's own progress signal stays authoritative; the console's
+  // running command only fills the stations it never reports.
+  const live = livePhase(run) || actionLivePhase(run);
   const training = isTrainingRun(run.state);
   const parts = RAIL.map(item => {
     if(item.phase) return stationHtml(run, item.phase, next, live);
@@ -1122,7 +1187,7 @@ function runHtml(run, opts){
 
   const slot = opts.spotlight ? `<div class="term-slot" data-root="${esc(run.root || "")}"></div>` : "";
   const cls = ["run", opts.spotlight ? "spot" : "", st.status === "open" ? "" : "closed"].filter(Boolean).join(" ");
-  return `<article class="${cls}">
+  return `<article class="${cls}" style="view-transition-name:${vtName("run", st.run_id)}">
     <div class="runhead">
       <span class="runid">${esc(st.run_id)}</span>
       <span class="chip tool">${esc(st.tool)}</span>${trainingChip}${kindChip}${statusChip}${lockChip}${rollback}
@@ -1368,7 +1433,7 @@ function decisionHtml(t){
     </div>`;
 
   if(t.open_run_id){
-    return `<article class="decision" data-suggest="0">${head}
+    return `<article class="decision" data-suggest="0" style="view-transition-name:${vtName("decision", t.root)}">${head}
       <div class="inflight">release in flight — ${esc(t.open_run_id)} (spotlighted above)</div>
     </article>`;
   }
@@ -1390,7 +1455,7 @@ function decisionHtml(t){
         ? esc(blocker)
         : "Walks verify → publish → deploy → tag-bitbucket → tag-github, pausing here for every RSA passcode and posture switch."}</div>
     </div>`;
-  return `<article class="decision" data-suggest="${suggest ? 1 : 0}">
+  return `<article class="decision" data-suggest="${suggest ? 1 : 0}" style="view-transition-name:${vtName("decision", t.root)}">
     ${head}
     <p class="headline${headline.calm ? " calm" : ""}">${esc(headline.text)}</p>
     ${evidenceHtml(t)}
@@ -1498,6 +1563,7 @@ function renderTerm(id){
   const t = terms.get(id);
   const a = actionsById.get(id);
   if(!t || !a) return;
+  maybeNotify(a, t);
   const prompt = activePrompt(a, t);
   const running = a.status === "running" || a.status === "starting";
   const bad = !running && (a.exit_code !== 0 || a.status === "failed");
@@ -1551,6 +1617,93 @@ function placeTerminals(){
     caret.el.focus();
     try{ caret.el.setSelectionRange(caret.start, caret.end); }catch(_e){ /* not selectable */ }
   }
+}
+
+/* ---------- desktop notifications ---------- */
+// A release can sit waiting on an RSA passcode for minutes while the operator
+// is in another window; the prompt dock and the toast only reach someone
+// already looking at the page. Notifications close that gap, on three rules:
+// they are opt-in (the choice persists per browser), they fire only while the
+// page is unfocused, and they never carry a secret value or the engine's raw
+// prompt bytes — the action label, run id, and the prompt's title/detail only.
+const NOTIFY_STORAGE_KEY = "edge-console-notify-v1";
+const NOTIFY_SUPPORTED = typeof Notification !== "undefined";
+
+function notifyEnabled(){
+  if(!NOTIFY_SUPPORTED || Notification.permission !== "granted") return false;
+  try{ return localStorage.getItem(NOTIFY_STORAGE_KEY) === "on"; }
+  catch(_e){ return false; }  // storage disabled: notifications stay off
+}
+
+function renderNotifyToggle(){
+  const btn = document.getElementById("notify-toggle");
+  if(!NOTIFY_SUPPORTED){ btn.hidden = true; return; }  // nothing to offer
+  btn.hidden = false;
+  if(Notification.permission === "denied"){
+    // A browser-level block is not the page's to undo; point at the one
+    // place that can instead of offering a switch that would never work.
+    btn.disabled = true;
+    btn.className = "notify-toggle";
+    btn.textContent = "notify blocked";
+    btn.title = "Notifications are blocked for this page in the browser's site settings — allow them there to use this.";
+    btn.setAttribute("aria-pressed", "false");
+    return;
+  }
+  const on = notifyEnabled();
+  btn.disabled = false;
+  btn.className = "notify-toggle" + (on ? " on" : "");
+  btn.textContent = on ? "notify on" : "notify off";
+  btn.title = on
+    ? "Desktop notifications are on — click to turn them off."
+    : "Desktop notification when the engine waits on you or a command fails badly — click to turn on.";
+  btn.setAttribute("aria-pressed", String(on));
+}
+
+// One notification per prompt id and one per action completion, ever. The
+// third set remembers which actions this page has seen running: a completion
+// is only news when the transition happened while the page was watching, so
+// anything already finished when the page loaded stays silent.
+const notifiedPromptIds = new Set();
+const notifiedActionIds = new Set();
+const runningActionIds = new Set();
+
+function fireNotification(title, body, tag, requireInteraction){
+  if(!notifyEnabled() || document.hasFocus()) return;
+  try{
+    const n = new Notification(title, {body, tag, requireInteraction});
+    n.onclick = () => { window.focus(); n.close(); };
+  }catch(_e){ /* permission revoked mid-session, or no notification service */ }
+}
+
+// Called from renderTerm — the one place every action snapshot flows through —
+// so prompts and completions are caught whether they arrived via pump or the
+// action list.
+function maybeNotify(a, t){
+  const running = a.status === "running" || a.status === "starting";
+  if(running){
+    runningActionIds.add(a.id);
+  } else if(runningActionIds.delete(a.id) && !notifiedActionIds.has(a.id)){
+    notifiedActionIds.add(a.id);
+    if(a.status === "failed" || a.exit_code !== 0)
+      fireNotification(
+        `${a.label || a.action} failed`,
+        [a.exit_code != null ? `exit ${a.exit_code}` : a.status, a.run_id].filter(Boolean).join(" · "),
+        `edge-console-done-${a.id}`,
+        false);
+  }
+  const p = activePrompt(a, t);
+  if(!p || notifiedPromptIds.has(p.id)) return;
+  notifiedPromptIds.add(p.id);
+  // The prompt's raw bytes are deliberately excluded: they are the engine's
+  // own output, and what a notification service may persist is not the page's
+  // call to make. The operator's answer never touches this path at all.
+  fireNotification(
+    `engine is waiting — ${p.title}`,
+    [a.label || a.action, a.run_id, p.detail].filter(Boolean).join(" · "),
+    `edge-console-prompt-${p.id}`,
+    // Secrets and posture acks block a release, so they stay on screen until
+    // dismissed; a passing question or failure clears on its own.
+    p.kind === "secret" || p.kind === "ack");
 }
 
 /* ---------- talking to the console ---------- */
@@ -1769,6 +1922,42 @@ function renderRoots(){
     `watching ${runsData.roots.map(esc).join(`<span class="rootsep"> · </span>`)}`;
 }
 
+/* ---------- render transitions ---------- */
+// Polls re-render the whole stage and history whenever any JSON moves, and
+// during a live release that is every two seconds — animating each of those
+// would flicker. So a view transition only wraps a render when the coarse
+// layout moved: which cards exist, in which section, with which status and
+// next phase. Anything finer renders synchronously, exactly as before.
+let lastLayoutSig = "";
+let stageTransitionRunning = false;
+
+function layoutSignature(){
+  if(!runsData) return "";
+  const stage = [], history = [];
+  for(const r of runsData.runs){
+    const key = `run:${r.state.run_id}=${r.state.status},${nextPhase(r) || "none"}`;
+    (r.state.status === "open" ? stage : history).push(key);
+  }
+  for(const t of (toolsData && toolsData.tools) || [])
+    stage.push(`decision:${t.root}=${t.open_run_id || "idle"}`);
+  return `${stage.join("|")}//${history.join("|")}`;
+}
+
+function withStageTransition(fn){
+  const sig = layoutSignature();
+  const animate = sig !== lastLayoutSig
+    && !stageTransitionRunning
+    && !document.hidden
+    && !window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    && typeof document.startViewTransition === "function";
+  if(!animate){ fn(); lastLayoutSig = sig; return; }
+  stageTransitionRunning = true;
+  // A skipped transition rejects .finished — clear the flag either way, so a
+  // dropped animation never disables every later one.
+  const clear = () => { stageTransitionRunning = false; };
+  document.startViewTransition(() => { fn(); lastLayoutSig = sig; }).finished.then(clear, clear);
+}
+
 /* ---------- polling ---------- */
 let lastRuns = "", lastTools = "";
 
@@ -1784,7 +1973,8 @@ async function pollRuns(){
     readOnly = !!data.read_only;
     if(raw === lastRuns) return;
     lastRuns = raw;
-    renderBanners(); renderRoots(); renderStage(); renderHistory();
+    renderBanners(); renderRoots();
+    withStageTransition(() => { renderStage(); renderHistory(); });
   }catch(_e){
     // Everything on screen is now a snapshot of an unknown age; say so rather
     // than letting a dead console look like a live one.
@@ -1799,7 +1989,11 @@ async function pollTools(){
     const raw = JSON.stringify(data);
     toolsData = data;
     // The environment block rides along here, and the banners depend on it.
-    if(raw !== lastTools){ lastTools = raw; renderBanners(); renderStage(); renderHistory(); }
+    if(raw !== lastTools){
+      lastTools = raw;
+      renderBanners();
+      withStageTransition(() => { renderStage(); renderHistory(); });
+    }
   }catch(_e){ /* keep last render */ }
 }
 
@@ -1856,6 +2050,27 @@ async function pollActions(){
 
 /* ---------- events ---------- */
 document.addEventListener("click", async ev => {
+  const notifyBtn = ev.target.closest("#notify-toggle");
+  if(notifyBtn){
+    if(notifyEnabled()){
+      try{ localStorage.setItem(NOTIFY_STORAGE_KEY, "off"); }catch(_e){ /* off for this session then */ }
+      renderNotifyToggle();
+    }else if(Notification.permission === "granted"){
+      try{ localStorage.setItem(NOTIFY_STORAGE_KEY, "on"); }catch(_e){ /* on for this session then */ }
+      renderNotifyToggle();
+    }else if(Notification.permission === "default"){
+      // Browsers grant notification permission only from a user gesture, so
+      // this click is the one place the page ever asks.
+      Notification.requestPermission().then(perm => {
+        if(perm === "granted"){
+          try{ localStorage.setItem(NOTIFY_STORAGE_KEY, "on"); }catch(_e){ /* on for this session then */ }
+        }
+        renderNotifyToggle();
+      });
+    }
+    return;
+  }
+
   const copyBtn = ev.target.closest("button.copy");
   if(copyBtn){
     try{ await navigator.clipboard.writeText(copyBtn.dataset.cmd); }
@@ -1957,6 +2172,7 @@ document.addEventListener("keydown", ev => {
   if(!send.disabled) send.click();
 });
 
+renderNotifyToggle();
 pollRuns(); pollPosture(); pollTools(); pollActions();
 setInterval(pollRuns, 2000);
 setInterval(pollActions, 2000);
