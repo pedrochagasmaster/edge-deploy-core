@@ -27,7 +27,6 @@ import codecs
 import os
 import re
 import subprocess
-import sys
 import threading
 import time
 import uuid
@@ -35,6 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from edge_console.engine_exec import EngineExecContext, engine_module_argv
 from edge_console.ledger import find_run_state, is_training_state
 
 # Trailing text that means the engine is blocked on the operator. Matched
@@ -804,13 +804,15 @@ class ActionRegistry:
         self,
         *,
         roots: list[Path],
-        engine_python: str | None = None,
+        engine: EngineExecContext | None = None,
         argv_builder: Callable[[ActionSpec, list[str], Path], list[str]] | None = None,
         on_finish: Callable[[ActionRunner], None] | None = None,
         node_transports: Callable[[], dict[str, str]] | None = None,
     ) -> None:
         self._roots = {str(Path(root).resolve()): Path(root).resolve() for root in roots}
-        self._engine_python = engine_python or sys.executable
+        # Production path always passes ``engine``. Demo / custom builders leave
+        # it None because they never call ``_default_argv`` for engine specs.
+        self._engine = engine
         self._argv_builder = argv_builder or self._default_argv
         self._on_finish = on_finish
         self._node_transports = node_transports or dict
@@ -822,7 +824,12 @@ class ActionRegistry:
         del cwd
         if spec.kind == "git":
             return ["git", *args]
-        return [self._engine_python, "-m", "edge_deploy", *args]
+        if self._engine is None:
+            raise ActionError(
+                "engine source is not bound; the console will not launch an unbound edge_deploy",
+                status=503,
+            )
+        return engine_module_argv(self._engine, args)
 
     def resolve_root(self, raw: object) -> Path:
         candidate = str(raw or "")

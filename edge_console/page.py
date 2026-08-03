@@ -643,6 +643,15 @@ function consoleIsBusyIn(root){
 function environmentProblems(env){
   if(!env) return [];
   const out = [];
+  if(env.engine && env.engine.status === "unknown")
+    out.push({phases: null, short: "engine unknown",
+      cta: "The source-bound release engine could not be identified, so no engine command can run.",
+      text: `<b>The source-bound release engine could not be identified</b>
+        (${esc(env.engine.detail || "identity probe failed")}).
+        Engine actions are disabled. Check <code>--engine-python</code> and that this
+        console loaded an intact <code>edge_deploy</code> package
+        ${env.engine_source ? `(source <code>${esc(env.engine_source)}</code>)` : ""}.`});
+
   const config = env.operator_config;
   if(config && config.status === "missing")
     out.push({phases: null, short: "no operator config",
@@ -1697,10 +1706,6 @@ function renderBanners(){
   const env = environment();
   for(const problem of environmentProblems(env))
     parts.push(`<div class="banner ${problem.phases === null ? "offline" : "warn"}">${problem.text}</div>`);
-  if(env && env.engine && env.engine.status === "unknown")
-    parts.push(`<div class="banner offline"><b>The release engine could not be identified</b>
-      (${esc(env.engine.detail || "")}). Commands may not run at all; check
-      <code>--engine-python</code>.</div>`);
   document.getElementById("banners").innerHTML = parts.join("");
 }
 

@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from edge_console.actions import ACTION_SPECS, ActionError, ActionRegistry, catalog
 from edge_console.demo import DEMO_ENGINE_SHA, build_demo_checkouts, demo_argv_builder
+from edge_console.engine_exec import EngineSourceError, build_engine_exec_context
 from edge_console.ledger import collect_runs_multi
 from edge_console.page import PAGE
 from edge_console.probes import PostureProber, ToolsProber
@@ -204,6 +205,17 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
     def _start_action(self, body: dict) -> None:
         action = str(body.get("action") or "")
+        spec = ACTION_SPECS.get(action)
+        if spec is not None and spec.kind == "engine":
+            # Fail closed: never launch an engine child whose identity we cannot
+            # confirm from the same source-bound probe the buttons report.
+            engine = self.readiness.snapshot().get("engine") or {}
+            if engine.get("status") != "ok":
+                detail = engine.get("detail") or "source-bound identity probe failed"
+                raise ActionError(
+                    f"engine identity is unavailable ({detail}); engine actions are disabled",
+                    status=503,
+                )
         if action in _NEEDS_CHECKOUT:
             root = self.registry.resolve_root(body.get("root"))
             if not (root / ".git").exists():
@@ -261,7 +273,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--engine-python",
         default=None,
-        help="Interpreter used for 'python -m edge_deploy' (default: the one running the console)",
+        help=(
+            "Python executable used to spawn engine children "
+            "(default: the one running the console). Does not select the "
+            "edge_deploy source — that is always the package this console loaded."
+        ),
     )
     parser.add_argument("--no-browser", action="store_true")
     return parser
@@ -283,14 +299,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.demo:
         roots = build_demo_checkouts()
         write_roots = roots
+        engine = None
     else:
         roots, write_roots = resolve_console_roots(args)
+        try:
+            engine = build_engine_exec_context(python=args.engine_python or sys.executable)
+        except EngineSourceError as exc:
+            print(
+                f"edge-console: cannot resolve the loaded edge_deploy source: {exc}",
+                file=sys.stderr,
+            )
+            return 2
 
     tools_prober = ToolsProber(roots, demo=args.demo)
     readiness = ReadinessProber(
-        engine_python=args.engine_python or sys.executable,
-        # Actions run inside a watched checkout, so that is where the engine
-        # identity has to be asked for the answer to be the one they will get.
+        engine=engine,
+        # Actions keep the tool checkout as cwd; the identity probe uses the
+        # same cwd plus the source-bound bootstrap so the answer matches them.
         probe_root=roots[0] if roots else None,
         demo=args.demo,
         demo_engine_sha=DEMO_ENGINE_SHA,
@@ -299,7 +324,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.read_only:
         registry = ActionRegistry(
             roots=roots,
-            engine_python=args.engine_python,
+            engine=engine,
             argv_builder=demo_argv_builder if args.demo else None,
             # A finished command usually moved the ledger or the checkout;
             # drop the cached divergence so the next poll re-reads reality.
@@ -325,6 +350,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"edge-console: github write probe root {root}")
     if args.demo:
         print("edge-console: DEMO — fabricated checkouts driven by the offline simulator")
+    elif engine is not None:
+        print(f"edge-console: engine source {engine.source_root}")
+        print(f"edge-console: engine python {engine.python}")
     if args.read_only:
         print("edge-console: read-only — no command buttons")
     else:

@@ -48,6 +48,14 @@ from edge_console.actions import (
     display_command,
 )
 from edge_console.demo import build_demo_checkouts, demo_argv_builder, demo_git
+from edge_console.engine_exec import (
+    EngineExecContext,
+    EngineSourceError,
+    build_engine_exec_context,
+    engine_identity_argv,
+    engine_module_argv,
+    resolve_engine_source_root,
+)
 from edge_console.ledger import (
     SCHEMA,
     collect_runs,
@@ -96,9 +104,14 @@ __all__ = [
     "catalog",
     "collect_runs",
     "collect_runs_multi",
+    "EngineExecContext",
+    "EngineSourceError",
+    "build_engine_exec_context",
     "demo_argv_builder",
     "demo_git",
     "display_command",
+    "engine_identity_argv",
+    "engine_module_argv",
     "find_run_state",
     "is_training_state",
     "main",
@@ -109,4 +122,5 @@ __all__ = [
     "probe_operator_config",
     "probe_tool",
     "resolve_console_roots",
+    "resolve_engine_source_root",
 ]

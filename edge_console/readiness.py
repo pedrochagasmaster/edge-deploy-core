@@ -9,8 +9,9 @@ instead of letting the operator discover it — sometimes several minutes and a
 posture switch into a guided release.
 
 Nothing here runs a release command or writes anything. The engine identity is
-read by asking the interpreter the console would actually spawn, which is the
-only answer that is true when ``--engine-python`` points somewhere else.
+read by asking the same source-bound child the console buttons will spawn, so
+``--engine-python`` can change the interpreter without changing which
+``edge_deploy`` source is under test.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ import threading
 import time
 from pathlib import Path
 
+from edge_console.engine_exec import EngineExecContext, engine_identity_argv
 from edge_deploy.audit import default_outbox
 from edge_deploy.config import DEFAULT_OPERATOR_CONFIG_PATH, load_operator_config
 
@@ -30,33 +32,24 @@ READINESS_CACHE_SECONDS = 30.0
 IDENTITY_TIMEOUT = 20.0
 BB_TOKEN_ENV = "BB_TOKEN"
 
-# Run *by the child*, so the hash is whatever that interpreter's edge_deploy
-# really is — not whatever the console happens to have imported. Reached
-# through importlib so this stays a string handed to another process rather
-# than an import of engine internals into the console.
-_IDENTITY_SNIPPET = (
-    "import json,importlib;"
-    "print(json.dumps(importlib.import_module('edge_deploy.ledger').engine_identity()))"
-)
 
-
-def probe_engine_identity(engine_python: str, cwd: Path | None = None) -> dict:
+def probe_engine_identity(engine: EngineExecContext, cwd: Path | None = None) -> dict:
     """The engine a console button would run: version and content hash.
 
-    ``cwd`` matters: ``python -c`` puts the working directory first on the
-    path, and console actions run inside a tool checkout, so that is where the
-    question has to be asked.
+    Uses the same source-bound argv as engine actions. ``cwd`` is still the
+    tool checkout actions use; the bootstrap inserts ``engine.source_root`` at
+    the front of ``sys.path`` so the checkout cannot supply a different package.
     """
     try:
         completed = subprocess.run(
-            [engine_python, "-c", _IDENTITY_SNIPPET],
+            engine_identity_argv(engine),
             cwd=str(cwd) if cwd else None,
             capture_output=True,
             text=True,
             timeout=IDENTITY_TIMEOUT,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        return {"status": "unknown", "detail": f"could not run {engine_python}: {exc}"}
+        return {"status": "unknown", "detail": f"could not run {engine.python}: {exc}"}
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip().splitlines()
         return {
@@ -141,12 +134,12 @@ class ReadinessProber:
     def __init__(
         self,
         *,
-        engine_python: str,
+        engine: EngineExecContext | None = None,
         probe_root: Path | None = None,
         demo: bool = False,
         demo_engine_sha: str | None = None,
     ) -> None:
-        self._engine_python = engine_python
+        self._engine = engine
         self._probe_root = probe_root
         self._demo = demo
         self._demo_engine_sha = demo_engine_sha
@@ -186,18 +179,34 @@ class ReadinessProber:
                 "powershell": {"present": True, "path": "(demo)"},
                 "audit": {"repo": "(demo)", "outbox": "(demo)", "queued": False},
                 "engine_python": "(demo simulator)",
+                "engine_source": "(demo simulator)",
+            }
+        if self._engine is None:
+            # Fail closed: without a bound source there is no honest identity.
+            return {
+                "engine": {
+                    "status": "unknown",
+                    "detail": "engine source is not bound",
+                },
+                "operator_config": probe_operator_config(),
+                "bb_token": probe_bb_token(),
+                "powershell": probe_powershell(),
+                "audit": {"repo": None, "outbox": None, "queued": False},
+                "engine_python": None,
+                "engine_source": None,
             }
         with self._lock:
             if self._cached and time.monotonic() - self._cached_at < READINESS_CACHE_SECONDS:
                 return self._cached
         config = probe_operator_config()
         result = {
-            "engine": probe_engine_identity(self._engine_python, cwd=self._probe_root),
+            "engine": probe_engine_identity(self._engine, cwd=self._probe_root),
             "operator_config": config,
             "bb_token": probe_bb_token(),
             "powershell": probe_powershell(),
             "audit": probe_audit(config.get("audit_repo") or ""),
-            "engine_python": self._engine_python,
+            "engine_python": self._engine.python,
+            "engine_source": self._engine.source_root,
         }
         with self._lock:
             self._cached = result
