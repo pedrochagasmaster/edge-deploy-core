@@ -18,7 +18,7 @@ from edge_deploy.remote_paths import edge_deploy_path, shell_remote_path
 from edge_deploy.runner import bootstrap_runner, read_remote_json, run_step
 from edge_deploy.transport import TransferProgressCallback
 
-BUNDLE_SCHEMA = "edge-deploy/dependency-bundle/1"
+BUNDLE_SCHEMA = "edge-deploy/dependency-bundle/2"
 _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 _WHEEL_RE = re.compile(r"^(?P<name>.+?)-(?P<version>[^-]+)-[^-]+-[^-]+-[^-]+\.whl$", re.IGNORECASE)
 

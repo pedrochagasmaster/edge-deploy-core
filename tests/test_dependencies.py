@@ -9,7 +9,12 @@ from conftest import FakeTmuxDriver
 
 import edge_deploy.dependencies as dependency_module
 from edge_deploy.config import DependencyBundleConfig, ToolProfile
-from edge_deploy.dependencies import BundleError, create_dependency_bundle, deliver_dependency_bundle
+from edge_deploy.dependencies import (
+    BUNDLE_SCHEMA,
+    BundleError,
+    create_dependency_bundle,
+    deliver_dependency_bundle,
+)
 
 
 def _config() -> DependencyBundleConfig:
@@ -147,6 +152,8 @@ def test_dependency_bundle_manifest_and_archive_are_deterministic(tmp_path: Path
     )
 
     manifest = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["schema"] == BUNDLE_SCHEMA
+    assert manifest["schema"] == "edge-deploy/dependency-bundle/2"
     assert manifest["source_sha"] == "b" * 40
     assert manifest["target"] == {
         "python": "3.10",
