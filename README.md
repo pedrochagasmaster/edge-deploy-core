@@ -35,7 +35,7 @@ and do not switch VPN or firewall posture during onboarding
 ```powershell
 git clone https://github.com/pedrochagasmaster/edge-deploy-core.git
 cd edge-deploy-core
-git checkout v1.6.0
+git checkout v1.6.1
 uv sync --extra dev
 ```
 

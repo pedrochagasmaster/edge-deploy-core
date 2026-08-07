@@ -26,6 +26,23 @@ from edge_deploy.config import (
 
 # Sibling Tool repos live next to edge-deploy-core (…/Projects/{autobench,robocop}).
 PROJECTS_ROOT = Path(__file__).resolve().parents[2]
+FIXTURE_PROFILES = Path(__file__).resolve().parent / "fixtures"
+
+
+def _profile_path(tool: str) -> Path:
+    """Prefer the sibling checkout; fall back to the committed fixture profile."""
+    sibling = PROJECTS_ROOT / tool / "edge_deploy.yaml"
+    fixture = FIXTURE_PROFILES / f"{tool}_edge_deploy.yaml"
+    if sibling.exists():
+        try:
+            ToolProfile.load(sibling)
+            return sibling
+        except ValueError as exc:
+            if "compatible_platform_tags" not in str(exc):
+                raise
+    if fixture.exists():
+        return fixture
+    pytest.skip(f"{tool} profile not available")
 
 # A nested profile that uses block mappings, block lists, flow lists, comments and quoted
 # scalars — and deliberately no YAML escape sequences, so both backends must agree.
@@ -243,9 +260,7 @@ def test_robocop_profile_agrees_across_backends_with_real_em_dash(monkeypatch) -
     # ``\u2014``. PyYAML decodes such escapes while the dependency-free fallback keeps them
     # literal, so the two backends parsed the field differently. The profile now ships a real
     # em-dash (U+2014), so both backends must agree byte-for-byte.
-    profile_path = PROJECTS_ROOT / "robocop" / "edge_deploy.yaml"
-    if not profile_path.exists():
-        pytest.skip("robocop profile not available")
+    profile_path = _profile_path("robocop")
 
     with_pyyaml = ToolProfile.load(profile_path)
     _force_fallback(monkeypatch)
@@ -272,6 +287,11 @@ def test_real_profiles_expose_expected_contract(real_profile) -> None:
     assert real_profile.smoke.standard, "every Tool ships at least one standard smoke command"
     assert real_profile.runtime_paths
     assert real_profile.dependency_paths
+    assert real_profile.dependency_bundle is not None
+    assert real_profile.dependency_bundle.compatible_platform_tags == (
+        "manylinux_2_24_x86_64",
+        "manylinux2014_x86_64",
+    )
 
 
 def test_real_profile_specifics(autobench_profile, robocop_profile) -> None:
@@ -285,9 +305,7 @@ def test_real_profile_specifics(autobench_profile, robocop_profile) -> None:
 
 
 def test_autobench_profile_loads_identically_across_backends(monkeypatch) -> None:
-    profile_path = PROJECTS_ROOT / "autobench" / "edge_deploy.yaml"
-    if not profile_path.exists():
-        pytest.skip("autobench profile not available")
+    profile_path = _profile_path("autobench")
 
     with_pyyaml = ToolProfile.load(profile_path)
     _force_fallback(monkeypatch)
