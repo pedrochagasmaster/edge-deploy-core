@@ -7,8 +7,10 @@ archive over the authenticated SSH control connection, and verifies it before ch
 the node checkout.
 
 Bundle identity covers the reviewed source SHA, LF-normalized dependency-file hashes,
-wheel hashes, and supported Python, ABI, and platform tags. Nodes stage bundles under
-`/ads_storage/$USER/.edge-deploy/bundles/<tool>/<digest>`. Extraction is clean and
+wheel hashes, and compatible Python, ABI, and platform tags. A compatible tag list
+describes one node target. For example, `manylinux_2_24_x86_64` and
+`manylinux2014_x86_64` describe one x86-64 target with glibc 2.24 or newer.
+Nodes stage bundles under `/ads_storage/$USER/.edge-deploy/bundles/<tool>/<digest>`. Extraction is clean and
 atomic; unexpected files, stale wheel versions, incompatible Python, insufficient disk,
 or failed offline resolution stop the release before update.
 

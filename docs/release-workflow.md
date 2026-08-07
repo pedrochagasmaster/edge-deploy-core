@@ -112,7 +112,7 @@ protocol unchanged. No transport failure silently falls back from `ssh` to
 an automatic retry over a different channel.
 
 No manual SCP or symlink workaround (for example, hand-copying a bundle to a
-node, or a `/ads_storage/$USER` symlink) is part of the canonical 1.5.0
+node, or a `/ads_storage/$USER` symlink) is part of the canonical 1.6.0
 workflow. Release-owned remote state lives under the canonical
 `~/.edge-deploy` path, resolved once per session against the authenticated
 node's real home directory.

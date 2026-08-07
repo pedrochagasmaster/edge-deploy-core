@@ -323,7 +323,7 @@ class DependencyBundleConfig:
     python_version: str = "3.10"
     implementation: str = "cp"
     abi: str = "cp310"
-    platform: str = "manylinux2014_x86_64"
+    compatible_platform_tags: tuple[str, ...] = ("manylinux_2_24_x86_64", "manylinux2014_x86_64")
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None) -> "DependencyBundleConfig | None":
@@ -335,8 +335,24 @@ class DependencyBundleConfig:
             python_version=str(data.get("python_version", "3.10")),
             implementation=str(data.get("implementation", "cp")),
             abi=str(data.get("abi", "cp310")),
-            platform=str(data.get("platform", "manylinux2014_x86_64")),
+            compatible_platform_tags=cls._platform_tags(data),
         )
+
+    @staticmethod
+    def _platform_tags(data: Mapping[str, Any]) -> tuple[str, ...]:
+        if "platform" in data:
+            raise ValueError("dependency_bundle.platform is obsolete; use compatible_platform_tags")
+        tags = tuple(
+            _as_str_list(
+                data.get(
+                    "compatible_platform_tags",
+                    ("manylinux_2_24_x86_64", "manylinux2014_x86_64"),
+                )
+            )
+        )
+        if not tags or any(not tag for tag in tags):
+            raise ValueError("dependency_bundle.compatible_platform_tags must not be empty")
+        return tags
 
 
 @dataclass(frozen=True)

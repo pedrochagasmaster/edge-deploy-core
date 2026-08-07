@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from conftest import FakeTmuxDriver
 
+import edge_deploy.dependencies as dependency_module
 from edge_deploy.config import DependencyBundleConfig, ToolProfile
 from edge_deploy.dependencies import BundleError, create_dependency_bundle, deliver_dependency_bundle
 
@@ -18,8 +19,52 @@ def _config() -> DependencyBundleConfig:
         python_version="3.10",
         implementation="cp",
         abi="cp310",
-        platform="manylinux2014_x86_64",
+        compatible_platform_tags=("manylinux_2_24_x86_64", "manylinux2014_x86_64"),
     )
+
+
+def test_dependency_bundle_rejects_obsolete_platform_field() -> None:
+    with pytest.raises(ValueError, match="compatible_platform_tags"):
+        DependencyBundleConfig.from_mapping({"platform": "manylinux2014_x86_64"})
+
+
+def test_build_dependency_bundle_repeats_compatible_platform_tags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_root = tmp_path / "output"
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(
+        dependency_module,
+        "_git_reader",
+        lambda _repo_root, _source_sha: lambda _path: b"demo==1.0\n",
+    )
+
+    def run(command, _cwd):
+        commands.append(list(command))
+        wheel = output_root / "demo" / ("a" * 40) / "wheels" / "demo-1.0-py3-none-any.whl"
+        wheel.write_bytes(b"wheel")
+
+    bundle = dependency_module.build_dependency_bundle(
+        ToolProfile(tool="demo", dependency_bundle=_config()),
+        repo_root=tmp_path,
+        source_sha="a" * 40,
+        output_root=output_root,
+        command_runner=run,
+    )
+
+    assert len(commands) == 1
+    command = commands[0]
+    assert [command[index + 1] for index, value in enumerate(command) if value == "--platform"] == [
+        "manylinux_2_24_x86_64",
+        "manylinux2014_x86_64",
+    ]
+    assert bundle.manifest["target"] == {
+        "python": "3.10",
+        "implementation": "cp",
+        "abi": "cp310",
+        "compatible_platform_tags": ["manylinux_2_24_x86_64", "manylinux2014_x86_64"],
+    }
 
 
 def test_dependency_bundle_identity_canonicalizes_line_endings(tmp_path: Path) -> None:
@@ -107,7 +152,7 @@ def test_dependency_bundle_manifest_and_archive_are_deterministic(tmp_path: Path
         "python": "3.10",
         "implementation": "cp",
         "abi": "cp310",
-        "platform": "manylinux2014_x86_64",
+        "compatible_platform_tags": ["manylinux_2_24_x86_64", "manylinux2014_x86_64"],
     }
     assert manifest["bundle_digest"] == bundle.digest
     with zipfile.ZipFile(bundle.archive_path) as archive:
